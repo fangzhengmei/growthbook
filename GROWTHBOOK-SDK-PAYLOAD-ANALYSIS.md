@@ -74,10 +74,12 @@ FeatureRule
 ### 3.1 SDK Payload 缓存架构
 
 ```
-SDK 请求 → /api/sdk-payload/:key
+SDK 请求 → /api/features/:key （公共端点，无认证）
+    ↓
+getFeaturesPublic()
     ↓
 getFeatureDefinitionsWithCache()
-    ├─ 查 sdkConnectionCache（MongoDB 持久化缓存）
+    ├─ 查 sdkConnectionCache（MongoDB 持久化缓存，集合名：sdkcache）
     │   ├─ 命中 → 直接返回
     │   └─ 未命中 → 实时构建
     └─ 实时构建 → buildSDKPayloadForConnection()
@@ -85,14 +87,19 @@ getFeatureDefinitionsWithCache()
 ```
 
 **缓存键**：
-- 新 SDK Connection：`sdk-` 前缀的唯一 key
-- 旧版 API Key：`{apiKey}:{environment}:{project}` 格式合成
+- 新 SDK Connection：`sdk-` 前缀的唯一 key（如 `sdk-abc123`）
+- 旧版 API Key：`legacy:{apiKey}:{environment}:{project}` 格式合成
+
+**缓存存储位置**：
+- 默认：MongoDB（`SDK_PAYLOAD_CACHE=mongo`）
+- 可配置为禁用（`SDK_PAYLOAD_CACHE=none`）
+- 设计预留了 S3/GCS 后端扩展点（TODO 注释）
 
 ### 3.2 缓存失效与主动刷新
 
 缓存不是被动等待 TTL，而是**变更驱动的主动刷新**。
 
-触发缓存刷新的入口点（通过 `queueSDKPayloadRefresh`）：
+触发缓存刷新的入口点（通过 `queueSDKPayloadRefresh` 异步触发）：
 - `FeatureModel`：特性创建、更新、删除、发布、回滚
 - `ExperimentModel`：实验状态变更
 - `SavedGroupModel`：用户分群变更
@@ -106,7 +113,7 @@ getFeatureDefinitionsWithCache()
 **刷新优化**：
 1. 计算受影响的 `payloadKeys`（`{environment, project}` 组合）
 2. 仅刷新环境匹配、项目范围匹配的 SDK Connection
-3. 批量处理：`promiseAllChunks(promises, 4)` 控制并发
+3. 批量处理：`promiseAllChunks(promises, 4)` 控制并发，避免 DB 风暴
 4. 触发后异步执行，不阻塞用户请求
 
 ### 3.3 版本同步机制
@@ -125,7 +132,25 @@ getFeatureDefinitionsWithCache()
 
 ## 4. 协议层契约
 
-### 4.1 SDK Connection 配置（后端 → Payload 生成参数）
+### 4.1 SDK 公共接口契约
+
+| 端点 | 方法 | 认证 | 用途 | 可用环境 |
+|------|------|------|------|---------|
+| `/api/features/:key` | GET | 否（CORS 开放） | SDK 拉取 Payload（本地评估模式） | Self-hosted + Cloud |
+| `/api/eval/:key` | POST | 否（CORS 开放） | 远程评估模式：提交 attributes，返回评估结果 | **Self-hosted ONLY** |
+| `/api/sdk-payload/:key` | GET | 是（内部 API） | 后台管理用，非 SDK 直接调用 | 内部 |
+| `/api/v1/sdk-payload/:key` | GET | 是（内部 API） | v1 路径别名 | 内部 |
+
+> **重要修正**：之前版本提到的 `/api/eval-features/:key` 是错误路径，正确公共端点为 `/api/eval/:key`，且仅在 self-hosted 环境下通过 `if (!IS_CLOUD)` 守卫启用。Cloud 环境必须使用独立的远程评估基础设施。
+
+**响应头（CDN 缓存控制）**：
+```
+Cache-Control: public, max-age=30, stale-while-revalidate=3600, stale-if-error=36000
+Surrogate-Key: {orgId} {apiKey} {envId}  // Fastly 清缓存用
+x-unrecoverable: 1                       // 不可恢复错误时标记，便于 CDN 缓存错误响应
+```
+
+### 4.2 SDK Connection 配置（后端 → Payload 生成参数）
 
 每个 SDK Connection 定义了 Payload 的生成参数，这是后台与 SDK 之间的**配置契约**：
 
@@ -137,7 +162,7 @@ SDKConnectionInterface {
   projects: string[];             // 项目过滤
   
   // SDK 能力声明（影响 Payload 格式）
-  languages: SDKLanguage[];       // SDK 语言：javascript, python, go, java 等
+  languages: SDKLanguage[];       // SDK 语言：javascript, python, go, java 等（支持多值）
   sdkVersion: string;             // SDK 版本号，用于能力协商
   
   // Payload 内容开关
@@ -164,28 +189,56 @@ SDKConnectionInterface {
 }
 ```
 
-### 4.2 能力协商机制（SDK Capabilities）
+### 4.3 能力协商机制（SDK Capabilities）
 
-根据 `languages` + `sdkVersion` 推导出 SDK 支持的能力集合：
+#### 单语言场景
 
+当 `languages` 数组长度 ≤ 1 时：
 ```typescript
-// shared/sdk-versioning.ts
-capabilities = getConnectionSDKCapabilities({ languages, sdkVersion })
-
-// 能力示例：
-"bucketingV2"              // 支持 v2 分桶算法
-"savedGroupReferences"     // 支持 $inGroup 引用（不内联展开）
-"prerequisites"            // 支持 parentConditions 前置条件
-"redirects"                // 支持 URL 重定向实验
-"visualExperiments"        // 支持可视化实验
+capabilities = getSDKCapabilities(language, sdkVersion)
 ```
 
-能力影响 Payload 生成：
-- 不支持 `savedGroupReferences` → 将 `$inGroup` 内联展开为 `$in`
-- 不支持 `prerequisites` → 过滤掉带前置条件的规则
-- 不支持 `redirects` → 过滤掉重定向实验
+根据语言和版本号，累积该版本及之前所有版本引入的能力。
 
-### 4.3 Payload 输出格式（后端 → SDK）
+#### 多语言场景（交集策略）
+
+当 `languages` 数组长度 > 1 时（`getConnectionSDKCapabilities` 函数，shared/src/sdk-versioning/index.ts:162-199）：
+
+```
+输入：languages = ["javascript", "python", "go"], sdkVersion = "1.5.0"
+
+步骤1：忽略 sdkVersion，每种语言使用最小默认版本（0.0.0）
+       确保不依赖任何语言的高版本独有特性
+
+步骤2：对每种语言分别计算能力集
+       javascript @ 0.0.0 → {bucketingV2, looseUnmarshalling}
+       python @ 0.0.0     → {bucketingV2, looseUnmarshalling, prerequisites}
+       go @ 0.0.0         → {bucketingV2}
+
+步骤3：取所有语言能力的交集
+       {bucketingV2, looseUnmarshalling} ∩ {bucketingV2, looseUnmarshalling, prerequisites} ∩ {bucketingV2}
+       = {bucketingV2}
+
+输出：capabilities = ["bucketingV2"]
+```
+
+**关键规则**：
+- 多语言配置下 `sdkVersion` 被忽略，强制使用最小版本（`undefined` → 默认版本）
+- 最终能力 = 所有语言能力的**交集**
+- 这确保生成的 Payload 能被连接中的**所有**语言 SDK 正确解析
+- 能力缺失意味着对应的 Payload 字段会被裁剪或转换
+
+**能力对 Payload 裁剪的影响**：
+
+| 能力缺失 | 裁剪/转换行为 |
+|---------|-------------|
+| `savedGroupReferences` | 将条件中的 `$inGroup` 内联展开为 `$in`，把用户 ID 列表直接嵌入规则 |
+| `prerequisites` | 过滤掉所有带 `parentConditions` 的规则，或在生成时剔除前置条件 |
+| `redirects` | 过滤掉所有 URL 重定向实验 |
+| `visualExperiments` | 过滤掉所有可视化实验 |
+| `bucketingV2` | 降级使用 v1 分桶算法 |
+
+### 4.4 Payload 输出格式（后端 → SDK）
 
 **核心类型**：`FeatureDefinitionSDKPayload`（后端）↔ `FeatureApiResponse`（SDK）
 
@@ -197,12 +250,12 @@ FeatureDefinitionSDKPayload {
   dateUpdated: Date | null;                        // Payload 生成时间
   
   // 加密字段（encryptPayload = true 时）
-  encryptedFeatures?: string;
-  encryptedExperiments?: string;
-  encryptedSavedGroups?: string;
+  encryptedFeatures?: string;                      // AES-GCM 加密的 features JSON
+  encryptedExperiments?: string;                   // AES-GCM 加密的 experiments JSON
+  encryptedSavedGroups?: string;                   // AES-GCM 加密的 savedGroups JSON
   
   // 保存组（savedGroupReferencesEnabled = true 时）
-  savedGroups?: SavedGroupsValues;
+  savedGroups?: SavedGroupsValues;                 // 保存组 ID → 值列表映射
 }
 
 // 特性定义
@@ -219,96 +272,105 @@ FeatureDefinition {
 // 单条规则
 FeatureDefinitionRule {
   id?: string;                                     // 规则 ID（includeRuleIds = true 时）
-  condition?: ConditionInterface;                  // 用户属性条件
+  condition?: ConditionInterface;                  // 用户属性条件（MongoRule）
   parentConditions?: ParentConditionInterface[];   // 前置条件
   force?: T;                                       // Force 规则值
   variations?: T[];                                // 实验变体
   weights?: number[];                              // 实验权重
   coverage?: number;                               // 流量覆盖率
   key?: string;                                    // 实验 trackingKey
-  hashAttribute?: string;                          // 分桶属性
-  hashVersion?: number;                            // 分桶算法版本
+  hashAttribute?: string;                          // 分桶属性（如 "id", "email"）
+  hashVersion?: number;                            // 分桶算法版本（1 或 2）
   seed?: string;                                   // 分桶种子
-  range?: VariationRange;                          // 分桶范围
-  ranges?: VariationRange[];                       // 多变量分桶范围
-  meta?: VariationMeta[];                          // 变体元数据
-  phase?: string;                                  // 实验阶段
+  range?: VariationRange;                          // 单变体分桶范围 [start, end)
+  ranges?: VariationRange[];                       // 多变体分桶范围
+  meta?: VariationMeta[];                          // 变体元数据（key, name）
+  phase?: string;                                  // 实验阶段索引
 }
-```
-
-### 4.4 API 接口契约
-
-| 端点 | 方法 | 用途 |
-|------|------|------|
-| `/api/sdk-payload/:key` | GET | 拉取 SDK Payload（本地评估模式） |
-| `/api/features/:key` | GET | 旧版接口，同上 |
-| `/api/eval-features/:key` | POST | 远程评估模式：提交 attributes，返回评估结果 |
-
-**响应头（CDN 缓存控制）**：
-```
-Cache-Control: public, max-age=30, stale-while-revalidate=3600, stale-if-error=36000
-Surrogate-Key: {orgId} {apiKey} {envId}  // Fastly 清缓存用
 ```
 
 ### 4.5 多语言 SDK 的统一契约
 
 所有语言 SDK 实现相同的评估逻辑，遵循同一套协议：
 
-1. **加载 Payload**：`loadFeatures()` → 发送 GET 请求到 `/api/sdk-payload/:key`
+1. **加载 Payload**：`loadFeatures()` → 发送 GET 请求到 `/api/features/:key`
 2. **本地评估**：`evalFeature(featureKey)` → 按规则顺序匹配，返回结果
 3. **跟踪曝光**：`trackingCallback` → 上报实验分配事件
 4. **刷新机制**：`refreshFeatures()` → 手动触发；或 SSE 流式更新
 
 **加密支持**：
-- 后端使用 `encryptionKey` 加密 payload
-- SDK 端使用相同 key 解密（AES-GCM）
-- 加密时 `features`、`experiments`、`savedGroups` 字段为空，真实数据在 `encrypted*` 字段中
+- 后端使用 `encryptionKey` 加密 payload（AES-GCM）
+- SDK 端使用相同 key 解密
+- 加密时 `features`、`experiments`、`savedGroups` 字段为空数组/对象，真实数据在 `encrypted*` 字段中
+- 远程评估模式（`remoteEvalEnabled=true`）禁用加密
 
 ---
 
-## 5. 数据流时序图
+## 5. 端到端时序与不一致窗口
 
 ```
-用户操作（后台 UI）
-    ↓
-[FeatureModel.updateFeature()]
-    ↓
-特性 version 递增 + 创建 Revision
-    ↓
-[queueSDKPayloadRefresh()]  // 异步，不阻塞
-    ├─ 计算受影响的 payloadKeys（env + project）
-    ├─ 查找所有匹配的 SDK Connection
-    └─ [refreshSDKPayloadCache()]
-        ├─ 拉取所有相关数据（features, experiments, savedGroups...）
-        ├─ 为每个 Connection 调用 buildSDKPayloadForConnection()
-        ├─ 写入 sdkConnectionCache
-        └─ 触发 SDK Webhooks（如果配置）
-
-    ↓（时间差：秒级）
-
-SDK 客户端
-    ↓
-GET /api/sdk-payload/:key
-    ↓
-[getFeatureDefinitionsWithCache()]
-    ├─ 命中缓存 → 直接返回
-    └─ 未命中 → 实时构建 + 写回缓存
-    ↓
-SDK 本地评估 → 用户看到特性值
+时间轴 →
+  │
+  T0  用户在后台 UI 点击「发布」按钮
+  │   ↓
+  │   POST /api/v1/features/:id/revisions/:version/publish
+  │   ├─ 权限校验
+  │   ├─ autoMerge 三路合并（live ← base ← draft）
+  │   ├─ 更新 Feature 主文档，version += 1
+  │   └─ Revision 标记为 published
+  │
+  T1  [queueSDKPayloadRefresh()] 被调用（异步，不阻塞 HTTP 响应）
+  │   ├─ 计算受影响的 payloadKeys = [{env: "production", project: ""}]
+  │   ├─ 查询所有匹配的 SDK Connection（假设有 5 个）
+  │   └─ 提交到后台队列，立即返回 HTTP 200
+  │
+  ├─────────────────────────────────────────────────────────────────
+  │                     🔴 不一致窗口开始（T1 ~ T3）
+  │                     SDK 仍拉取到旧版本缓存
+  │
+  T2  后台 worker 开始执行 refreshSDKPayloadCache()
+  │   ├─ 拉取全量数据：features, experiments, savedGroups, holdouts...
+  │   ├─ 为每个 Connection 构建 payload（buildSDKPayloadForConnection）
+  │   ├─ 并发控制：promiseAllChunks(promises, 4)
+  │   └─ 逐个写入 sdkConnectionCache
+  │
+  T3  最后一个 SDK Connection 缓存更新完成
+  │
+  ├─────────────────────────────────────────────────────────────────
+  │                     🟢 不一致窗口结束
+  │                     新的 SDK 请求将获取新版本
+  │
+  T4  SDK 客户端发起 GET /api/features/:key
+  │   ├─ CDN 层：max-age=30s，可能还缓存着旧版本（如果 T3-T0 < 30s）
+  │   ├─ 源站：命中新缓存 → 返回新版 payload
+  │   └─ SDK 本地：stale-while-revalidate，先返回旧版再后台刷新
+  │
+  T5  SDK 本地评估 → 用户看到新特性值
 ```
+
+**不一致窗口分析**：
+
+| 阶段 | 持续时间 | 影响范围 | 缓解措施 |
+|------|---------|---------|---------|
+| T1 → T3 | 通常 1~5 秒，取决于 Connection 数量和 DB 性能 | 所有使用该 Connection 的 SDK | 异步刷新，批量并发 4 |
+| T3 → CDN 失效 | 最长 30 秒（max-age） | Cloud/CDN 部署环境 | stale-while-revalidate 允许后台刷新 |
+| SDK 本地缓存 | 取决于 SDK 刷新策略 | 单个客户端 | 手动 refreshFeatures() 或 SSE 流式更新 |
+
+**最坏情况不一致窗口**：约 30 秒（CDN max-age）+ SDK 本地缓存时间。
 
 ---
 
 ## 6. 关键设计决策
 
 ### 6.1 缓存优先 + 主动刷新
-- 读路径：缓存优先，未命中时实时构建
+- 读路径：缓存优先，未命中时实时构建并异步写回
 - 写路径：变更后立即触发所有相关缓存的刷新
 - 权衡：读路径延迟极低（< 10ms），但写路径有放大效应（一个特性变更可能触发数十个 Connection 的缓存刷新）
 
 ### 6.2 能力协商而非版本锁定
 - 不采用 "v1 API / v2 API" 的硬版本切分
 - 而是通过 SDK 声明的 `languages` + `sdkVersion` 动态推导能力
+- 多语言时取交集，确保最低共同兼容性
 - 向后兼容：旧 SDK 收到的是它能理解的子集
 
 ### 6.3 扁平规则（v2）替代按环境存储（v1）
@@ -321,6 +383,11 @@ SDK 本地评估 → 用户看到特性值
 - 支持审核、回滚、冲突合并
 - 发布时才真正写入 Feature 主文档并触发缓存刷新
 
+### 6.5 公共端点与内部端点分离
+- `/api/features/:key` 完全公开，CORS 开放，便于浏览器端 SDK 使用
+- `/api/eval/:key` 仅限 self-hosted，Cloud 通过独立基础设施提供远程评估
+- 内部管理 API（`/api/sdk-payload/:key`）需要认证，不对外暴露
+
 ---
 
 ## 7. 边界情况与注意事项
@@ -330,6 +397,8 @@ SDK 本地评估 → 用户看到特性值
 3. **最终一致性**：缓存刷新是异步的，SDK 可能在数秒内拿到旧版本（通过 `stale-while-revalidate` 平衡）
 4. **能力矩阵爆炸**：15+ 种 SDK 语言 × 无数个版本号，能力推导逻辑需精心维护
 5. **加密密钥管理**：`encryptionKey` 存储在 SDK Connection 中，泄露风险需控制
+6. **多语言能力退化**：多语言配置下能力取交集，可能导致高级特性（如前置条件、保存组引用）无法使用
+7. **远程评估边界**：Cloud 环境禁用 `/api/eval/:key`，需注意部署环境差异
 
 ---
 
@@ -339,7 +408,8 @@ GrowthBook 的 SDK Payload 机制是一个**配置驱动、缓存优先、能力
 
 - **规则编排**：通过 v2 扁平规则 + Revision 版本管理，实现灵活的跨环境规则组合
 - **缓存同步**：变更驱动的主动刷新 + CDN 边缘缓存，平衡了实时性与性能
-- **协议契约**：SDK Connection 作为配置契约，能力协商实现多语言 SDK 的向后兼容
+- **协议契约**：SDK Connection 作为配置契约，能力协商（单语言取并集、多语言取交集）实现多语言 SDK 的向后兼容
 - **扩展点**：Webhook、SSE 流式更新、远程评估等机制支持更复杂的集成场景
+- **部署边界**：Self-hosted 与 Cloud 在远程评估端点上有明确差异，需注意能力对齐
 
 这套设计使得 GrowthBook 能够支撑从单项目到超大规模企业的特性管理需求，同时保持 SDK 的轻量级和高性能。
