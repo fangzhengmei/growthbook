@@ -22,6 +22,8 @@ GrowthBook 的特性（Feature）在磁盘上经历了三代存储格式的演�
 
 **JIT 迁移**：读取时通过 `FeatureModel.toInterface` 将所有旧格式统一归一化为 v2 格式；写入时总是输出 v2 格式。
 
+> **源码证据**：`packages/back-end/src/models/FeatureModel.ts` → `toInterface()`
+
 ### 2.2 规则类型系统
 
 每条 `FeatureRule` 可能是以下类型之一（通过隐式字段区分）：
@@ -31,6 +33,8 @@ GrowthBook 的特性（Feature）在磁盘上经历了三代存储格式的演�
 - **Experiment 规则**：`variations` + `weights` —— A/B 测试分流
 - **ExperimentRef 规则**：`experimentId` —— 引用独立的实验对象
 - **Schedule 规则**：`schedule` —— 按时间调度生效
+
+> **源码证据**：`packages/shared/types/feature.d.ts` → `FeatureRule` 类型定义
 
 ### 2.3 规则的组合与优先级
 
@@ -67,6 +71,8 @@ FeatureRule
 2. 发布时执行 `autoMerge` 进行三路合并（live ← base ← draft）
 3. 合并成功后递增特性 `version`，标记修订为 `published`
 
+> **源码证据**：`packages/back-end/src/models/FeatureRevisionModel.ts` → `publishRevision()`
+
 ---
 
 ## 3. 缓存机制与版本同步
@@ -95,6 +101,8 @@ getFeatureDefinitionsWithCache()
 - 可配置为禁用（`SDK_PAYLOAD_CACHE=none`）
 - 设计预留了 S3/GCS 后端扩展点（TODO 注释）
 
+> **源码证据**：`packages/back-end/src/models/SdkConnectionCacheModel.ts` → `getById()`, `upsert()`
+
 ### 3.2 缓存失效与主动刷新
 
 缓存不是被动等待 TTL，而是**变更驱动的主动刷新**。
@@ -109,6 +117,8 @@ getFeatureDefinitionsWithCache()
 - `SdkConnectionModel`：SDK 连接配置变更
 - 定时任务：`updateScheduledFeatures`（调度规则生效）、`updateRampSchedules`（渐进式放量）
 - `CustomFieldModel`：自定义字段定义变更
+
+> **源码证据**：`packages/back-end/src/jobs/updateAllJobs.ts` → `queueSDKPayloadRefresh()`
 
 **刷新优化**：
 1. 计算受影响的 `payloadKeys`（`{environment, project}` 组合）
@@ -134,14 +144,25 @@ getFeatureDefinitionsWithCache()
 
 ### 4.1 SDK 公共接口契约
 
-| 端点 | 方法 | 认证 | 用途 | 可用环境 |
-|------|------|------|------|---------|
-| `/api/features/:key` | GET | 否（CORS 开放） | SDK 拉取 Payload（本地评估模式） | Self-hosted + Cloud |
-| `/api/eval/:key` | POST | 否（CORS 开放） | 远程评估模式：提交 attributes，返回评估结果 | **Self-hosted ONLY** |
-| `/api/sdk-payload/:key` | GET | 是（内部 API） | 后台管理用，非 SDK 直接调用 | 内部 |
-| `/api/v1/sdk-payload/:key` | GET | 是（内部 API） | v1 路径别名 | 内部 |
+#### 公共端点 vs 内部端点对照表
 
-> **重要修正**：之前版本提到的 `/api/eval-features/:key` 是错误路径，正确公共端点为 `/api/eval/:key`，且仅在 self-hosted 环境下通过 `if (!IS_CLOUD)` 守卫启用。Cloud 环境必须使用独立的远程评估基础设施。
+| 类别 | 端点 | 方法 | 认证 | 用途 | 可用环境 | 源码位置 |
+|------|------|------|------|------|---------|---------|
+| **公共** | `/api/features/:key` | GET | 否（CORS 开放） | SDK 拉取 Payload（本地评估模式） | Self-hosted + Cloud | `packages/back-end/src/app.ts:297-313` |
+| **公共** | `/api/eval/:key` | POST | 否（CORS 开放） | 远程评估模式：提交 attributes，返回评估结果 | **Self-hosted ONLY** | `packages/back-end/src/app.ts:315-335` |
+| **内部** | `/api/v1/sdk-payload/:key` | GET | 是（API Key/JWT） | 内部管理用，非 SDK 直接调用 | 内部 | `packages/back-end/src/api/sdk-payload/getSdkPayload.ts:25` |
+| **内部** | `/api/v1/features/...` | 多种 | 是（API Key/JWT） | 特性 CRUD、发布、审核等管理操作 | 内部 | `packages/back-end/src/api/features/features.router.ts` |
+
+> **路径修正说明**：
+> - `sdk-payload` 路由通过 `apiRouter` 自动添加版本前缀，默认 `v1`，完整路径为 `/api/v1/sdk-payload/:key`
+> - 源码证据：`packages/back-end/src/api/api.router.ts:195-224` → 路由注册时自动拼接 `/${version}${route.path}`
+> - 挂载点：`packages/back-end/src/app.ts:369-376` → `app.use("/api", apiRouter)`
+> - 之前版本提到的 `/api/eval-features/:key` 是错误路径，正确公共端点为 `/api/eval/:key`
+
+> **部署边界说明**：
+> - `/api/eval/:key` 仅在 self-hosted 环境下通过 `if (!IS_CLOUD)` 守卫启用
+> - Cloud 环境必须使用独立的远程评估基础设施
+> - 源码证据：`packages/back-end/src/util/secrets.ts:13` → `IS_CLOUD = stringToBoolean(process.env.IS_CLOUD)`
 
 **响应头（CDN 缓存控制）**：
 ```
@@ -189,6 +210,8 @@ SDKConnectionInterface {
 }
 ```
 
+> **源码证据**：`packages/shared/types/sdk-connection.d.ts` → `SDKConnectionInterface`
+
 ### 4.3 能力协商机制（SDK Capabilities）
 
 #### 单语言场景
@@ -200,33 +223,65 @@ capabilities = getSDKCapabilities(language, sdkVersion)
 
 根据语言和版本号，累积该版本及之前所有版本引入的能力。
 
+> **源码证据**：`packages/shared/src/sdk-versioning/index.ts:137-158` → `getSDKCapabilities()`
+
 #### 多语言场景（交集策略）
 
-当 `languages` 数组长度 > 1 时（`getConnectionSDKCapabilities` 函数，shared/src/sdk-versioning/index.ts:162-199）：
+当 `languages` 数组长度 > 1 时（`getConnectionSDKCapabilities` 函数）：
 
 ```
 输入：languages = ["javascript", "python", "go"], sdkVersion = "1.5.0"
 
-步骤1：忽略 sdkVersion，每种语言使用最小默认版本（0.0.0）
-       确保不依赖任何语言的高版本独有特性
+步骤1：忽略 sdkVersion，每种语言使用其 defaultSdkVersions
+       javascript → 0.31.0（不是 0.0.0！）
+       python     → 1.0.0
+       go         → 0.1.4
 
 步骤2：对每种语言分别计算能力集
-       javascript @ 0.0.0 → {bucketingV2, looseUnmarshalling}
-       python @ 0.0.0     → {bucketingV2, looseUnmarshalling, prerequisites}
-       go @ 0.0.0         → {bucketingV2}
+       javascript @ 0.31.0 → {bucketingV2, looseUnmarshalling}
+       python @ 1.0.0     → {bucketingV2, looseUnmarshalling, prerequisites}
+       go @ 0.1.4         → {bucketingV2, looseUnmarshalling}
 
 步骤3：取所有语言能力的交集
-       {bucketingV2, looseUnmarshalling} ∩ {bucketingV2, looseUnmarshalling, prerequisites} ∩ {bucketingV2}
-       = {bucketingV2}
+       {bucketingV2, looseUnmarshalling} ∩ {bucketingV2, looseUnmarshalling, prerequisites} ∩ {bucketingV2, looseUnmarshalling}
+       = {bucketingV2, looseUnmarshalling}
 
-输出：capabilities = ["bucketingV2"]
+输出：capabilities = ["bucketingV2", "looseUnmarshalling"]
+```
+
+**关键代码逻辑**（`packages/shared/src/sdk-versioning/index.ts:179-188`）：
+```typescript
+for (const language of connection.languages || []) {
+  const languageCapabilities = getSDKCapabilities(
+    language,
+    strategy.includes("min-ver-intersection")
+      ? undefined  // 传 undefined，触发使用 defaultSdkVersion
+      : getLatestSDKVersion(language),
+    strategy === "min-ver-intersection-loose-unmarshalling",
+  );
+  // ... 取交集
+}
+```
+
+**defaultSdkVersions 定义**（`packages/shared/src/sdk-versioning/index.ts:71-97`）：
+```typescript
+const defaultSdkVersions: Record<SDKLanguage, string> = {
+  javascript: "0.31.0",    // 不是 0.0.0
+  nodejs: "0.31.0",
+  python: "1.0.0",
+  go: "0.1.4",
+  java: "0.9.0",
+  // ... 其他语言
+};
 ```
 
 **关键规则**：
-- 多语言配置下 `sdkVersion` 被忽略，强制使用最小版本（`undefined` → 默认版本）
+- 多语言配置下 `sdkVersion` 被忽略，传 `undefined` 触发使用 `getDefaultSDKVersion(language)`
 - 最终能力 = 所有语言能力的**交集**
 - 这确保生成的 Payload 能被连接中的**所有**语言 SDK 正确解析
 - 能力缺失意味着对应的 Payload 字段会被裁剪或转换
+
+> **重要修正**：之前版本错误地认为多语言时使用固定 0.0.0 版本，实际上是按各语言的 `defaultSdkVersions` 取值。这是一个迁移用的基准版本（截至 2023/12/5），用于在 SDK 连接创建时未存储版本号的情况下提供合理的默认能力集。
 
 **能力对 Payload 裁剪的影响**：
 
@@ -289,6 +344,8 @@ FeatureDefinitionRule {
 }
 ```
 
+> **源码证据**：`packages/shared/types/sdk.d.ts` → `FeatureDefinitionSDKPayload`
+
 ### 4.5 多语言 SDK 的统一契约
 
 所有语言 SDK 实现相同的评估逻辑，遵循同一套协议：
@@ -318,15 +375,17 @@ FeatureDefinitionRule {
   │   ├─ autoMerge 三路合并（live ← base ← draft）
   │   ├─ 更新 Feature 主文档，version += 1
   │   └─ Revision 标记为 published
+  │   └─ 同步返回 HTTP 200 给用户
   │
   T1  [queueSDKPayloadRefresh()] 被调用（异步，不阻塞 HTTP 响应）
   │   ├─ 计算受影响的 payloadKeys = [{env: "production", project: ""}]
   │   ├─ 查询所有匹配的 SDK Connection（假设有 5 个）
-  │   └─ 提交到后台队列，立即返回 HTTP 200
+  │   └─ 提交到后台队列
   │
   ├─────────────────────────────────────────────────────────────────
-  │                     🔴 不一致窗口开始（T1 ~ T3）
-  │                     SDK 仍拉取到旧版本缓存
+  │                     🔴 不一致窗口 A（T1 ~ T3）
+  │                     SDK 拉取仍命中旧缓存
+  │                     持续时间：1~5 秒（取决于 Connection 数量和 DB 性能）
   │
   T2  后台 worker 开始执行 refreshSDKPayloadCache()
   │   ├─ 拉取全量数据：features, experiments, savedGroups, holdouts...
@@ -337,24 +396,36 @@ FeatureDefinitionRule {
   T3  最后一个 SDK Connection 缓存更新完成
   │
   ├─────────────────────────────────────────────────────────────────
-  │                     🟢 不一致窗口结束
+  │                     🟡 不一致窗口 B（T3 ~ T4）
+  │                     CDN 层仍缓存旧版本（max-age=30s）
+  │                     持续时间：最长 30 秒
+  │
+  T4  CDN 缓存失效，新请求到达源站
+  │
+  ├─────────────────────────────────────────────────────────────────
+  │                     🟢 后端一致
   │                     新的 SDK 请求将获取新版本
   │
-  T4  SDK 客户端发起 GET /api/features/:key
-  │   ├─ CDN 层：max-age=30s，可能还缓存着旧版本（如果 T3-T0 < 30s）
+  T5  SDK 客户端发起 GET /api/features/:key
+  │   ├─ CDN 层：如果 T5-T3 < 30s，可能还返回旧版本
   │   ├─ 源站：命中新缓存 → 返回新版 payload
   │   └─ SDK 本地：stale-while-revalidate，先返回旧版再后台刷新
   │
-  T5  SDK 本地评估 → 用户看到新特性值
+  ├─────────────────────────────────────────────────────────────────
+  │                     🟡 不一致窗口 C（T5 ~ T6）
+  │                     单个客户端本地缓存
+  │                     持续时间：取决于 SDK 刷新策略
+  │
+  T6  SDK 本地评估 → 用户看到新特性值
 ```
 
 **不一致窗口分析**：
 
-| 阶段 | 持续时间 | 影响范围 | 缓解措施 |
-|------|---------|---------|---------|
-| T1 → T3 | 通常 1~5 秒，取决于 Connection 数量和 DB 性能 | 所有使用该 Connection 的 SDK | 异步刷新，批量并发 4 |
-| T3 → CDN 失效 | 最长 30 秒（max-age） | Cloud/CDN 部署环境 | stale-while-revalidate 允许后台刷新 |
-| SDK 本地缓存 | 取决于 SDK 刷新策略 | 单个客户端 | 手动 refreshFeatures() 或 SSE 流式更新 |
+| 窗口 | 阶段 | 持续时间 | 影响范围 | 缓解措施 | 源码证据 |
+|------|------|---------|---------|---------|---------|
+| A | T1 → T3 | 通常 1~5 秒 | 所有使用该 Connection 的 SDK | 异步刷新，批量并发 4 | `packages/back-end/src/jobs/updateAllJobs.ts` |
+| B | T3 → CDN 失效 | 最长 30 秒（max-age） | Cloud/CDN 部署环境 | stale-while-revalidate 允许后台刷新 | `packages/back-end/src/controllers/features.ts:503` → `getFeaturesPublic()` |
+| C | SDK 本地缓存 | 取决于 SDK 刷新策略 | 单个客户端 | 手动 refreshFeatures() 或 SSE 流式更新 | `packages/sdk-js/src/GrowthBook.ts` |
 
 **最坏情况不一致窗口**：约 30 秒（CDN max-age）+ SDK 本地缓存时间。
 
@@ -386,7 +457,7 @@ FeatureDefinitionRule {
 ### 6.5 公共端点与内部端点分离
 - `/api/features/:key` 完全公开，CORS 开放，便于浏览器端 SDK 使用
 - `/api/eval/:key` 仅限 self-hosted，Cloud 通过独立基础设施提供远程评估
-- 内部管理 API（`/api/sdk-payload/:key`）需要认证，不对外暴露
+- 内部管理 API（`/api/v1/sdk-payload/:key`）需要认证，不对外暴露
 
 ---
 
@@ -402,7 +473,23 @@ FeatureDefinitionRule {
 
 ---
 
-## 8. 总结
+## 8. 关键结论索引
+
+| 结论 | 源码位置 | 函数/类型 |
+|------|---------|-----------|
+| 规则 v0/v1/v2 模型演进 | `packages/back-end/src/models/FeatureModel.ts` | `toInterface()` |
+| 缓存主动刷新触发 | `packages/back-end/src/jobs/updateAllJobs.ts` | `queueSDKPayloadRefresh()` |
+| 多语言能力协商交集策略 | `packages/shared/src/sdk-versioning/index.ts:162-199` | `getConnectionSDKCapabilities()` |
+| defaultSdkVersions 定义 | `packages/shared/src/sdk-versioning/index.ts:71-97` | `defaultSdkVersions` |
+| sdk-payload 路由版本前缀 | `packages/back-end/src/api/api.router.ts:195-224` | `allRoutes.forEach()` |
+| /api/eval 仅 self-hosted | `packages/back-end/src/app.ts:315-335` | `if (!IS_CLOUD)` 守卫 |
+| IS_CLOUD 环境变量 | `packages/back-end/src/util/secrets.ts:13` | `IS_CLOUD` |
+| SDK Payload 类型定义 | `packages/shared/types/sdk.d.ts` | `FeatureDefinitionSDKPayload` |
+| SDK Connection 配置 | `packages/shared/types/sdk-connection.d.ts` | `SDKConnectionInterface` |
+
+---
+
+## 9. 总结
 
 GrowthBook 的 SDK Payload 机制是一个**配置驱动、缓存优先、能力协商、最终一致**的分布式系统设计：
 
