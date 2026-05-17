@@ -233,23 +233,43 @@ capabilities = getSDKCapabilities(language, sdkVersion)
 输入：languages = ["javascript", "python", "go"], sdkVersion = "1.5.0"
 
 步骤1：忽略 sdkVersion，每种语言使用其 defaultSdkVersions
-       javascript → 0.31.0（不是 0.0.0！）
+       javascript → 0.31.0
        python     → 1.0.0
        go         → 0.1.4
 
-步骤2：对每种语言分别计算能力集
-       javascript @ 0.31.0 → {bucketingV2, looseUnmarshalling}
-       python @ 1.0.0     → {bucketingV2, looseUnmarshalling, prerequisites}
-       go @ 0.1.4         → {bucketingV2, looseUnmarshalling}
+步骤2：对每种语言分别计算能力集（累积 ≤ 该版本的所有能力）
+       javascript @ 0.31.0
+         = 0.0.0 {looseUnmarshalling, namespacesV2}
+           ∪ 0.20.0 {encryption}
+           ∪ 0.21.0 {streaming}
+           ∪ 0.23.0 {bucketingV2}
+           ∪ 0.24.0 {visualEditor}
+           ∪ 0.27.0 {semverTargeting, visualEditorJS}
+           ∪ 0.29.0 {remoteEval}
+           ∪ 0.30.0 {visualEditorDragDrop}
+         = {looseUnmarshalling, namespacesV2, encryption, streaming, bucketingV2,
+            visualEditor, semverTargeting, visualEditorJS, remoteEval, visualEditorDragDrop}
+       源码证据：packages/shared/src/sdk-versioning/sdk-versions/javascript.json:75-109
+
+       python @ 1.0.0
+         = 1.0.0 {bucketingV2, encryption}
+         = {bucketingV2, encryption}
+       源码证据：packages/shared/src/sdk-versioning/sdk-versions/python.json:37-40
+
+       go @ 0.1.4
+         = 0.0.0 {looseUnmarshalling, namespacesV2}
+           ∪ 0.1.4 {bucketingV2, streaming, semverTargeting, encryption}
+         = {looseUnmarshalling, namespacesV2, bucketingV2, streaming, semverTargeting, encryption}
+       源码证据：packages/shared/src/sdk-versioning/sdk-versions/go.json:45-57
 
 步骤3：取所有语言能力的交集
-       {bucketingV2, looseUnmarshalling} ∩ {bucketingV2, looseUnmarshalling, prerequisites} ∩ {bucketingV2, looseUnmarshalling}
-       = {bucketingV2, looseUnmarshalling}
+       javascript ∩ python ∩ go
+       = {bucketingV2, encryption}
 
-输出：capabilities = ["bucketingV2", "looseUnmarshalling"]
+输出：capabilities = ["bucketingV2", "encryption"]
 ```
 
-**关键代码逻辑**（`packages/shared/src/sdk-versioning/index.ts:179-188`）：
+**关键代码逻辑**（`packages/shared/src/sdk-versioning/index.ts:179-188` → `getConnectionSDKCapabilities()`）：
 ```typescript
 for (const language of connection.languages || []) {
   const languageCapabilities = getSDKCapabilities(
@@ -263,7 +283,7 @@ for (const language of connection.languages || []) {
 }
 ```
 
-**defaultSdkVersions 定义**（`packages/shared/src/sdk-versioning/index.ts:71-97`）：
+**defaultSdkVersions 定义**（`packages/shared/src/sdk-versioning/index.ts:71-97` → `defaultSdkVersions`）：
 ```typescript
 const defaultSdkVersions: Record<SDKLanguage, string> = {
   javascript: "0.31.0",    // 不是 0.0.0
@@ -277,13 +297,22 @@ const defaultSdkVersions: Record<SDKLanguage, string> = {
 
 **关键规则**：
 - 多语言配置下 `sdkVersion` 被忽略，传 `undefined` 触发使用 `getDefaultSDKVersion(language)`
+- 能力推导逻辑：对每种语言，累积 `version ≤ defaultSdkVersion` 的所有能力项
 - 最终能力 = 所有语言能力的**交集**
 - 这确保生成的 Payload 能被连接中的**所有**语言 SDK 正确解析
 - 能力缺失意味着对应的 Payload 字段会被裁剪或转换
 
 > **重要修正**：之前版本错误地认为多语言时使用固定 0.0.0 版本，实际上是按各语言的 `defaultSdkVersions` 取值。这是一个迁移用的基准版本（截至 2023/12/5），用于在 SDK 连接创建时未存储版本号的情况下提供合理的默认能力集。
 
-**能力对 Payload 裁剪的影响**：
+> **能力交集修正对 Payload 裁剪的影响**：
+> 原示例错误地认为交集包含 `looseUnmarshalling`，但真实交集只有 `{bucketingV2, encryption}`。这意味着：
+> - ❌ `looseUnmarshalling` 不在交集中 → python SDK 不支持 → payload 不会启用宽松反序列化
+> - ❌ `namespacesV2` 不在交集中 → python SDK 不支持 → 命名空间规则需降级处理
+> - ❌ `streaming` 不在交集中 → python SDK 不支持 → SSE 流式更新不可用
+> - ❌ `prerequisites` 不在交集中 → 需过滤/剔除带前置条件的规则
+> - ✅ `bucketingV2` 和 `encryption` 在交集中 → 所有三种语言 SDK 均支持 → payload 可安全使用 v2 分桶和加密
+
+**能力对 Payload 裁剪的影响**（`packages/back-end/src/util/features.ts` → `mapFeatureRuleForSDK()`）：
 
 | 能力缺失 | 裁剪/转换行为 |
 |---------|-------------|
