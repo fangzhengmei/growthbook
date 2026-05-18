@@ -278,23 +278,31 @@ if (rows.length == MAX_ROWS_UNIT_AGGREGATE_QUERY) {
 - `packages/back-end/src/services/experimentQueries/constants.ts:4`
 - `packages/back-end/src/services/stats.ts:717-723`
 
-### 4.3 多指标查询限制
+### 4.3 多指标查询分块逻辑
 
 ```typescript
 // 单查询最大指标数（防止SQL列数过多）
 export const MAX_METRICS_PER_QUERY = 200;
 
-// 自动分块逻辑
+// 分块逻辑：按列数限制自动分块
 function chunkMetrics(metrics, maxColumnsPerQuery, isBandit) {
   // 基础列开销：100维度 + 1variation + 2users/count = 103列
   const baseColumnsNeeded = 103;
 
-  // 每个指标列开销 = 基础列 + CUPED列 + 截断列 + 未截断列
+  // 每个指标列开销取决于：
+  // - 指标类型（mean/ratio/quantile）
+  // - 是否启用回归调整（CUPED）
+  // - 是否启用百分位截断
+  // - 是否需要未截断版本
+  // - 是否Bandit模式（额外theta列）
   // 按列数限制自动分块
 }
 ```
 
-**代码来源**：`packages/back-end/src/services/experimentQueries/constants.ts:2`
+**代码来源**：
+- 常量定义：`packages/back-end/src/services/experimentQueries/constants.ts:2`
+- 分块逻辑：`packages/back-end/src/services/experimentQueries/experimentQueries.ts:177-220`
+- 列数计算：`packages/back-end/src/services/experimentQueries/experimentQueries.ts:36-139`
 
 ### 4.4 查询状态聚合规则
 
@@ -579,6 +587,52 @@ interface ExperimentReportResultDimension {
 | **失效方式** | 1. **手动删除**：通过 API 显式删除指定快照<br>2. **无自动过期**：快照永久存储，不会因时间流逝自动失效<br>3. **实验归档不清理**：实验标记为 `archived` 状态时，关联的快照数据保持完整，不会被级联删除 |
 | **增量更新** | 支持增量刷新（Incremental Refresh），仅查询新增数据 |
 | **可追溯性** | 保存完整 SQL 和查询 ID，可复现历史结果 |
+
+#### 5.4.4 阶段变更与快照触发的关系
+
+快照触发与实验阶段变更是两个独立的流程，不存在自动联动。具体关系如下：
+
+**1. 阶段变更的独立流程**
+- 实验阶段（phase）的创建、修改是独立操作，通过 `updateExperiment` API 完成
+- 新增阶段后，实验的 `phases` 数组长度增加，但不会触发任何快照创建
+- 阶段变更（如调整流量权重、新增变体）仅修改实验元数据，不影响已有快照
+
+**2. 快照触发的三种路径**
+
+| 触发方式 | 触发源 | 目标阶段 | 说明 |
+|---------|--------|---------|------|
+| **手动触发** | 用户点击界面"分析"按钮 / 调用 `postExperimentSnapshot` API | 可指定任意 `phase`（默认最新阶段） | 立即执行一次完整分析，`triggeredBy` 字段标记为 `"manual"` 或 `"manual-dashboard"` |
+| **调度触发** | 后台定时任务（根据 `nextSnapshotAttempt`） | 始终针对最新阶段 `experiment.phases.length - 1` | 由组织级 `updateSchedule` 控制频率，`triggeredBy` 标记为 `"scheduler"`；需满足 `autoSnapshots: true` 且 `disableAutoSnapshots: false` |
+| **阶段变更** | 无自动触发 | - | 阶段变更后**不会自动**创建快照；如需分析新阶段数据，需手动触发或等待下一次调度 |
+
+**3. 自动快照开关逻辑**
+
+```typescript
+// 自动快照生效条件：
+const autoRefreshEnabled = 
+  experiment.autoSnapshots === true && 
+  experiment.disableAutoSnapshots !== true;
+
+// 下次调度时间计算（determineNextDate）：
+// - 默认：EXPERIMENT_REFRESH_FREQUENCY 小时（1~168小时范围）
+// - Cron 表达式：解析 cron 规则计算下次执行时间
+// - Stale 模式：按指定小时数间隔
+// - Never：返回 null，完全禁用自动快照
+```
+
+**代码来源**：`packages/back-end/src/services/experiments.ts:763-789, 3550-3555, 3912-3918`
+
+**4. 典型时序示例**
+
+```
+Day 1 10:00 — 实验启动，创建 Phase 0
+Day 1 10:05 — 用户手动触发快照 → 生成 Snapshot #1 (phase=0)
+Day 1 14:00 — 调度触发 → 生成 Snapshot #2 (phase=0)
+Day 2 09:00 — 用户新增 Phase 1（调整流量权重）
+Day 2 09:00 — 无快照生成（阶段变更不自动触发）
+Day 2 10:00 — 用户手动触发分析 → 生成 Snapshot #3 (phase=1)
+Day 2 14:00 — 调度触发 → 生成 Snapshot #4 (phase=1，最新阶段)
+```
 
 ---
 
