@@ -249,18 +249,15 @@ capabilities = getSDKCapabilities(language, sdkVersion)
            ∪ 0.30.0 {visualEditorDragDrop}
          = {looseUnmarshalling, namespacesV2, encryption, streaming, bucketingV2,
             visualEditor, semverTargeting, visualEditorJS, remoteEval, visualEditorDragDrop}
-       源码证据：packages/shared/src/sdk-versioning/sdk-versions/javascript.json:75-109
 
        python @ 1.0.0
          = 1.0.0 {bucketingV2, encryption}
          = {bucketingV2, encryption}
-       源码证据：packages/shared/src/sdk-versioning/sdk-versions/python.json:37-40
 
        go @ 0.1.4
          = 0.0.0 {looseUnmarshalling, namespacesV2}
            ∪ 0.1.4 {bucketingV2, streaming, semverTargeting, encryption}
          = {looseUnmarshalling, namespacesV2, bucketingV2, streaming, semverTargeting, encryption}
-       源码证据：packages/shared/src/sdk-versioning/sdk-versions/go.json:45-57
 
 步骤3：取所有语言能力的交集
        javascript ∩ python ∩ go
@@ -268,6 +265,20 @@ capabilities = getSDKCapabilities(language, sdkVersion)
 
 输出：capabilities = ["bucketingV2", "encryption"]
 ```
+
+**各能力结论证据（按固定格式）**：
+
+| 结论 | 仓库相对路径 | 对应函数/字段 |
+|------|-------------|--------------|
+| javascript @ 0.31.0 支持 looseUnmarshalling | `packages/shared/src/sdk-versioning/sdk-versions/javascript.json:107-109` | `versions[0].capabilities` |
+| javascript @ 0.31.0 支持 encryption | `packages/shared/src/sdk-versioning/sdk-versions/javascript.json:103-105` | `versions[11].capabilities` |
+| javascript @ 0.31.0 支持 streaming | `packages/shared/src/sdk-versioning/sdk-versions/javascript.json:99-101` | `versions[10].capabilities` |
+| javascript @ 0.31.0 支持 bucketingV2 | `packages/shared/src/sdk-versioning/sdk-versions/javascript.json:95-97` | `versions[9].capabilities` |
+| python @ 1.0.0 仅支持 bucketingV2 + encryption | `packages/shared/src/sdk-versioning/sdk-versions/python.json:37-40` | `versions[4].capabilities` |
+| go @ 0.1.4 支持 looseUnmarshalling | `packages/shared/src/sdk-versioning/sdk-versions/go.json:54-57` | `versions[6].capabilities` |
+| go @ 0.1.4 支持 bucketingV2 + encryption | `packages/shared/src/sdk-versioning/sdk-versions/go.json:45-53` | `versions[1].capabilities` |
+| 多语言取交集逻辑 | `packages/shared/src/sdk-versioning/index.ts:190-198` | `getConnectionSDKCapabilities()` |
+| defaultSdkVersions 基准值 | `packages/shared/src/sdk-versioning/index.ts:71-97` | `defaultSdkVersions` |
 
 **关键代码逻辑**（`packages/shared/src/sdk-versioning/index.ts:179-188` → `getConnectionSDKCapabilities()`）：
 ```typescript
@@ -312,15 +323,43 @@ const defaultSdkVersions: Record<SDKLanguage, string> = {
 > - ❌ `prerequisites` 不在交集中 → 需过滤/剔除带前置条件的规则
 > - ✅ `bucketingV2` 和 `encryption` 在交集中 → 所有三种语言 SDK 均支持 → payload 可安全使用 v2 分桶和加密
 
-**能力对 Payload 裁剪的影响**（`packages/back-end/src/util/features.ts` → `mapFeatureRuleForSDK()`）：
+**能力协商到 Payload 裁剪的完整链路**：
 
-| 能力缺失 | 裁剪/转换行为 |
-|---------|-------------|
-| `savedGroupReferences` | 将条件中的 `$inGroup` 内联展开为 `$in`，把用户 ID 列表直接嵌入规则 |
-| `prerequisites` | 过滤掉所有带 `parentConditions` 的规则，或在生成时剔除前置条件 |
-| `redirects` | 过滤掉所有 URL 重定向实验 |
-| `visualExperiments` | 过滤掉所有可视化实验 |
-| `bucketingV2` | 降级使用 v1 分桶算法 |
+```
+1. getConnectionSDKCapabilities() 推导能力交集
+   ↓ packages/shared/src/sdk-versioning/index.ts:162-199
+   
+2. refreshSDKPayloadCache() 调用并传入 capabilities
+   ↓ packages/back-end/src/services/features.ts:751
+   
+3. buildSDKPayloadForConnection() 把 capabilities 透传给 getFeatureDefinition()
+   ↓ packages/back-end/src/services/features.ts:1052-1268
+   
+4. getFeatureDefinition() 根据 capabilities 做裁剪决策
+   ↓ packages/back-end/src/util/features.ts:478-921
+     ├─ L564: hasPrerequisites = capabilities.includes("prerequisites")
+     │  └─ L577-590: 不支持则返回 null（整个特性被过滤）
+     ├─ L565-569: shouldExpandSavedGroups = !capabilities.includes("savedGroupReferences")
+     │  └─ L795-802: getParsedCondition() 把 $inGroup 内联展开为 $in
+     ├─ L571-574: allowedKeys = !capabilities.includes("looseUnmarshalling") ? getPayloadAllowedKeys() : null
+     │  └─ L782-791: 用 pick() 仅保留允许的字段
+     └─ L814: 不支持 prerequisites 且规则带 prerequisites → return null（单条规则被过滤）
+   
+5. generateAutoExperimentsPayload() 过滤可视化/重定向实验
+   ↓ packages/back-end/src/services/features.ts:282-362
+     └─ 无 redirects/visualExperiments 能力 → 过滤对应实验类型
+```
+
+**能力对 Payload 裁剪的影响（带链路证据）**：
+
+| 能力缺失 | 触发点（仓库路径 + 行号） | 裁剪/转换行为 |
+|---------|-------------------------|-------------|
+| `prerequisites` | `packages/back-end/src/util/features.ts:577-590` | 整个特性或单条规则被过滤，返回 null |
+| `savedGroupReferences` | `packages/back-end/src/util/features.ts:795-802` | `$inGroup` 内联展开为 `$in`，用户 ID 列表嵌入规则 |
+| `looseUnmarshalling` | `packages/back-end/src/util/features.ts:782-791` | 用 `pick()` 裁剪规则字段，仅保留 `getPayloadAllowedKeys()` 返回的白名单 |
+| `redirects` | `packages/back-end/src/services/features.ts:282-362` | URL 重定向实验从 payload 中被过滤 |
+| `visualExperiments` | `packages/back-end/src/services/features.ts:282-362` | 可视化实验从 payload 中被过滤 |
+| `bucketingV2` | `packages/shared/src/sdk-versioning/index.ts:154-156` | 降级使用 v1 分桶算法，`hashVersion` 设为 1 |
 
 ### 4.4 Payload 输出格式（后端 → SDK）
 
