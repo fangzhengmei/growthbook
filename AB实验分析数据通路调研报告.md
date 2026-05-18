@@ -361,7 +361,168 @@ async function getStaleQueries() {
 
 ---
 
-## 5. 缓存机制详解
+## 5. 置信区间计算链路
+
+置信区间（Confidence Interval, CI）是 A/B 实验统计结论的核心输出。本章结构化说明从配置参数传入统计引擎，到结果格式化的完整链路。
+
+### 5.1 参数传递链：从配置到统计引擎
+
+#### 5.1.1 可配置参数总览
+
+| 参数名 | 前端配置字段 | 后端类型 | 默认值 | 作用 |
+|-------|-------------|---------|-------|------|
+| **alpha** | `pValueThreshold` | `number` | 0.05 | 显著性水平，决定置信度（1-alpha） |
+| **p值校正** | `pValueCorrection` | `boolean` | `false` | 是否启用多重检验校正 |
+| **单侧区间** | `oneSidedIntervals` | `boolean` | `false` | `true`=单侧区间，`false`=双侧区间 |
+| **统计引擎** | `statsEngine` | `string` | `"frequentist"` | `"bayesian"` 或 `"frequentist"` |
+| **差异类型** | `differenceType` | `string` | `"relative"` | `"relative"`（相对）或 `"absolute"`（绝对） |
+| **序列检验** | `sequentialTesting` | `boolean` | `false` | 是否启用序列检验 |
+
+#### 5.1.2 参数转换与传入
+
+所有参数通过 `getAnalysisSettingsForStatsEngine` 函数统一转换为 Python 统计引擎的输入格式：
+
+```typescript
+export function getAnalysisSettingsForStatsEngine(
+  settings: ExperimentSnapshotAnalysisSettings,
+  variations: ExperimentReportVariation[],
+  coverage: number,
+  phaseLengthDays: number,
+): AnalysisSettingsForStatsEngine {
+  // 1. alpha 转换：pValueThreshold → alpha
+  const pValueThresholdNumber =
+    Number(settings.pValueThreshold) || DEFAULT_P_VALUE_THRESHOLD;
+
+  const analysisData: AnalysisSettingsForStatsEngine = {
+    // 基础配置
+    stats_engine: settings.statsEngine,
+    alpha: pValueThresholdNumber,          // 传入显著性水平
+    difference_type: settings.differenceType,
+    
+    // 置信区间相关开关
+    p_value_corrected: !!settings.pValueCorrection,
+    one_sided_intervals: !!settings.oneSidedIntervals,
+    sequential_testing_enabled: settings.sequentialTesting ?? false,
+    
+    // ... 其他参数
+  };
+  return analysisData;
+}
+```
+
+**代码来源**：`packages/back-end/src/services/stats.ts:71-114`
+
+#### 5.1.3 统计引擎内部使用
+
+参数传入 Python 统计引擎后，在不同统计范式下的使用方式：
+
+| 统计范式 | alpha 用途 | 单侧区间影响 | p值校正方式 |
+|---------|-----------|-------------|------------|
+| **频率派** | 计算临界值：`z_{1-alpha/2}`（双侧）或 `z_{1-alpha}`（单侧） | 单侧：CI = [estimate - z_{1-alpha}*SE, +∞) 或 (-∞, estimate + z_{1-alpha}*SE] | holm-bonferroni 法校正 alpha |
+| **贝叶斯** | 确定后验分布的 Credible Interval 分位数：`[alpha/2, 1-alpha/2]` | 单侧：分位数取 `[alpha, 1]` 或 `[0, 1-alpha]` | benjamini-hochberg 法控制 FDR |
+
+**代码来源**：`packages/stats/` 目录下 Python 统计引擎
+
+### 5.2 结果格式化：CI 中 null 边界的处理路径
+
+Python 统计引擎返回的 CI 中可能包含 `null` 值，表示边界未定义。后端在结果解析阶段将其归一化为 `±Infinity`。
+
+#### 5.2.1 归一化函数
+
+```typescript
+const getFormattedCI = (
+  ci?: [number | null, number | null],
+): [number, number] | undefined => {
+  if (!ci) return undefined;
+  // 左边界 null → -Infinity，右边界 null → +Infinity
+  return [ci[0] ?? -Infinity, ci[1] ?? Infinity];
+};
+```
+
+**代码来源**：`packages/back-end/src/services/stats.ts:457-462`
+
+#### 5.2.2 归一化调用点
+
+在 `parseStatsEngineResult` 函数中，对 5 类结果的 CI 逐一进行归一化处理：
+
+```typescript
+row.variations.forEach((v, i) => {
+  // 1. 主结果 CI
+  if ("ci" in v) {
+    v.ci = getFormattedCI(v.ci);
+  }
+  // 2. CUPED 未调整版本 CI
+  if (v.supplementalResults?.cupedUnadjusted && "ci" in v.supplementalResults.cupedUnadjusted) {
+    v.supplementalResults.cupedUnadjusted.ci = getFormattedCI(v.supplementalResults.cupedUnadjusted.ci);
+  }
+  // 3. 未截断版本 CI
+  if (v.supplementalResults?.uncapped && "ci" in v.supplementalResults.uncapped) {
+    v.supplementalResults.uncapped.ci = getFormattedCI(v.supplementalResults.uncapped.ci);
+  }
+  // 4. 未分层版本 CI
+  if (v.supplementalResults?.unstratified && "ci" in v.supplementalResults.unstratified) {
+    v.supplementalResults.unstratified.ci = getFormattedCI(v.supplementalResults.unstratified.ci);
+  }
+  // 5. 无方差缩减版本 CI
+  if (v.supplementalResults?.noVarianceReduction && "ci" in v.supplementalResults.noVarianceReduction) {
+    v.supplementalResults.noVarianceReduction.ci = getFormattedCI(v.supplementalResults.noVarianceReduction.ci);
+  }
+});
+```
+
+**代码来源**：`packages/back-end/src/services/stats.ts:510-552`
+
+#### 5.2.3 null 边界的业务含义
+
+| CI 原始值 | 归一化后 | 业务场景 |
+|----------|---------|---------|
+| `[null, null]` | `[-Infinity, Infinity]` | 样本量不足，无法计算有效区间 |
+| `[0.01, null]` | `[0.01, Infinity]` | 单侧下限（仅关注提升），上界无约束 |
+| `[null, -0.01]` | `[-Infinity, -0.01]` | 单侧上限（仅关注下降），下界无约束 |
+| `[-0.02, 0.05]` | `[-0.02, 0.05]` | 正常双侧区间，无需转换 |
+
+#### 5.2.4 最终表达
+
+归一化后的 CI 存储在快照的 `results` 字段中，前端可直接使用：
+- `Infinity` / `-Infinity` 在 JSON 序列化时保持原值
+- 前端图表渲染时可识别并展示为"无边界"或"未计算"
+- 统计显著性判断时，可正确处理区间是否包含 0
+
+### 5.3 置信区间链路总览
+
+```
+用户配置（UI/API）
+    │
+    ▼
+settings.pValueThreshold → alpha
+settings.pValueCorrection → p_value_corrected
+settings.oneSidedIntervals → one_sided_intervals
+    │
+    ▼
+getAnalysisSettingsForStatsEngine()  [stats.ts:71-114]
+    │
+    ▼
+Python 统计引擎（频率派/贝叶斯）
+    │  计算 CI，边界缺失时返回 null
+    ▼
+parseStatsEngineResult()  [stats.ts:510-552]
+    │
+    ├─> 主结果 CI → getFormattedCI()
+    ├─> CUPED 未调整 CI → getFormattedCI()
+    ├─> 未截断 CI → getFormattedCI()
+    ├─> 未分层 CI → getFormattedCI()
+    └─> 无方差缩减 CI → getFormattedCI()
+    │
+    ▼
+快照持久化（ExperimentSnapshot.results）
+    │
+    ▼
+前端展示（图表渲染、显著性判断）
+```
+
+---
+
+## 6. 缓存机制详解
 
 ### 5.1 三级缓存架构总览
 
@@ -722,7 +883,7 @@ Day 2 14:00 — 调度触发 → 生成 Snapshot #4 (phase=1，最新阶段)
 
 ---
 
-## 7. 关键技术要点总结
+## 8. 关键技术要点总结
 
 ### 7.1 数据正确性保障
 
