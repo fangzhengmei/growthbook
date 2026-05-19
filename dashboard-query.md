@@ -472,27 +472,35 @@ protected async beforeUpdate(existing, updates, _newDoc) {
 ```
 前端点击"刷新"按钮
   ↓
-PUT /api/dashboards/:id/refresh
+POST /dashboards/:id/refresh
   ↓
-refreshDashboardData() [dashboards.controller.ts:180]
-  ├─ 实验 Dashboard
-  │   ├─ planExperimentSnapshot()
-  │   ├─ createExperimentSnapshotFromPlan()
-  │   └─ 更新 block.snapshotId
-  └─ 通用 Dashboard
+refreshDashboardData() [dashboards.controller.ts:180-278]
+  │
+  ├─ 【分支1】有 experimentId 的实验 Dashboard
+  │   ├─ planExperimentSnapshot() → 创建主快照
+  │   ├─ 为不同 dimension 的 block 创建单独快照
+  │   ├─ updateDashboardMetricAnalyses()  ← 更新指标分析
+  │   ├─ updateDashboardSavedQueries()    ← 更新 SavedQuery 结果
+  │   │   └─ executeAndSaveQuery() [saved-queries.controller.ts:249]
+  │   │       └─ runFreeFormQuery() [datasource.ts:152]
+  │   │           ├─ 权限检查: canRunSqlExplorerQueries()
+  │   │           ├─ 安全检查: isReadOnlySQL()
+  │   │           ├─ SQL 拼装: integration.getFreeFormQuery()
+  │   │           │   └─ ensureLimit() + format()
+  │   │           └─ 查询执行: integration.runTestQuery()
+  │   │               └─ integration.runQuery()  // 具体数据源实现
+  │   ├─ updateDashboardExplorations()    ← 更新探索分析
+  │   └─ 保存 blocks (不更新 lastUpdated/nextUpdate)
+  │
+  └─ 【分支2】无 experimentId 的通用 Dashboard
       └─ updateNonExperimentDashboard() [dashboards.ts:235]
           ├─ updateDashboardMetricAnalyses()
           │   └─ createMetricAnalysis()
           ├─ updateDashboardSavedQueries()
-          │   └─ executeAndSaveQuery() [saved-queries.controller.ts:249]
-          │       └─ runFreeFormQuery() [datasource.ts:152]
-          │           ├─ getSourceIntegrationObject()
-          │           ├─ integration.getFreeFormQuery()
-          │           │   └─ ensureLimit() + format()
-          │           └─ integration.runTestQuery()
-          │               └─ integration.runQuery()  // 具体数据源实现
-          └─ updateDashboardExplorations()
-              └─ runProductAnalyticsExploration()
+          │   └─ (同上查询执行流程)
+          ├─ updateDashboardExplorations()
+          │   └─ runProductAnalyticsExploration()
+          └─ 保存 blocks + 更新 lastUpdated + 重算 nextUpdate
 ```
 
 ### 5.2 定时更新完整链路
@@ -631,39 +639,70 @@ interface QueryExecutionResult {
 
 ```typescript
 // 路由层: dashboards.controller.ts:131-168
-async putDashboard(req, res) {
-  const dashboard = await req.context.models.dashboards.getById(id);
-  const updates = await dashboardModel.processApiUpdateBody(
-    req.context,
-    body,
-    dashboard,
-    req.params.id
-  );
-  await req.context.models.dashboards.update(dashboard, updates);
-  return res.status(200).json({ status: 200, dashboard });
-}
+async updateDashboard(req, res) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+  const updates = { ...req.body };
+  const dashboard = await context.models.dashboards.getById(id);
+  
+  // 直接处理 blocks，不经过 processApiUpdateBody
+  if (updates.blocks) {
+    // 1. 迁移旧版本 block
+    const migratedBlocks = updates.blocks.map(migrateBlock);
+    // 2. 为新 block 生成 ID
+    const createdBlocks = migratedBlocks.map((blockData) =>
+      dashboardBlockHasIds(blockData)
+        ? blockData
+        : generateDashboardBlockIds(context.org.id, blockData),
+    );
+    updates.blocks = createdBlocks;
+  }
 
-// 模型层: DashboardModel.ts:442-460
-async processApiUpdateBody(context, body, existing, id) {
-  // 1. 处理 blocks
-  blocks: body.blocks?.map(block => 
-    fromBlockApiInterface(block, existing?.organization)
-  ),
-  // 2. 迁移旧版本 block
-  const migrateBlock = (block) => {
-    if (block.type === "sql-explorer" && !block.blockConfig) {
-      return { ...block, blockConfig: [] };
-    }
-    return block;
-  };
-  // 3. 为新 block 生成 ID
-  generateDashboardBlockIds(blocks, id);
+  // 3. 直接调用 updateById 保存
+  const updatedDashboard = await context.models.dashboards.updateById(
+    id,
+    updates as UpdateProps<DashboardInterface>,
+  );
+
+  return res.status(200).json({ status: 200, dashboard: updatedDashboard });
 }
 ```
 
-**代码位置**：
-- `packages/back-end/src/routers/dashboards/dashboards.controller.ts:131-168`
-- `packages/back-end/src/enterprise/models/DashboardModel.ts:442-460`
+**代码位置**：`packages/back-end/src/routers/dashboards/dashboards.controller.ts:131-168`
+
+> **重要修正**：`processApiUpdateBody` 方法存在于 DashboardModel 中，但它是给 BaseModel 的通用 API 框架使用的。当前路由显式调用了 `updateDashboard` 控制器，直接处理 blocks 并调用 `updateById`，**不会经过 `processApiUpdateBody`**。
+
+#### 8.1.3 migrateBlock 函数的真实作用
+
+`migrateBlock` 是一个独立导出的函数，用于处理版本迁移，但**它不会为 sql-explorer block 自动补空 blockConfig**：
+
+```typescript
+// DashboardModel.ts:494-670
+export function migrateBlock(doc) {
+  switch (doc.type) {
+    case "experiment-metric":
+      // 迁移 metricSelector -> metricIds
+      // 迁移 pinnedMetricSlices -> sliceTagsFilter
+      return { ...doc, metricIds, sliceTagsFilter, ... };
+      
+    case "experiment-dimension":
+      // 类似的迁移逻辑
+      return { ...doc, ... };
+      
+    case "experiment-time-series":
+      // 类似的迁移逻辑  
+      return { ...doc, ... };
+      
+    // 注意: sql-explorer 没有专门的迁移逻辑!
+    // blockConfig 为空数组的情况由 Zod schema 的默认值处理
+  }
+  return doc;
+}
+```
+
+**代码位置**：`packages/back-end/src/enterprise/models/DashboardModel.ts:494-670`
+
+> **关键发现**：`migrateBlock` 对 sql-explorer block 没有特殊处理。如果 block 缺少 `blockConfig` 字段，Zod schema 的 `legacySqlExplorerBlockInterface` 定义中 `blockConfig` 是可选的（`.optional()`），运行时会保留原值（可能为 undefined）。但在渲染时，SqlExplorerBlock 组件会使用 `block.blockConfig || []` 作为默认值。
 
 ### 8.2 blockConfig 与 dataVizConfigIndex 的映射机制
 
@@ -786,6 +825,62 @@ const blockNeedsConfiguration =
 
 **代码位置**：`packages/front-end/enterprise/components/Dashboards/DashboardEditor/DashboardBlock/index.tsx:346-366`
 
+#### 8.2.6 影响边界：只影响渲染，不影响查询执行
+
+> **🚨 关键修正**：`blockConfig` 和 `dataVizConfigIndex` **对查询执行完全没有影响**，它们只控制渲染展示。
+
+```typescript
+// updateDashboardSavedQueries() [dashboards.ts:379-414]
+// 这个函数只提取 savedQueryId，完全不看 blockConfig 或 dataVizConfigIndex
+export async function updateDashboardSavedQueries(context, blocks) {
+  const savedQueries = await context.models.savedQueries.getByIds([
+    ...new Set(
+      blocks
+        .filter(block => 
+          blockHasFieldOfType(block, "savedQueryId", isString) &&
+          block.savedQueryId.length > 0
+        )
+        .map(block => block.savedQueryId),  // 只提取 savedQueryId
+    ),
+  ]);
+
+  // ... 获取数据源 ...
+
+  await Promise.all(
+    savedQueries.map(async (savedQuery) => {
+      // 执行查询时只用 savedQuery 本身的 SQL，与 blockConfig 无关
+      await executeAndSaveQuery(context, savedQuery, savedQueryDataSource);
+    }),
+  );
+}
+```
+
+**代码位置**：`packages/back-end/src/enterprise/services/dashboards.ts:379-414`
+
+**影响边界总结**：
+
+| 阶段 | blockConfig/dataVizConfigIndex 的作用 | 依赖的核心数据 |
+|-----|------------------------------------|-------------|
+| **查询执行** | ❌ 无任何影响 | `savedQuery.sql` |
+| **结果存储** | ❌ 无任何影响 | `savedQuery.results` |
+| **前端渲染** | ✅ 决定展示哪些内容 | `blockConfig` + `savedQuery.dataVizConfig` + `savedQuery.results` |
+
+**执行流程中的数据流**：
+
+```
+保存阶段:
+  block { savedQueryId, blockConfig } → 存入数据库
+
+查询执行阶段:
+  提取所有 savedQueryId → 执行 SQL → 结果存入 SavedQuery.results
+  (blockConfig 在此阶段完全不被读取)
+
+渲染阶段:
+  读取 block.blockConfig → 遍历每个 configId:
+    ├─ "results_table" → 渲染 savedQuery.results.results
+    └─ "chart-id" → 匹配 savedQuery.dataVizConfig → 用 results 渲染图表
+```
+
 ### 8.3 手动刷新 vs 定时刷新：分叉差异详解
 
 #### 8.3.1 触发入口对比
@@ -807,18 +902,30 @@ const blockNeedsConfiguration =
     ↓
     POST /dashboards/${dashboard.id}/refresh
       ↓
-后端: dashboards.router.ts
+后端: dashboards.router.ts:98-102
   ↓
-  refreshDashboardData() [dashboards.controller.ts:180]
-    ├─ 实验 Dashboard: 走实验快照流程
-    └─ 通用 Dashboard: updateNonExperimentDashboard() [dashboards.ts:235]
-        └─ updateDashboardSavedQueries() [dashboards.ts:379-414]
-            └─ executeAndSaveQuery() [saved-queries.controller.ts:249-281]
-                └─ runFreeFormQuery() [datasource.ts:152-219]
-                    ├─ 权限检查: canRunSqlExplorerQueries()
-                    ├─ 安全检查: isReadOnlySQL()
-                    ├─ SQL 拼装: integration.getFreeFormQuery()
-                    └─ 查询执行: integration.runTestQuery()
+  refreshDashboardData() [dashboards.controller.ts:180-278]
+    │
+    ├─ 【分支1】有 experimentId 的实验 Dashboard
+    │   ├─ planExperimentSnapshot() → 创建主快照
+    │   ├─ 为不同 dimension 的 block 创建单独快照
+    │   ├─ updateDashboardMetricAnalyses()  ← 更新指标分析
+    │   ├─ updateDashboardSavedQueries()    ← 更新 SavedQuery 结果
+    │   ├─ updateDashboardExplorations()    ← 更新探索分析
+    │   └─ 保存 blocks (不更新 lastUpdated/nextUpdate)
+    │
+    └─ 【分支2】无 experimentId 的通用 Dashboard
+        └─ updateNonExperimentDashboard() [dashboards.ts:235-250]
+            ├─ updateDashboardMetricAnalyses()
+            ├─ updateDashboardSavedQueries() [dashboards.ts:379-414]
+            │   └─ executeAndSaveQuery() [saved-queries.controller.ts:249-281]
+            │       └─ runFreeFormQuery() [datasource.ts:152-219]
+            │           ├─ 权限检查: canRunSqlExplorerQueries()
+            │           ├─ 安全检查: isReadOnlySQL()
+            │           ├─ SQL 拼装: integration.getFreeFormQuery()
+            │           └─ 查询执行: integration.runTestQuery()
+            ├─ updateDashboardExplorations()
+            └─ 保存 blocks + 更新 lastUpdated + 重算 nextUpdate
                       ↓
 前端: DashboardSnapshotProvider.tsx
   ↓ 轮询状态 (每 2 秒)
@@ -859,14 +966,34 @@ Agenda 定时任务 (每 10 分钟触发)
 
 | 差异点 | 手动刷新 | 定时刷新 |
 |-------|---------|---------|
+| **触发入口** | `POST /dashboards/:id/refresh` | Agenda 任务调度 |
 | **上下文** | 用户请求上下文（带权限） | Agenda 系统上下文 |
-| **错误处理** | 立即返回错误给前端 | 失败后关闭 `enableAutoUpdates` |
-| **更新时间** | `lastUpdated` 立即更新 | `lastUpdated` 和 `nextUpdate` 都更新 |
+| **Dashboard 类型** | 支持实验 Dashboard 和通用 Dashboard | 仅支持通用 Dashboard（`experimentId=null`） |
+| **实验 Dashboard** | ✅ 支持，走实验快照流程 | ❌ 不支持（查询条件明确过滤 `experimentId=null`） |
+| **通用 Dashboard** | ✅ 调用 `updateNonExperimentDashboard()` | ✅ 调用 `updateNonExperimentDashboard()` |
+| **更新 lastUpdated** | 通用 Dashboard 更新，实验 Dashboard 不更新 | ✅ 总是更新 |
+| **重算 nextUpdate** | 通用 Dashboard 更新，实验 Dashboard 不更新 | ✅ 总是更新 |
+| **错误处理** | 立即抛出异常返回给前端 | 捕获异常，自动关闭 `enableAutoUpdates` |
 | **并发性** | 用户触发，可能并发 | 串行处理，最多 100 个/次 |
-| **结果通知** | 前端轮询，实时显示状态 | 无通知，仅更新数据库 |
-| **Dashboard 类型** | 支持实验和通用 Dashboard | 仅支持通用 Dashboard（`experimentId=null`） |
+| **结果通知** | 前端轮询，实时显示进度和状态 | 无通知，仅更新数据库 |
+| **sql-explorer 支持** | ✅ 通过 `updateDashboardSavedQueries()` 更新 | ✅ 通过 `updateDashboardSavedQueries()` 更新 |
 
-#### 8.3.5 失败处理差异
+#### 8.3.5 刷新接口 HTTP 方法确认
+
+> ✅ **确认正确**：刷新接口是 `POST /dashboards/:id/refresh`
+
+```typescript
+// dashboards.router.ts:98-102
+router.post(
+  "/:id/refresh",
+  validateRequestMiddleware({ params: dashboardParams }),
+  dashboardsController.refreshDashboardData,
+);
+```
+
+**代码位置**：`packages/back-end/src/routers/dashboards/dashboards.router.ts:98-102`
+
+#### 8.3.6 失败处理差异
 
 **手动刷新失败**：
 ```typescript
@@ -966,9 +1093,11 @@ const savedQueryOptions = useMemo(
 ┌─────────────────────────────────────────────────────────────────┐
 │                        后端存储阶段                              │
 ├─────────────────────────────────────────────────────────────────┤
-│  DashboardModel.processApiUpdateBody()                          │
+│  updateDashboard 控制器 [dashboards.controller.ts:131-168]      │
 │    ↓                                                             │
-│  验证 block 格式 → 迁移旧版本 → 生成 ID → 保存到 MongoDB        │
+│  migrateBlock() 迁移旧版本 → generateDashboardBlockIds() 生成 ID │
+│    ↓                                                             │
+│  updateById() 保存到 MongoDB                                    │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
@@ -977,7 +1106,7 @@ const savedQueryOptions = useMemo(
 │  手动/定时触发刷新                                               │
 │    ↓                                                             │
 │  updateDashboardSavedQueries() 提取所有 savedQueryId            │
-│    ↓                                                             │
+│    ↓ (blockConfig 在此阶段完全不被读取)                          │
 │  并行 executeAndSaveQuery() → 执行 SQL → 保存 results           │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
@@ -991,3 +1120,89 @@ const savedQueryOptions = useMemo(
 │    - "chart-1" → 匹配 dataVizConfig → DataVisualizationDisplay │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 九、代码理解错误修正总结
+
+本章节总结本次核对代码后发现并修正的错误：
+
+### 9.1 保存流程调用链错误
+
+**❌ 原错误理解**：
+```
+控制器调用 processApiUpdateBody() → 处理 blocks → 保存
+```
+
+**✅ 实际代码**（`dashboards.controller.ts:131-168`）：
+```typescript
+async updateDashboard(req, res) {
+  // 直接处理 blocks，不经过 processApiUpdateBody
+  if (updates.blocks) {
+    const migratedBlocks = updates.blocks.map(migrateBlock);
+    const createdBlocks = migratedBlocks.map(...);
+    updates.blocks = createdBlocks;
+  }
+  // 直接调用 updateById 保存
+  await context.models.dashboards.updateById(id, updates);
+}
+```
+
+**说明**：`processApiUpdateBody` 方法确实存在于 DashboardModel 中，但它是给 BaseModel 的通用 API 框架使用的。当前路由显式调用了 `updateDashboard` 控制器，**不会经过 `processApiUpdateBody`**。
+
+### 9.2 migrateBlock 函数作用错误
+
+**❌ 原错误理解**：`migrateBlock` 会为 sql-explorer block 自动补空 blockConfig 数组。
+
+**✅ 实际代码**（`DashboardModel.ts:494-670`）：
+- `migrateBlock` 只处理 `experiment-metric`、`experiment-dimension`、`experiment-time-series` 三种 block 类型的版本迁移
+- 对 sql-explorer block **没有任何特殊处理**
+- 如果 block 缺少 blockConfig 字段，会保留原值（可能为 undefined）
+- 渲染时由前端组件 `SqlExplorerBlock.tsx` 使用 `block.blockConfig || []` 作为默认值
+
+### 9.3 HTTP 方法错误
+
+**❌ 原错误理解**：刷新接口是 `PUT /api/dashboards/:id/refresh`
+
+**✅ 实际代码**（`dashboards.router.ts:98-102`）：
+```typescript
+router.post("/:id/refresh", ..., dashboardsController.refreshDashboardData);
+```
+
+**正确接口**：`POST /dashboards/:id/refresh`
+
+### 9.4 blockConfig 影响边界错误
+
+**❌ 原错误理解**：隐含暗示 blockConfig 可能影响查询执行。
+
+**✅ 实际代码**（`dashboards.ts:379-414`）：
+```typescript
+export async function updateDashboardSavedQueries(context, blocks) {
+  // 只提取 savedQueryId，完全不看 blockConfig
+  const savedQueryIds = blocks
+    .filter(block => blockHasFieldOfType(block, "savedQueryId", isString))
+    .map(block => block.savedQueryId);
+  
+  // ... 执行查询时只用 savedQuery 本身的 SQL
+}
+```
+
+**明确结论**：
+- `blockConfig` 和 `dataVizConfigIndex` **对查询执行完全没有影响**
+- 它们**只控制前端渲染展示**，决定显示哪些结果和图表
+- 查询执行仅依赖 `savedQueryId` 和 `SavedQuery.sql`
+
+### 9.5 手动刷新分支逻辑错误
+
+**❌ 原错误理解**：手动刷新只有一个统一流程。
+
+**✅ 实际代码**（`dashboards.controller.ts:180-278`）：
+- 手动刷新有**两个分支**：
+  - **分支 1**：有 `experimentId` 的实验 Dashboard → 走实验快照流程 + 更新三类数据
+  - **分支 2**：无 `experimentId` 的通用 Dashboard → 调用 `updateNonExperimentDashboard()`
+- 实验 Dashboard 手动刷新**不更新** `lastUpdated` 和 `nextUpdate`
+- 通用 Dashboard 手动刷新**会更新** `lastUpdated` 和 `nextUpdate`
+
+### 9.6 定时刷新限制错误
+
+**✅ 补充确认**：定时刷新通过 `getDashboardsToUpdate()` 明确过滤 `experimentId: null`，**只支持通用 Dashboard**，不支持实验 Dashboard。
