@@ -61,22 +61,12 @@ export const getSdkPayload = createApiRequestHandler({
 | 密钥类型 | 生成时机 | 用途 | 存储位置 | 代码位置 |
 |---------|---------|------|---------|---------|
 | `key` (SDK 连接 Key) | 创建 SDK 连接时 | 客户端请求载荷的唯一标识，URL 路径参数，缓存键 | `sdkconnections` 集合 | `SdkConnectionModel.ts:217-221` |
-| `encryptionKey` | 创建 SDK 连接时 | AES-CBC 128 位密钥，加密载荷内容 | `sdkconnections` 集合 | `SdkConnectionModel.ts:242-252` |
+| `encryptionKey` | 创建 SDK 连接时 | AES-CBC 128 位密钥，加密载荷内容 | `sdkconnections` 集合 | `api-key.util.ts:50-62` |
 | `proxy.signingKey` | 创建 SDK 连接时 | 代理签名密钥 | `sdkconnections` 集合 | `SdkConnectionModel.ts:246` |
 
-### 2.2 密钥生成代码
+### 2.2 `generateEncryptionKey` 定义与调用链路
 
-**SDK 连接 Key 生成** `SdkConnectionModel.ts:217-221`
-
-```typescript
-function generateSDKConnectionKey() {
-  return generateSigningKey("sdk-", 12);
-}
-```
-
-- 前缀固定为 `sdk-`，用于 `getPayloadParamsFromApiKey()` 中通过正则 `/^sdk-/` 识别
-
-**加密密钥生成** `SdkConnectionModel.ts:242-252`
+**定义位置**：`packages/back-end/src/util/api-key.util.ts:50-62`
 
 ```typescript
 export async function generateEncryptionKey(): Promise<string> {
@@ -89,7 +79,42 @@ export async function generateEncryptionKey(): Promise<string> {
 }
 ```
 
-### 2.3 强绑定关系 `SdkConnectionInterface` `sdk-connection.d.ts:66-105`
+**调用位置 1**：SDK 连接创建 `SdkConnectionModel.ts:34, 238`
+
+```typescript
+// 导入
+import { generateEncryptionKey } from "back-end/src/util/api-key.util";
+
+// 创建连接时调用
+const connection: SDKConnectionInterface = {
+  // ...
+  encryptionKey: await generateEncryptionKey(),
+  // ...
+};
+```
+
+**调用位置 2**：旧版 API Key 创建 `ApiKeyModel.ts:5, 360`
+
+```typescript
+import { generateEncryptionKey } from "back-end/src/util/api-key.util";
+
+// 创建旧版 API Key 时可选调用
+encryptionKey: encryptSDK ? await generateEncryptionKey() : undefined,
+```
+
+> **职责澄清**：`generateEncryptionKey` 是通用工具函数，定义在 `api-key.util.ts` 中，被 `SdkConnectionModel` 和 `ApiKeyModel` 共同使用。
+
+### 2.3 SDK 连接 Key 生成 `SdkConnectionModel.ts:217-221`
+
+```typescript
+function generateSDKConnectionKey() {
+  return generateSigningKey("sdk-", 12);
+}
+```
+
+- 前缀固定为 `sdk-`，用于 `getPayloadParamsFromApiKey()` 中通过正则 `/^sdk-/` 识别
+
+### 2.4 强绑定关系 `SdkConnectionInterface` `sdk-connection.d.ts:66-105`
 
 ```typescript
 export interface SDKConnectionInterface {
@@ -108,7 +133,7 @@ export interface SDKConnectionInterface {
 }
 ```
 
-### 2.4 密钥吊销（删除连接）`SdkConnectionModel.ts:451-461`
+### 2.5 密钥吊销（删除连接）`SdkConnectionModel.ts:451-461`
 
 ```typescript
 export async function deleteSDKConnectionModel(
@@ -125,7 +150,7 @@ export async function deleteSDKConnectionModel(
 
 > **重要校正**：删除连接时**没有主动删除对应的缓存记录**。缓存记录（`sdkcache` 集合）保留，但后续请求时会因 `findSDKConnectionByKey(key)` 找不到连接而抛出 `UnrecoverableApiError("Invalid API Key")`。
 
-### 2.5 吊销验证 `features.ts:326-329`
+### 2.6 吊销验证 `controllers/features.ts:326-329`
 
 ```typescript
 if (key.match(/^sdk-/)) {
@@ -139,9 +164,116 @@ if (key.match(/^sdk-/)) {
 
 ---
 
-## 三、载荷构造与缓存
+## 三、控制台到后端完整闭环（创建/更新/删除）
 
-### 3.1 缓存键设计
+### 3.1 创建 SDK 连接
+
+| 层级 | 代码位置 | 关键操作 |
+|------|---------|---------|
+| 前端调用点 | `SDKConnectionForm.tsx:429-435` | `apiCall(/sdk-connections, { method: "POST", body: ... })` |
+| API 路由层 | `sdk-connection.router.ts:11` | `router.post("/", sdkConnectionController.postSDKConnection)` |
+| 控制器层 | `sdk-connection.controller.ts:73-90` | 调用 `createSDKConnection()` → `queueSDKPayloadRefresh()` |
+| 模型层 | `SdkConnectionModel.ts:230-294` | `createSDKConnection()` 生成 key + encryptionKey → 写入 DB → `queueSDKPayloadRefresh()` |
+
+**前端调用** `SDKConnectionForm.tsx:429-435`
+
+```typescript
+const res = await apiCall<{ connection: SDKConnectionInterface }>(
+  `/sdk-connections`,
+  {
+    method: "POST",
+    body: JSON.stringify(body),
+  },
+);
+```
+
+**控制器层** `sdk-connection.controller.ts:73-90`
+
+```typescript
+const doc = await createSDKConnection(context, {
+  ...params,
+  encryptPayload,
+  hashSecureAttributes,
+  remoteEvalEnabled,
+  organization: org.id,
+});
+
+queueSDKPayloadRefresh({
+  context,
+  payloadKeys: [],
+  sdkConnections: [doc],
+  auditContext: { event: "created", model: "sdkconnection", id: doc.id },
+});
+```
+
+### 3.2 更新 SDK 连接
+
+| 层级 | 代码位置 | 关键操作 |
+|------|---------|---------|
+| 前端调用点 | `SDKConnectionForm.tsx:423-426` | `apiCall(/sdk-connections/${id}, { method: "PUT", body: ... })` |
+| API 路由层 | `sdk-connection.router.ts:13` | `router.put("/:id", sdkConnectionController.putSDKConnection)` |
+| 控制器层 | `sdk-connection.controller.ts:98-167` | 调用 `editSDKConnection()` → 如配置变更则 `queueSDKPayloadRefresh()` |
+| 模型层 | `SdkConnectionModel.ts:297-429` | `editSDKConnection()` 更新 DB → 如环境/项目/加密等变更则 `queueSDKPayloadRefresh()` |
+
+**前端调用** `SDKConnectionForm.tsx:423-426`
+
+```typescript
+await apiCall(`/sdk-connections/${initialValue.id}`, {
+  method: "PUT",
+  body: JSON.stringify(body),
+});
+```
+
+**配置变更触发刷新** `SdkConnectionModel.ts:369-427`
+
+```typescript
+const keysRequiringProxyUpdate = [
+  "sdkVersion", "projects", "environment", "encryptPayload",
+  "hashSecureAttributes", "remoteEvalEnabled", "includeVisualExperiments",
+  "includeDraftExperiments", "includeExperimentNames", "includeRedirectExperiments",
+  "includeRuleIds", "includeProjectIdInMetadata", "includeCustomFieldsInMetadata",
+  "allowedCustomFieldsInMetadata", "includeTagsInMetadata",
+  "savedGroupReferencesEnabled",
+] as const;
+
+keysRequiringProxyUpdate.forEach((key) => {
+  if (key in otherChanges && !isEqual(otherChanges[key], connection[key])) {
+    needsProxyUpdate = true;
+  }
+});
+
+if (needsProxyUpdate) {
+  queueSDKPayloadRefresh({
+    context,
+    payloadKeys: [],
+    sdkConnections: [{ ...connection, ...fullChanges }],
+    auditContext: { event: "updated", model: "sdkconnection", id: connection.id },
+  });
+}
+```
+
+### 3.3 删除 SDK 连接
+
+| 层级 | 代码位置 | 关键操作 |
+|------|---------|---------|
+| 前端调用点 | `sdks/[sdkid].tsx:159-161` | `apiCall(/sdk-connections/${id}, { method: "DELETE" })` |
+| API 路由层 | `sdk-connection.router.ts:21` | `router.delete("/:id", sdkConnectionController.deleteSDKConnection)` |
+| 控制器层 | `sdk-connection.controller.ts:146-167` | 调用 `deleteSDKConnectionModel()` |
+| 模型层 | `SdkConnectionModel.ts:451-461` | `deleteSDKConnectionModel()` 从 DB 删除连接记录 |
+
+**前端调用** `sdks/[sdkid].tsx:159-161`
+
+```typescript
+await apiCall(`/sdk-connections/${connection.id}`, {
+  method: "DELETE",
+});
+```
+
+---
+
+## 四、载荷构造与缓存
+
+### 4.1 缓存键设计
 
 **缓存键 = `connection.key`**（即 SDK 连接的 `key` 字段）
 
@@ -156,13 +288,13 @@ public async getById(id: string) {
 }
 ```
 
-`features.ts:427`
+`controllers/features.ts:427`
 
 ```typescript
 const cached = await context.models.sdkConnectionCache.getById(params.key);
 ```
 
-`features.ts:802-806`
+`services/features.ts:802-806`
 
 ```typescript
 await context.models.sdkConnectionCache.upsert(
@@ -172,9 +304,9 @@ await context.models.sdkConnectionCache.upsert(
 );
 ```
 
-### 3.2 载荷构造流程
+### 4.2 载荷构造流程
 
-`getFeatureDefinitionsWithCache()` `features.ts:415-501`
+`getFeatureDefinitionsWithCache()` `controllers/features.ts:415-501`
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -190,18 +322,20 @@ await context.models.sdkConnectionCache.upsert(
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 缓存失效触发条件
+### 4.3 `queueSDKPayloadRefresh` 完整触发矩阵
 
 **主动失效**：通过 `queueSDKPayloadRefresh()` 触发缓存刷新，**不是删除缓存，而是覆盖更新**
 
-`features.ts:607-621`
+`services/features.ts:607-621`
 
 ```typescript
 export function queueSDKPayloadRefresh(data: {
   context: ReqContext | ApiReqContext;
   payloadKeys: SDKPayloadKey[];
   sdkConnections?: SDKConnectionInterface[];
-  // ...
+  skipRefreshForProject?: string;
+  treatEmptyProjectAsGlobal?: boolean;
+  auditContext?: { event: string; model: string; id?: string };
 }) {
   refreshSDKPayloadCache({ ...data, stackTrace }).catch((e) => {
     logger.error(e, "Error refreshing SDK Payload Cache");
@@ -209,15 +343,26 @@ export function queueSDKPayloadRefresh(data: {
 }
 ```
 
-**触发时机**（调用 `queueSDKPayloadRefresh` 的场景）：
+**完整触发场景矩阵**：
 
-| 触发场景 | 代码位置 | payloadKeys 参数 |
-|---------|---------|-----------------|
-| 功能发布/变更 | `postFeature.ts`, `editFeature.ts`, `toggleFeature.ts` 等 | 受影响的 `{ environment, project }` 组合 |
-| SDK 连接配置变更（环境/项目/加密等） | `SdkConnectionModel.ts:411-427` | 空数组，直接传入 `sdkConnections` |
-| 实验启动/停止 | `experiment-feature.ts` | 受影响的环境 + 项目 |
+| 触发模块 | 触发场景 | 代码位置 | payloadKeys / sdkConnections |
+|---------|---------|---------|-----------------------------|
+| **Feature** | 创建、更新、删除、切换状态 | `FeatureModel.ts:873, 899, 927` | 受影响的 `{ environment, project }` |
+| **SDK Connection** | 创建 | `SdkConnectionModel.ts:281-290` | `sdkConnections: [newConnection]` |
+| **SDK Connection** | 更新（环境/项目/加密等配置变更） | `SdkConnectionModel.ts:411-427` | `sdkConnections: [updatedConnection]` |
+| **SDK Connection** | 控制器层创建后 | `sdk-connection.controller.ts:81-90` | `sdkConnections: [doc]` |
+| **Experiment** | 启动、停止、关联 feature | `ExperimentModel.ts:2013, 2044` | 受影响的 `{ environment, project }` |
+| **Project** | `publicId` 变更 | `ProjectModel.ts:143-154` | 所有环境 + `treatEmptyProjectAsGlobal: true` |
+| **Custom Field** | 创建、更新 | `CustomFieldModel.ts:275, 308` | 所有环境 + `treatEmptyProjectAsGlobal: true` |
+| **Saved Group** | 创建、更新、删除 | `savedGroups.ts:24-32` | 所有环境 + 所有项目（全局刷新） |
+| **Holdout** | 创建、更新、删除、状态变更 | `holdout.controller.ts:522, 558, 615, 639, 721` | `getAffectedSDKPayloadKeys(holdout)` |
+| **Holdout (Job)** | 定时状态更新 | `updateHoldoutStatus.ts:138, 171, 201` | `getAffectedSDKPayloadKeys(holdout)` |
+| **URL Redirect** | 创建、更新、删除 | `UrlRedirectModel.ts:127, 158` | `getPayloadKeys(context, experiment)` |
+| **Visual Changeset** | 创建、更新、删除 | `VisualChangesetModel.ts:428, 464, 495` | 受影响的 `{ environment, project }` |
+| **Environment** | 创建、更新 | `environment.controller.ts:211` `putEnvironment.ts:65` | 受影响的环境 |
+| **Safe Rollout** | 创建、更新、删除 | `SafeRolloutModel.ts:85` | 受影响的 `{ environment, project }` |
 
-**匹配逻辑** `features.ts:728-740`
+**匹配逻辑** `services/features.ts:728-740`
 
 ```typescript
 sdkConnections.forEach((connection) => {
@@ -237,7 +382,7 @@ sdkConnections.forEach((connection) => {
 });
 ```
 
-### 3.4 加密载荷构造 `features.ts:843-960`
+### 4.4 加密载荷构造 `services/features.ts:843-960`
 
 `getFeatureDefinitionsResponse()` 中处理加密：
 
@@ -263,9 +408,9 @@ export async function getFeatureDefinitionsResponse({
 
 ---
 
-## 四、客户端拉取与重连
+## 五、客户端拉取与重连
 
-### 4.1 拉取入口 `feature-repository.ts:50-54`
+### 5.1 拉取入口 `feature-repository.ts:50-54`
 
 ```typescript
 fetchFeaturesCall: ({ host, clientKey, headers }) => {
@@ -276,7 +421,7 @@ fetchFeaturesCall: ({ host, clientKey, headers }) => {
 },
 ```
 
-### 4.2 SSE 实时更新连接 `feature-repository.ts:67-74`
+### 5.2 SSE 实时更新连接 `feature-repository.ts:67-74`
 
 ```typescript
 eventSourceCall: ({ host, clientKey, headers }) => {
@@ -289,7 +434,7 @@ eventSourceCall: ({ host, clientKey, headers }) => {
 
 > **SSE 端点 `/sub/:key`**：由独立的代理/边缘服务处理，不在主后端 app.ts 路由中。
 
-### 4.3 拉取策略 `feature-repository.ts:384-446`
+### 5.3 拉取策略 `feature-repository.ts:384-446`
 
 **SWR（Stale-While-Revalidate）策略**：
 
@@ -307,7 +452,7 @@ eventSourceCall: ({ host, clientKey, headers }) => {
 └─────────────────────────────────────────────────┘
 ```
 
-### 4.4 SSE 事件处理 `feature-repository.ts:473-496`
+### 5.4 SSE 事件处理 `feature-repository.ts:473-496`
 
 ```typescript
 cb: (event: MessageEvent<string>) => {
@@ -327,7 +472,7 @@ cb: (event: MessageEvent<string>) => {
 },
 ```
 
-### 4.5 错误重试与退避 `feature-repository.ts:505-521`
+### 5.5 错误重试与退避 `feature-repository.ts:505-521`
 
 ```typescript
 function onSSEError(channel: ScopedChannel) {
@@ -346,7 +491,7 @@ function onSSEError(channel: ScopedChannel) {
 }
 ```
 
-### 4.6 客户端解密 `GrowthBookClient.ts`
+### 5.6 客户端解密 `GrowthBookClient.ts`
 
 ```typescript
 public async setPayload(payload: FeatureApiResponse): Promise<void> {
@@ -362,79 +507,138 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
 
 ---
 
-## 五、完整链路图
+## 六、完整链路图
 
 ```
-┌─────────────┐  1. 创建连接  ┌───────────────────────────────────┐
-│ 控制台 UI   │──────────────▶│ 后端 /api/v1/sdk-connections      │
-│ (SDK 连接)  │               │  - generateSDKConnectionKey()     │
-└─────────────┘               │  - generateEncryptionKey()        │
-       │                      │  - 写入 sdkconnections 集合        │
-       │                      └───────────────────────────────────┘
-       │                                         │
-       │ 5. 功能变更（发布/编辑）                │
-       ▼                                         │
-┌─────────────┐  触发刷新  ┌───────────────────────────────────┐
-│ 控制台 UI   │──────────▶│ queueSDKPayloadRefresh()           │
-│ (功能管理)  │            │  - 匹配受影响的 SDK 连接            │
-└─────────────┘            │  - buildSDKPayloadForConnection()  │
-                           │  - upsert 到 sdkcache 集合          │
-                           └───────────────────────────────────┘
-                                                                       
-                                                                       
-                           ┌───────────────────────────────────┐
-                           │ 客户端 SDK                        │
-                           │  ┌─────────────────────────────┐  │
-                           │  │ 2. GET /api/features/:key   │  │
-                           │  │    getFeatureDefinitions... │  │
-                           │  │    命中缓存 → 直接返回        │  │
-                           │  │    未命中 → 实时生成 → 缓存   │  │
-                           │  └─────────────────────────────┘  │
-                           │  ┌─────────────────────────────┐  │
-                           │  │ 3. EventSource /sub/:key    │  │
-                           │  │    features-updated → 重拉   │  │
-                           │  │    features → 直接更新       │  │
-                           │  │    错误 → 指数退避重试        │  │
-                           │  └─────────────────────────────┘  │
-                           │  ┌─────────────────────────────┐  │
-                           │  │ 4. setPayload()             │  │
-                           │  │    decryptPayload()         │  │
-                           │  └─────────────────────────────┘  │
-                           └───────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 控制台 UI (front-end)                                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  SDKConnectionForm.tsx                            sdks/[sdkid].tsx     │
+│  ├─ POST /sdk-connections (创建)             ├─ DELETE /sdk-connections/:id │
+│  └─ PUT /sdk-connections/:id (更新)          └─ ...                     │
+│                                                                         │
+│  其他管理页面                                                             │
+│  ├─ 功能管理（Feature）→ 触发 payloadKeys                                │
+│  ├─ 实验管理（Experiment）→ 触发 payloadKeys                             │
+│  ├─ 项目管理（Project）→ 触发全局刷新                                     │
+│  ├─ 自定义字段（Custom Field）→ 触发全局刷新                              │
+│  ├─ 分组管理（Saved Group）→ 触发全局刷新                                 │
+│  ├─ Holdout 管理 → 触发受影响环境刷新                                     │
+│  ├─ URL Redirect 管理 → 触发关联实验刷新                                  │
+│  └─ Visual Changeset 管理 → 触发受影响环境刷新                            │
+│                                                                         │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 后端 API 路由层                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│  sdk-connection.router.ts                                                │
+│  ├─ POST /          → postSDKConnection                                  │
+│  ├─ PUT /:id        → putSDKConnection                                   │
+│  └─ DELETE /:id     → deleteSDKConnection                                │
+│                                                                         │
+│  其他路由（features, experiments, projects, ...）                        │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 后端模型层 / 服务层                                                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│  SdkConnectionModel.ts                                                   │
+│  ├─ createSDKConnection() → generateSDKConnectionKey()                  │
+│  │                           → generateEncryptionKey()                  │
+│  │                           → queueSDKPayloadRefresh()                 │
+│  ├─ editSDKConnection()   → 如配置变更 → queueSDKPayloadRefresh()       │
+│  └─ deleteSDKConnectionModel() → 从 DB 删除记录                          │
+│                                                                         │
+│  services/features.ts                                                    │
+│  ├─ queueSDKPayloadRefresh() → refreshSDKPayloadCache()                 │
+│  │                                   ├─ 匹配受影响的 SDK 连接            │
+│  │                                   ├─ buildSDKPayloadForConnection()  │
+│  │                                   └─ sdkConnectionCache.upsert()      │
+│  ├─ getFeatureDefinitionsResponse() → 可选 encrypt() 加密               │
+│  └─ ...                                                                  │
+│                                                                         │
+│  其他模型（FeatureModel, ExperimentModel, ProjectModel, ...）            │
+│  └─ 各自 afterUpdate / afterDelete 钩子 → queueSDKPayloadRefresh()       │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 数据库                                                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  sdkconnections 集合       → 存储连接配置（key, encryptionKey, ...）    │
+│  sdkcache 集合             → 存储载荷缓存（key = connection.key）        │
+│  features / experiments / projects / ... 集合                            │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+          ┌─────────────────────┴─────────────────────┐
+          │                                           │
+          ▼                                           ▼
+┌───────────────────────────────┐    ┌───────────────────────────────────┐
+│ 客户端 SDK (sdk-js)          │    │ 代理 / 边缘服务                    │
+├───────────────────────────────┤    ├───────────────────────────────────┤
+│  feature-repository.ts        │    │  /sub/:key (SSE 端点)              │
+│  ├─ fetchFeatures()           │    │  ├─ features-updated → 通知重拉    │
+│  │  → GET /api/features/:key  │    │  └─ features → 直接推送数据        │
+│  ├─ startAutoRefresh()        │    │                                   │
+│  │  → EventSource /sub/:key   │    │                                   │
+│  └─ onSSEError()              │    │                                   │
+│     → 指数退避重试            │    │                                   │
+│                              │    │                                   │
+│  GrowthBookClient.ts          │    │                                   │
+│  └─ setPayload()              │    │                                   │
+│     → decryptPayload()        │    │                                   │
+└───────────────────────────────┘    └───────────────────────────────────┘
 ```
 
 ---
 
-## 六、核心代码文件索引
+## 七、核心代码文件索引
 
 | 模块 | 文件路径 | 关键函数 |
 |------|---------|---------|
+| 工具函数 | `packages/back-end/src/util/api-key.util.ts` | `generateEncryptionKey`, `generateSigningKey` |
 | 类型定义 | `packages/shared/types/sdk-connection.d.ts` | `SDKConnectionInterface` |
-| 后端模型 | `packages/back-end/src/models/SdkConnectionModel.ts` | `generateSDKConnectionKey`, `generateEncryptionKey`, `deleteSDKConnectionModel`, `updateSDKConnectionModel` |
+| 后端模型 | `packages/back-end/src/models/SdkConnectionModel.ts` | `generateSDKConnectionKey`, `createSDKConnection`, `editSDKConnection`, `deleteSDKConnectionModel` |
 | 缓存模型 | `packages/back-end/src/models/SdkConnectionCacheModel.ts` | `getById`, `upsert` |
 | 载荷生成 | `packages/back-end/src/services/features.ts` | `queueSDKPayloadRefresh`, `refreshSDKPayloadCache`, `buildSDKPayloadForConnection`, `getFeatureDefinitionsResponse` |
 | 控制器 | `packages/back-end/src/controllers/features.ts` | `getFeatureDefinitionsWithCache`, `getPayloadParamsFromApiKey`, `getFeaturesPublic` |
+| 连接控制器 | `packages/back-end/src/routers/sdk-connection/sdk-connection.controller.ts` | `postSDKConnection`, `putSDKConnection`, `deleteSDKConnection` |
+| 连接路由 | `packages/back-end/src/routers/sdk-connection/sdk-connection.router.ts` | 路由定义 |
 | API 路由 | `packages/back-end/src/api/sdk-payload/getSdkPayload.ts` | `getSdkPayload` |
+| 前端表单 | `packages/front-end/components/Features/SDKConnections/SDKConnectionForm.tsx` | 创建/编辑 SDK 连接 |
+| 前端详情 | `packages/front-end/pages/sdks/[sdkid].tsx` | 删除 SDK 连接 |
 | 客户端拉取 | `packages/sdk-js/src/feature-repository.ts` | `fetchFeatures`, `startAutoRefresh`, `onSSEError`, `enableChannel`, `disableChannel` |
 | 客户端解密 | `packages/sdk-js/src/GrowthBookClient.ts` | `setPayload` |
-| 前端 UI | `packages/front-end/components/Features/SDKConnections/SDKConnectionForm.tsx` | SDK 连接创建/编辑表单 |
 
 ---
 
-## 七、关键结论
+## 八、关键结论
 
-1.  **环境强绑定**：`SDKConnectionInterface.environment` 在创建时确定，`getPayloadParamsFromApiKey()` 从 key 反查连接时提取，无法跨环境拉取。
+1.  **`generateEncryptionKey` 职责澄清**：定义在 `api-key.util.ts:50-62`，是通用工具函数，被 `SdkConnectionModel`（SDK 连接）和 `ApiKeyModel`（旧版 API Key）共同调用。
 
-2.  **两个 API 入口职责分离**：
+2.  **环境强绑定**：`SDKConnectionInterface.environment` 在创建时确定，`getPayloadParamsFromApiKey()` 从 key 反查连接时提取，无法跨环境拉取。
+
+3.  **两个 API 入口职责分离**：
     - `/api/features/:key`：公开、无认证、SDK 客户端主入口
     - `/api/v1/sdk-payload/:key`：需认证、管理端/服务端使用
 
-3.  **缓存键 = 连接 Key**：每个 SDK 连接有独立的缓存，以 `connection.key` 为键存储在 `sdkcache` 集合。
+4.  **控制台到后端完整闭环**：
+    - 创建：`SDKConnectionForm.tsx` → `POST /sdk-connections` → `postSDKConnection` → `createSDKConnection` → `queueSDKPayloadRefresh`
+    - 更新：`SDKConnectionForm.tsx` → `PUT /sdk-connections/:id` → `putSDKConnection` → `editSDKConnection` → 如配置变更则 `queueSDKPayloadRefresh`
+    - 删除：`sdks/[sdkid].tsx` → `DELETE /sdk-connections/:id` → `deleteSDKConnection` → `deleteSDKConnectionModel`
 
-4.  **缓存失效 = 覆盖更新**：没有显式删除缓存的操作，通过 `queueSDKPayloadRefresh()` 触发 `upsert` 覆盖更新。
+5.  **`queueSDKPayloadRefresh` 触发矩阵**：覆盖 12+ 个模块，包括 Feature、SDK Connection、Experiment、Project、Custom Field、Saved Group、Holdout、URL Redirect、Visual Changeset、Environment、Safe Rollout。
 
-5.  **密钥吊销 = 删除连接**：删除连接记录后，`findSDKConnectionByKey()` 会抛出 "Invalid API Key" 错误，缓存记录保留但无法访问。
+6.  **缓存键 = 连接 Key**：每个 SDK 连接有独立的缓存，以 `connection.key` 为键存储在 `sdkcache` 集合。
 
-6.  **SSE 连接独立**：`/sub/:key` 端点由独立代理服务处理，推送 `features-updated`（通知重拉）或 `features`（直接推送数据）事件。
+7.  **缓存失效 = 覆盖更新**：没有显式删除缓存的操作，通过 `queueSDKPayloadRefresh()` 触发 `upsert` 覆盖更新。
 
-7.  **客户端重试机制**：SSE 连接错误采用指数退避（3^n * 1s），最大 5 分钟间隔。
+8.  **密钥吊销 = 删除连接**：删除连接记录后，`findSDKConnectionByKey()` 会抛出 "Invalid API Key" 错误，缓存记录保留但无法访问。
+
+9.  **SSE 连接独立**：`/sub/:key` 端点由独立代理服务处理，推送 `features-updated`（通知重拉）或 `features`（直接推送数据）事件。
+
+10. **客户端重试机制**：SSE 连接错误采用指数退避（`3^(errors-3) * (1000 + random(0-1000))` ms），最大 5 分钟间隔。
