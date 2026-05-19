@@ -271,9 +271,170 @@ await apiCall(`/sdk-connections/${connection.id}`, {
 
 ---
 
-## 四、载荷构造与缓存
+## 四、SDK 连接创建阶段的双重刷新机制分析
 
-### 4.1 缓存键设计
+### 4.1 问题确认：同一次创建动作触发两次 `queueSDKPayloadRefresh`
+
+在 SDK 连接创建流程中，**模型层**和**控制器层**都独立调用了 `queueSDKPayloadRefresh`，导致同一次创建动作触发两次完整的 payload 刷新。
+
+**调用链概览**：
+
+```
+POST /sdk-connections
+    │
+    ├─→ sdk-connection.controller.ts:postSDKConnection
+    │    │
+    │    ├─→ createSDKConnection()  [模型层]
+    │    │    └─→ queueSDKPayloadRefresh()  ← 第一次调用 (SdkConnectionModel.ts:281)
+    │    │
+    │    └─→ queueSDKPayloadRefresh()  ← 第二次调用 (sdk-connection.controller.ts:81)
+    │
+    └─→ 返回响应
+```
+
+### 4.2 完整执行路径与代码锚点
+
+| 层级 | 代码位置 | 关键操作 |
+|------|---------|---------|
+| **前端入口** | `SDKConnectionForm.tsx:429-435` | `apiCall(/sdk-connections, { method: "POST" })` |
+| **API 路由层** | `sdk-connection.router.ts:11` | `router.post("/", sdkConnectionController.postSDKConnection)` |
+| **控制器层调用** | `sdk-connection.controller.ts:81-90` | 调用 `createSDKConnection()` 返回后，执行 `queueSDKPayloadRefresh()` |
+| **模型层调用** | `SdkConnectionModel.ts:281-290` | `createSDKConnection()` 内部写入 DB 后，执行 `queueSDKPayloadRefresh()` |
+| **刷新执行** | `services/features.ts:607-621` | `queueSDKPayloadRefresh()` → 异步调用 `refreshSDKPayloadCache()` |
+
+### 4.3 第一次调用（模型层）`SdkConnectionModel.ts:281-290`
+
+```typescript
+// createSDKConnection() 函数内部
+const doc = await SDKConnectionModel.create(connection);
+
+if (IS_CLOUD) {
+  // ... Cloud 环境的 SDK 映射
+}
+
+queueSDKPayloadRefresh({
+  context,
+  payloadKeys: [],
+  sdkConnections: [connection],
+  auditContext: {
+    event: "created",
+    model: "sdkconnection",
+    id: connection.id,
+  },
+});
+
+const created = toInterface(doc);
+await audit.logCreate(context, created);
+return created;
+```
+
+**调用时机**：DB 写入完成后，`createSDKConnection` 函数返回前。
+
+### 4.4 第二次调用（控制器层）`sdk-connection.controller.ts:81-90`
+
+```typescript
+const doc = await createSDKConnection(context, {
+  ...params,
+  encryptPayload,
+  hashSecureAttributes,
+  remoteEvalEnabled,
+  organization: org.id,
+});
+
+queueSDKPayloadRefresh({
+  context,
+  payloadKeys: [],
+  sdkConnections: [doc],
+  auditContext: {
+    event: "created",
+    model: "sdkconnection",
+    id: doc.id,
+  },
+});
+
+res.status(200).json({
+  status: 200,
+  connection: doc,
+});
+```
+
+**调用时机**：`createSDKConnection()` 返回后，响应发送前。
+
+### 4.5 去重/合并保障机制检查
+
+| 机制类型 | 是否存在 | 说明 |
+|---------|---------|------|
+| **内存去重** | ❌ 不存在 | `queueSDKPayloadRefresh` 直接调用 `refreshSDKPayloadCache`，无任何去重逻辑 |
+| **任务队列** | ❌ 不存在 | 直接异步调用，没有经过任务队列或批处理 |
+| **防抖/节流** | ❌ 不存在 | 没有任何 debounce 或 throttle 机制 |
+| **乐观锁** | ❌ 不存在 | `upsert` 方法没有版本检查或乐观锁 |
+| **幂等性** | ✅ 存在 | 两次调用结果相同，最终数据一致 |
+
+**`upsert` 实现分析** `SdkConnectionCacheModel.ts:41-63`：
+
+```typescript
+public async upsert(
+  id: string,
+  contents: string,
+  auditContext?: SdkConnectionCacheAuditContext,
+) {
+  // Find existing doc by id only (ignore version) to support version upgrades
+  const existing = await this._findOne({ id });
+  const updateData = {
+    contents,
+    schemaVersion: LATEST_SDK_PAYLOAD_SCHEMA_VERSION,
+    audit: auditContext,
+  };
+  if (existing) {
+    return this.update(existing, updateData);  // 第二次调用会走这里
+  }
+  return this.create({ id, ...updateData });  // 第一次调用会走这里
+}
+```
+
+> **关键点**：两次调用都会执行完整的 `refreshSDKPayloadCache` 流程，只是最终 `upsert` 时第一次创建、第二次更新。
+
+### 4.6 实际影响分析
+
+| 影响维度 | 分析结论 | 说明 |
+|---------|---------|------|
+| **刷新次数** | ❌ 2 次完整刷新 | 同一次创建触发两次独立的 `refreshSDKPayloadCache` 执行 |
+| **API 响应时延** | ✅ 无影响 | 两次调用都是 fire-and-forget，不阻塞 API 响应 |
+| **数据一致性** | ✅ 无影响 | 两次刷新结果相同，最终数据一致 |
+| **资源浪费** | ❌ 显著浪费 | 重复执行：<br>• `getAllPayloadExperiments()` <br>• `getAllPayloadSafeRollouts()` <br>• `getAllSavedGroups()` <br>• `getAllFeatures()` <br>• `getAllVisualExperiments()` <br>• `getAllURLRedirectExperiments()` <br>• `buildSDKPayloadForConnection()` |
+| **数据库负载** | ❌ 翻倍 | 两次完整的查询 + 两次 upsert 写入 |
+| **稳定性风险** | ⚠️ 低风险 | 不会导致错误，但在高并发创建场景下可能加剧数据库压力 |
+| **竞态条件** | ⚠️ 理论存在 | 两次异步执行可能交叉，但 `upsert` 是原子操作，最终状态一致 |
+
+### 4.7 设计意图推测与改进建议
+
+**可能的设计意图**：
+1. **模型层自包含**：模型层内部确保创建后缓存立即可用
+2. **控制器层统一**：控制器层作为统一入口，确保所有 SDK 连接变更都触发刷新
+3. **代码重构遗留**：可能是某次重构时遗漏了对重复调用的清理
+
+**改进建议**：
+- 移除其中一次调用（建议移除控制器层的调用，保持模型层自包含）
+- 或在 `queueSDKPayloadRefresh` 中增加基于 `connection.key` 的短时间窗口去重（如 1 秒内相同 key 只执行一次）
+
+### 4.8 两次刷新执行时序对比
+
+| 时间点 | 第一次刷新（模型层） | 第二次刷新（控制器层） |
+|-------|---------------------|---------------------|
+| T0 | 触发 `queueSDKPayloadRefresh` | 未触发 |
+| T1 | 异步执行 `refreshSDKPayloadCache` | `createSDKConnection` 返回 |
+| T2 | 查询所有数据（features, experiments...） | 触发 `queueSDKPayloadRefresh` |
+| T3 | 构建 payload | 异步执行 `refreshSDKPayloadCache` |
+| T4 | `upsert` 创建缓存记录（第一次） | 查询所有数据（重复查询） |
+| T5 | 完成 | 构建 payload（重复构建） |
+| T6 | - | `upsert` 更新缓存记录（第二次） |
+| T7 | - | 完成 |
+
+---
+
+## 五、载荷构造与缓存
+
+### 5.1 缓存键设计
 
 **缓存键 = `connection.key`**（即 SDK 连接的 `key` 字段）
 
@@ -304,7 +465,7 @@ await context.models.sdkConnectionCache.upsert(
 );
 ```
 
-### 4.2 载荷构造流程
+### 5.2 载荷构造流程
 
 `getFeatureDefinitionsWithCache()` `controllers/features.ts:415-501`
 
@@ -322,7 +483,7 @@ await context.models.sdkConnectionCache.upsert(
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 4.3 `queueSDKPayloadRefresh` 完整触发矩阵
+### 5.3 `queueSDKPayloadRefresh` 完整触发矩阵
 
 **主动失效**：通过 `queueSDKPayloadRefresh()` 触发缓存刷新，**不是删除缓存，而是覆盖更新**
 
@@ -382,7 +543,7 @@ sdkConnections.forEach((connection) => {
 });
 ```
 
-### 4.4 加密载荷构造 `services/features.ts:843-960`
+### 5.4 加密载荷构造 `services/features.ts:843-960`
 
 `getFeatureDefinitionsResponse()` 中处理加密：
 
@@ -408,9 +569,9 @@ export async function getFeatureDefinitionsResponse({
 
 ---
 
-## 五、客户端拉取与重连
+## 六、客户端拉取与重连
 
-### 5.1 拉取入口 `feature-repository.ts:50-54`
+### 6.1 拉取入口 `feature-repository.ts:50-54`
 
 ```typescript
 fetchFeaturesCall: ({ host, clientKey, headers }) => {
@@ -421,7 +582,7 @@ fetchFeaturesCall: ({ host, clientKey, headers }) => {
 },
 ```
 
-### 5.2 SSE 实时更新连接 `feature-repository.ts:67-74`
+### 6.2 SSE 实时更新连接 `feature-repository.ts:67-74`
 
 ```typescript
 eventSourceCall: ({ host, clientKey, headers }) => {
@@ -434,7 +595,7 @@ eventSourceCall: ({ host, clientKey, headers }) => {
 
 > **SSE 端点 `/sub/:key`**：由独立的代理/边缘服务处理，不在主后端 app.ts 路由中。
 
-### 5.3 拉取策略 `feature-repository.ts:384-446`
+### 6.3 拉取策略 `feature-repository.ts:384-446`
 
 **SWR（Stale-While-Revalidate）策略**：
 
@@ -452,7 +613,7 @@ eventSourceCall: ({ host, clientKey, headers }) => {
 └─────────────────────────────────────────────────┘
 ```
 
-### 5.4 SSE 事件处理 `feature-repository.ts:473-496`
+### 6.4 SSE 事件处理 `feature-repository.ts:473-496`
 
 ```typescript
 cb: (event: MessageEvent<string>) => {
@@ -472,7 +633,7 @@ cb: (event: MessageEvent<string>) => {
 },
 ```
 
-### 5.5 错误重试与退避 `feature-repository.ts:505-521`
+### 6.5 错误重试与退避 `feature-repository.ts:505-521`
 
 ```typescript
 function onSSEError(channel: ScopedChannel) {
@@ -491,7 +652,7 @@ function onSSEError(channel: ScopedChannel) {
 }
 ```
 
-### 5.6 客户端解密 `GrowthBookClient.ts`
+### 6.6 客户端解密 `GrowthBookClient.ts`
 
 ```typescript
 public async setPayload(payload: FeatureApiResponse): Promise<void> {
@@ -507,7 +668,7 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
 
 ---
 
-## 六、完整链路图
+## 七、完整链路图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -549,9 +710,13 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
 │  SdkConnectionModel.ts                                                   │
 │  ├─ createSDKConnection() → generateSDKConnectionKey()                  │
 │  │                           → generateEncryptionKey()                  │
-│  │                           → queueSDKPayloadRefresh()                 │
+│  │                           → queueSDKPayloadRefresh()  ⚠️ 第一次      │
 │  ├─ editSDKConnection()   → 如配置变更 → queueSDKPayloadRefresh()       │
 │  └─ deleteSDKConnectionModel() → 从 DB 删除记录                          │
+│                                                                         │
+│  sdk-connection.controller.ts                                            │
+│  └─ postSDKConnection() → 调用 createSDKConnection() 返回后             │
+│                           → queueSDKPayloadRefresh()  ⚠️ 第二次（重复）  │
 │                                                                         │
 │  services/features.ts                                                    │
 │  ├─ queueSDKPayloadRefresh() → refreshSDKPayloadCache()                 │
@@ -596,7 +761,7 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
 
 ---
 
-## 七、核心代码文件索引
+## 八、核心代码文件索引
 
 | 模块 | 文件路径 | 关键函数 |
 |------|---------|---------|
@@ -616,7 +781,7 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
 
 ---
 
-## 八、关键结论
+## 九、关键结论
 
 1.  **`generateEncryptionKey` 职责澄清**：定义在 `api-key.util.ts:50-62`，是通用工具函数，被 `SdkConnectionModel`（SDK 连接）和 `ApiKeyModel`（旧版 API Key）共同调用。
 
@@ -631,14 +796,25 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
     - 更新：`SDKConnectionForm.tsx` → `PUT /sdk-connections/:id` → `putSDKConnection` → `editSDKConnection` → 如配置变更则 `queueSDKPayloadRefresh`
     - 删除：`sdks/[sdkid].tsx` → `DELETE /sdk-connections/:id` → `deleteSDKConnection` → `deleteSDKConnectionModel`
 
-5.  **`queueSDKPayloadRefresh` 触发矩阵**：覆盖 12+ 个模块，包括 Feature、SDK Connection、Experiment、Project、Custom Field、Saved Group、Holdout、URL Redirect、Visual Changeset、Environment、Safe Rollout。
+5.  **⚠️ 创建阶段存在双重刷新**：SDK 连接创建时，**模型层**（`SdkConnectionModel.ts:281`）和**控制器层**（`sdk-connection.controller.ts:81`）都独立调用了 `queueSDKPayloadRefresh`，导致同一次创建触发两次完整的 payload 刷新。
 
-6.  **缓存键 = 连接 Key**：每个 SDK 连接有独立的缓存，以 `connection.key` 为键存储在 `sdkcache` 集合。
+6.  **无去重保障机制**：`queueSDKPayloadRefresh` 直接调用 `refreshSDKPayloadCache`，没有内存去重、任务队列、防抖/节流或乐观锁机制。
 
-7.  **缓存失效 = 覆盖更新**：没有显式删除缓存的操作，通过 `queueSDKPayloadRefresh()` 触发 `upsert` 覆盖更新。
+7.  **双重刷新的影响**：
+    - ✅ API 响应时延无影响（fire-and-forget）
+    - ✅ 数据一致性无影响（两次结果相同）
+    - ❌ 资源显著浪费（重复查询 features/experiments/savedGroups/holdouts 等）
+    - ❌ 数据库负载翻倍（两次查询 + 两次 upsert）
+    - ⚠️ 高并发场景下可能加剧数据库压力
 
-8.  **密钥吊销 = 删除连接**：删除连接记录后，`findSDKConnectionByKey()` 会抛出 "Invalid API Key" 错误，缓存记录保留但无法访问。
+8.  **`queueSDKPayloadRefresh` 触发矩阵**：覆盖 12+ 个模块，包括 Feature、SDK Connection、Experiment、Project、Custom Field、Saved Group、Holdout、URL Redirect、Visual Changeset、Environment、Safe Rollout。
 
-9.  **SSE 连接独立**：`/sub/:key` 端点由独立代理服务处理，推送 `features-updated`（通知重拉）或 `features`（直接推送数据）事件。
+9.  **缓存键 = 连接 Key**：每个 SDK 连接有独立的缓存，以 `connection.key` 为键存储在 `sdkcache` 集合。
 
-10. **客户端重试机制**：SSE 连接错误采用指数退避（`3^(errors-3) * (1000 + random(0-1000))` ms），最大 5 分钟间隔。
+10. **缓存失效 = 覆盖更新**：没有显式删除缓存的操作，通过 `queueSDKPayloadRefresh()` 触发 `upsert` 覆盖更新。
+
+11. **密钥吊销 = 删除连接**：删除连接记录后，`findSDKConnectionByKey()` 会抛出 "Invalid API Key" 错误，缓存记录保留但无法访问。
+
+12. **SSE 连接独立**：`/sub/:key` 端点由独立代理服务处理，推送 `features-updated`（通知重拉）或 `features`（直接推送数据）事件。
+
+13. **客户端重试机制**：SSE 连接错误采用指数退避（`3^(errors-3) * (1000 + random(0-1000))` ms），最大 5 分钟间隔。
