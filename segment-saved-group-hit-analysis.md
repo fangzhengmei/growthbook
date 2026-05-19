@@ -18,7 +18,7 @@
 
 ### 2.1 结构真源
 
-Saved Group 的类型定义真源在 Zod validator 中（`packages/shared/src/validators/saved-group.ts:9-26`）：
+Saved Group 的类型定义真源在 Zod validator 中（`packages/shared/src/validators/saved-group.ts:7-26`）：
 
 ```typescript
 export const savedGroupTypeValidator = z.enum(["condition", "list"]);
@@ -60,60 +60,95 @@ export const savedGroupTargeting = z
 
 在构建 SDK payload 时，`getParsedCondition()` 将 saved group 配置转换为 SDK 可评估的条件（`packages/back-end/src/util/features.ts:125-208`）：
 
+**函数签名（源码精确）**：
 ```typescript
-function getParsedCondition(
+export function getParsedCondition(
   groupMap: GroupMap,
   condition?: string,
   savedGroups?: SavedGroupTargeting[],
-) {
-  const conditions: ConditionInterface[] = [];
-  
-  // 1. 解析常规条件 JSON
-  if (condition) conditions.push(JSON.parse(condition));
-  
-  // 2. 解析 savedGroups 配置（支持 all/any/none 三种匹配模式）
-  if (savedGroups) {
-    savedGroups.forEach(({ ids, match }) => {
-      if (match === "all") {
-        // 全部命中：每个 group 单独 AND
-        ids.forEach(id => conditions.push(getSavedGroupCondition(id, groupMap, true)));
-      } else if (match === "any") {
-        // 任意命中：多个 group 用 OR 包裹
-        conditions.push({ $or: ids.map(id => getSavedGroupCondition(id, groupMap, true)) });
-      } else if (match === "none") {
-        // 全部不命中：每个 group 单独 AND NOT
-        ids.forEach(id => conditions.push(getSavedGroupCondition(id, groupMap, false)));
-      }
-    });
+): ConditionInterface | undefined
+```
+
+**执行流程**：
+```typescript
+const conditions: ConditionInterface[] = [];
+
+// 1. 解析常规条件 JSON（仅当 condition !== "{}" 时）
+if (condition && condition !== "{}") {
+  try {
+    const cond = JSON.parse(condition);
+    if (cond) conditions.push(cond);
+  } catch (e) {
+    // ignore condition parse errors here
   }
-  
-  return { $and: conditions };
 }
+
+// 2. 解析 savedGroups 配置（支持 all/any/none 三种匹配模式）
+if (savedGroups) {
+  savedGroups.forEach(({ ids, match }) => {
+    // 过滤无效 group（condition 为空或 list 无值）
+    const groupIds = ids.filter((id) => {
+      const group = groupMap.get(id);
+      if (!group) return false;
+      if (group.type === "condition") {
+        if (!group.condition || group.condition === "{}") return false;
+      } else {
+        if (!group.useEmptyListGroup && !group.values?.length) return false;
+        if (typeof group.values === "undefined") return false;
+      }
+      return true;
+    });
+    if (!groupIds.length) return;
+
+    // match === "all"：每个 group 单独 AND
+    // match === "any"：多个 group 用 OR 包裹（单个 OR 直接提升到顶层）
+    // match === "none"：每个 group 单独 AND NOT
+  });
+}
+
+// 3. 展开嵌套 saved groups
+conditions.forEach((cond) => {
+  recursiveWalk(cond, expandNestedSavedGroups(groupMap));
+});
+
+// 返回值：无条件返回 undefined，单条件直接返回，多条件用 $and 包裹
+return conditions.length === 0 ? undefined :
+       conditions.length === 1 ? conditions[0] :
+       { $and: conditions };
 ```
 
 单个 saved group 的条件转换逻辑 `getSavedGroupCondition()`（`packages/back-end/src/util/features.ts:102-123`）：
 
+**函数签名（源码精确）**：
 ```typescript
 function getSavedGroupCondition(
   groupId: string,
   groupMap: GroupMap,
   include: boolean,
-): null | ConditionInterface {
-  const group = groupMap.get(groupId);
-  
-  // condition 类型：直接使用条件表达式
-  if (group.type === "condition" && group.condition) {
+): null | ConditionInterface
+```
+
+**执行流程**：
+```typescript
+const group = groupMap.get(groupId);
+if (!group) return null;
+
+// condition 类型：直接使用条件表达式（JSON.parse 失败返回 null）
+if (group.type === "condition" && group.condition) {
+  try {
     const cond = JSON.parse(group.condition);
     return include ? cond : { $not: cond };
+  } catch (e) {
+    return null;
   }
-  
-  // list 类型：生成 $inGroup / $notInGroup 操作符
-  return {
-    [group.attributeKey]: { 
-      [include ? "$inGroup" : "$notInGroup"]: groupId 
-    },
-  };
 }
+
+// list 类型：无 attributeKey 返回 null
+if (!group.attributeKey) return null;
+
+return {
+  [group.attributeKey]: { [include ? "$inGroup" : "$notInGroup"]: groupId },
+};
 ```
 
 ### 2.3 条件评估（SDK 侧）
@@ -138,7 +173,7 @@ case "$notInGroup":
 
 ### 3.1 结构真源
 
-Segment 的类型定义真源在 Zod validator 中（`packages/shared/src/validators/segment.ts:9-27`）：
+Segment 的类型定义真源在 Zod validator 中（`packages/shared/src/validators/segment.ts:7-27`）：
 
 ```typescript
 const TYPES = ["SQL", "FACT"] as const;
@@ -158,94 +193,155 @@ export const segmentValidator = z
     managedBy: z.enum(["", "api", "config"]).optional(),
     sql: z.string().optional(),   // SQL 类型：用户自定义 SQL
     factTableId: z.string().optional(), // FACT 类型：关联事实表
-    filters: z.array(z.string()).optional(), // FACT 类型：过滤条件
+    filters: z.array(z.string()).optional(), // FACT 类型：过滤条件（注意：string[]，不是 Filter[]）
     projects: z.array(z.string()).optional(),
   })
   .strict();
 ```
 
-**注意**：`packages/shared/types/segment.d.ts` 中的类型只是从 validator 派生的别名（`z.infer<typeof segmentValidator>`），不包含结构定义。
+**注意**：
+- `packages/shared/types/segment.d.ts` 中的类型只是从 validator 派生的别名（`z.infer<typeof segmentValidator>`），不包含结构定义
+- `filters` 字段类型是 `z.array(z.string())`（字符串数组），不是 `Filter[]`
 
 ### 3.2 SQL 过滤逻辑（分析端）
 
-Segment 过滤发生在实验单元查询 `__experimentUnits` CTE 中（`packages/back-end/src/integrations/sql/queries/experiment-units-query.ts:148-163, 220-224`）：
+Segment 过滤发生在实验单元查询 `__experimentUnits` CTE 中（`packages/back-end/src/integrations/sql/queries/experiment-units-query.ts:22-243`）。
 
+**函数签名（源码精确）**：
+```typescript
+export function getExperimentUnitsQuery(
+  dialect: SqlDialect,
+  datasource: DataSourceInterface,
+  params: ExperimentUnitsQueryParams,
+): string
+```
+
+其中 `ExperimentUnitsQueryParams` 定义（`packages/shared/types/integrations.d.ts:299-310`）：
+```typescript
+interface ExperimentBaseQueryParams {
+  settings: ExperimentSnapshotSettings;
+  activationMetric: ExperimentMetricInterface | null;
+  factTableMap: FactTableMap;
+  dimensions: Dimension[];
+  segment: SegmentInterface | null;
+  unitsTableFullName?: string;
+}
+
+export interface ExperimentUnitsQueryParams extends ExperimentBaseQueryParams {
+  includeIdJoins: boolean;
+}
+```
+
+**SQL 结构（源码精确）**：
 ```sql
 WITH
-  -- 1. 构建 segment CTE
-  __segment as (
-    -- SQL 类型：直接使用用户定义的 SQL
-    -- FACT 类型：通过 getFactSegmentCTE 生成
-    SELECT user_id, date FROM (...segment SQL...) s
+  ${params.includeIdJoins ? idJoinSQL : ""}
+  __rawExperiment AS (
+    ${compileSqlTemplate(exposureQuery.query, {
+      startDate, endDate, experimentId, phase, customFields
+    })}
   ),
-  
-  -- 2. 实验曝光数据
   __experimentExposures AS (
-    SELECT 
-      e.user_id, 
-      e.variation_id, 
-      e.timestamp
+    SELECT
+      e.${baseIdType} as ${baseIdType},
+      CAST(e.variation_id AS CHAR) as variation,
+      CAST(e.timestamp AS DATETIME) as timestamp
     FROM __rawExperiment e
-    WHERE e.experiment_id = 'exp_xxx'
+    WHERE e.experiment_id = '${settings.experimentId}'
+      AND e.timestamp >= ${startTimestamp}
+      ${endDate ? `AND e.timestamp <= ${endTimestamp}` : ""}
+      ${settings.queryFilter ? `AND (${settings.queryFilter})` : ""}
   ),
-  
-  -- 3. 实验单元：曝光数据 JOIN segment 过滤
+  ${activationMetric ? `, __activationMetric as (...)` : ""}
+  ${segment ? `, __segment as (${getSegmentCTE(...)})` : ""}  -- 行 148-163
+  ${unitDimensions.map(d => `, __dim_unit_${d.dimension.id} as (...)`).join("\n")}
   __experimentUnits AS (
     SELECT
-      e.user_id,
-      MAX(e.variation_id) AS variation,
+      e.${baseIdType} AS ${baseIdType},
+      ${variationLogic} AS variation,
       MIN(e.timestamp) AS first_exposure_timestamp
     FROM __experimentExposures e
-    -- 关键：INNER JOIN segment，只保留同时在 segment 中的用户
-    JOIN __segment s ON (s.user_id = e.user_id)
-    -- 时间一致性：确保用户在曝光时刻已属于该 segment
-    WHERE s.date <= e.timestamp
-    GROUP BY e.user_id
+    ${segment ? `JOIN __segment s ON (s.${baseIdType} = e.${baseIdType})` : ""}  -- 行 220-224
+    ${unitDimensions.map(d => `LEFT JOIN __dim_unit_${d.dimension.id} ...`).join("\n")}
+    ${activationMetric ? `LEFT JOIN __activationMetric a ON ...` : ""}
+    ${segment ? `WHERE s.date <= e.timestamp` : ""}  -- 行 239
+    GROUP BY e.${baseIdType}
   )
 ```
 
 ### 3.3 Segment CTE 构建
 
-`getSegmentCTE()` 负责生成 segment 的 CTE SQL（`packages/back-end/src/integrations/sql/ctes/segment-cte.ts:8-83`）：
+`getSegmentCTE()` 负责生成 segment 的 CTE SQL（`packages/back-end/src/integrations/sql/ctes/segment-cte.ts:8-83`）。
 
+**函数签名（源码精确）**：
 ```typescript
-function getSegmentCTE(
+export function getSegmentCTE(
   dialect: SqlDialect,
   segment: SegmentInterface,
   baseIdType: string,
   idJoinMap: Record<string, string>,
   factTableMap: FactTableMap,
-  cteContext?: CteContext,
-): string {
-  let segmentSql: string;
-  
-  if (segment.type === "SQL") {
-    segmentSql = segment.sql;
-  } else {
-    // FACT 类型：基于事实表 + 过滤器生成 SQL
-    segmentSql = getFactSegmentCTE(dialect, {
-      factTable,
-      filters: segment.filters,
-      cteContext,
-      // ...
-    });
-  }
-  
-  // 处理跨 ID 类型 join（如 segment 用 user_id，但实验用 anonymous_id）
-  if (segment.userIdType !== baseIdType) {
-    return `
-      SELECT
-        i.${baseIdType},
-        ${dateCol} as date
-      FROM (${segmentSql}) s
-      JOIN ${idJoinMap[segment.userIdType]} i 
-        ON (i.${segment.userIdType} = s.${segment.userIdType})
-    `;
-  }
-  
-  return segmentSql;
-}
+  sqlVars?: SQLVars,  // 注意：第5个参数是 sqlVars，不是 cteContext
+): string
 ```
+
+**执行流程**：
+```typescript
+let segmentSql = "";
+
+// SQL 类型：使用用户自定义 SQL（支持模板变量替换）
+if (segment.type === "SQL") {
+  if (!segment.sql) throw new Error("SQL Segment has no SQL value");
+  segmentSql = sqlVars
+    ? compileSqlTemplate(segment.sql, sqlVars, dialect)
+    : segment.sql;
+}
+// FACT 类型：基于事实表 + 过滤器生成 SQL
+else {
+  if (!segment.factTableId) throw new Error("FACT Segment has no factTableId");
+  const factTable = factTableMap.get(segment.factTableId);
+  if (!factTable) throw new Error(`Unknown fact table: ${segment.factTableId}`);
+  
+  segmentSql = getFactSegmentCTE(dialect, {
+    baseIdType,
+    idJoinMap,
+    factTable,
+    filters: segment.filters,
+    sqlVars,
+  });
+  
+  // FACT 类型直接返回包装后的 SQL，不经过后续 ID 类型转换
+  return `-- Segment (${segment.name})
+          SELECT * FROM (\n${segmentSql}\n) s `;
+}
+
+// SQL 类型：处理 ID 类型转换
+const dateCol = dialect.castUserDateCol("s.date");
+const userIdType = segment.userIdType || "user_id";
+
+// 跨 ID 类型 join（如 segment 用 user_id，实验用 anonymous_id）
+if (userIdType !== baseIdType) {
+  return `-- Segment (${segment.name})
+    SELECT i.${baseIdType}, ${dateCol} as date
+    FROM (${segmentSql}) s
+    JOIN ${idJoinMap[userIdType]} i ON (i.${userIdType} = s.${userIdType})`;
+}
+
+// 日期列需要转换
+if (dateCol !== "s.date") {
+  return `-- Segment (${segment.name})
+    SELECT s.${userIdType}, ${dateCol} as date
+    FROM (${segmentSql}) s`;
+}
+
+// 直接返回原始 SQL
+return `-- Segment (${segment.name})\n${segmentSql}\n`;
+```
+
+**关键点**：
+- 第 5 个参数是 `sqlVars?: SQLVars`，不是 `cteContext`
+- `getSegmentCTE` 调用 `getFactSegmentCTE`，不调用 `getExperimentUnitsQuery`
+- FACT 类型在函数内部直接返回，不经过后续 ID 类型转换逻辑
 
 ---
 
@@ -264,9 +360,8 @@ ExperimentResultsQueryRunner.startQueries()
   │
   ├─ [分支1] useUnitsTable = true
   │   ├─ 调用 integration.getExperimentUnitsTableQuery(unitQueryParams)
-  │   │   → SqlIntegration.getExperimentUnitsTableQuery()
-  │   │   → 内部调用 this.getExperimentUnitsQuery(params)
-  │   │   → buildExperimentUnitsQuerySql()
+  │   │   → SqlIntegration.getExperimentUnitsTableQuery()  [行 807-818]
+  │   │   → 内部调用 this.getExperimentUnitsQuery(params)  [行 812]
   │   │   → 生成 CREATE TABLE ... AS SELECT * FROM __experimentUnits
   │   │
   │   └─ 后续指标查询：unitsSource = "exposureTable"
@@ -280,29 +375,77 @@ ExperimentResultsQueryRunner.startQueries()
 
 ### 4.2 快照设置构建：saved group 缺席的证据
 
-`getSnapshotSettings()` 函数（`packages/back-end/src/services/experiments.ts:429-725`）展示了 snapshotSettings 的完整构建过程：
+`getSnapshotSettings()` 函数（`packages/back-end/src/services/experiments.ts:429-725`）展示了 snapshotSettings 的完整构建过程。
 
+**函数签名（源码精确）**：
 ```typescript
 export function getSnapshotSettings({
   experiment,
   phaseIndex,
-  // ... 其他参数
-}: { /* ... */ }): ExperimentSnapshotSettings {
-  const phase = experiment.phases[phaseIndex];
-  
-  return {
-    activationMetric: experiment.activationMetric || null,
-    attributionModel: experiment.attributionModel || "firstExposure",
-    lookbackOverride: lookbackOverride,
-    skipPartialData: !!experiment.skipPartialData,
-    segment: experiment.segment || "",           // ✓ segment 被读取
-    queryFilter: experiment.queryFilter || "",   // ✓ queryFilter 被读取
-    datasourceId: experiment.datasource || "",
-    // ... 其他字段
-    // ✗ 注意：这里没有任何 phase.savedGroups 的读取逻辑
-    // ✗ 没有任何 saved group 相关字段被写入 snapshotSettings
-  };
-}
+  snapshotType,
+  dimension,
+  regressionAdjustmentEnabled,
+  orgPriorSettings,
+  orgDisabledPrecomputedDimensions,
+  settingsForSnapshotMetrics,
+  metricMap,
+  factTableMap,
+  metricGroups,
+  incrementalRefreshModel,
+  reweight,
+  datasource,
+  useStickyBucketing,
+}: {
+  experiment: ExperimentInterface;
+  phaseIndex: number;
+  snapshotType: SnapshotType;
+  dimension: string | null;
+  regressionAdjustmentEnabled: boolean;
+  orgPriorSettings: MetricPriorSettings | undefined;
+  orgDisabledPrecomputedDimensions: boolean;
+  settingsForSnapshotMetrics: MetricSnapshotSettings[];
+  metricMap: Map<string, ExperimentMetricInterface>;
+  factTableMap: FactTableMap;
+  metricGroups: MetricGroupInterface[];
+  incrementalRefreshModel: IncrementalRefreshInterface | null;
+  reweight?: boolean;
+  datasource?: DataSourceInterface;
+  useStickyBucketing?: boolean;
+}): ExperimentSnapshotSettings
+```
+
+**返回结构（源码精确，行 695-724）**：
+```typescript
+return {
+  activationMetric: experiment.activationMetric || null,
+  attributionModel: experiment.attributionModel || "firstExposure",
+  lookbackOverride: lookbackOverride,
+  skipPartialData: !!experiment.skipPartialData,
+  segment: experiment.segment || "",           // ✓ segment 被读取
+  queryFilter: experiment.queryFilter || "",   // ✓ queryFilter 被读取
+  datasourceId: experiment.datasource || "",
+  dimensions: dimensions,
+  startDate: phase.dateStarted,
+  endDate: phase.dateEnded || new Date(),
+  experimentId: experiment.trackingKey || experiment.id,
+  phase: {
+    index: phaseIndex + "",
+  },
+  customFields: experiment.customFields,
+  goalMetrics,
+  secondaryMetrics,
+  guardrailMetrics,
+  regressionAdjustmentEnabled,
+  defaultMetricPriorSettings: defaultPriorSettings,
+  exposureQueryId: experiment.exposureQueryId,
+  metricSettings,
+  variations: getLatestPhaseVariations(experiment).map((v, i) => ({
+    id: v.key || i + "",
+    weight: phase.variationWeights[i] || 0,
+  })),
+  coverage: phase.coverage ?? 1,
+  banditSettings,
+};
 ```
 
 **代码证据 1：类型定义层面**
@@ -347,22 +490,32 @@ const useUnitsTable =
 ```
 
 **执行流程**：
-1. 先执行 `getExperimentUnitsTableQuery()`（`SqlIntegration.ts:807-818`）：
+1. `getExperimentUnitsTableQuery()`（`SqlIntegration.ts:807-818`）：
+   ```typescript
+   getExperimentUnitsTableQuery(params: ExperimentUnitsQueryParams): string {
+     if (!params.unitsTableFullName) {
+       throw new Error("Units table full name is required");
+     }
+     const cteSql = this.getExperimentUnitsQuery(params);
+     return this.getExperimentUnitsTableQueryFromCte(
+       params.unitsTableFullName,
+       cteSql,
+     );
+   }
+   ```
+   生成 SQL：
    ```sql
-   CREATE OR REPLACE TABLE growthbook_tmp_units_xxx AS (
-     WITH __experimentUnits AS (
-       -- 包含 segment JOIN 过滤
-       SELECT ... FROM __experimentExposures e
-       JOIN __segment s ON (s.user_id = e.user_id)
-       WHERE s.date <= e.timestamp
-     )
+   CREATE OR REPLACE TABLE ${unitsTableFullName}
+   ${this.createUnitsTableOptions()}
+   AS (
+     WITH
+     ${cteSql}
      SELECT * FROM __experimentUnits
    );
    ```
 2. 所有后续指标查询通过 `unitsSource: "exposureTable"` 直接读取该临时表（`experiment-metric-query.ts:305-306`）：
    ```sql
-   SELECT ... FROM growthbook_tmp_units_xxx
-   -- 无需再次 JOIN segment
+   FROM ${params.unitsTableFullName}
    ```
 
 **优势**：多指标共享一次 segment 过滤，避免重复计算。
@@ -373,28 +526,72 @@ const useUnitsTable =
 
 **执行流程**：每个指标查询内嵌完整的 `__experimentUnits` CTE（`experiment-metric-query.ts:273-277`）：
 ```sql
--- getExperimentMetricQuery() 生成的 SQL
 WITH
-  __experimentUnits AS (
-    -- 每个指标查询都重新做一次 segment JOIN
-    SELECT ... FROM __experimentExposures e
-    JOIN __segment s ON (s.user_id = e.user_id)
-    WHERE s.date <= e.timestamp
-  ),
+  ${idJoinSQL}
+  ${
+    params.unitsSource === "exposureQuery"
+      ? `${getExperimentUnitsQuery(dialect, datasource, {
+          ...params,
+          includeIdJoins: false,
+        })},`
+      : params.unitsSource === "otherQuery"
+        ? params.unitsSql
+        : ""
+  }
   __distinctUsers AS (
-    SELECT ... FROM __experimentUnits
-  ),
-  __metric AS (...)
-SELECT ...
+    SELECT ... FROM ${
+      params.unitsSource === "exposureTable"
+        ? `${params.unitsTableFullName}`
+        : "__experimentUnits"
+    }
+  )
 ```
 
 **行为差异**：
 - `unitsSource: "exposureQuery"` 时，`idTypeObjects` 会额外包含 segment 的 `userIdType`（`experiment-metric-query.ts:208-213`）
 - `unitsSource: "exposureTable"` 时，segment 过滤已在临时表中完成，指标查询不再处理 segment
 
-### 4.4 评估与回溯阶段的协作机制
+### 4.4 Experiment Metric Query 完整链路
 
-#### 4.4.1 全流程时序图
+`getExperimentMetricQuery()`（`packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts:38-614`）
+
+**函数签名（源码精确）**：
+```typescript
+export function getExperimentMetricQuery(
+  dialect: SqlDialect,
+  datasource: DataSourceInterface,
+  params: ExperimentMetricQueryParams,
+): string
+```
+
+其中 `ExperimentMetricQueryParams` 定义（`packages/shared/types/integrations.d.ts:397-404`）：
+```typescript
+type UnitsSource = "exposureQuery" | "exposureTable" | "otherQuery";
+
+export interface ExperimentMetricQueryParams extends ExperimentBaseQueryParams {
+  metric: MetricInterface;
+  denominatorMetrics: MetricInterface[];
+  unitsSource: UnitsSource;
+  unitsSql?: string;
+  forcedUserIdType?: string;
+}
+```
+
+**关键参数解构（行 43-49）**：
+```typescript
+const {
+  metric: metricDoc,
+  denominatorMetrics: denominatorMetricsDocs,
+  activationMetric: activationMetricDoc,
+  settings,
+  segment,
+} = params;
+const factTableMap = params.factTableMap;
+```
+
+### 4.5 评估与回溯阶段的协作机制
+
+#### 4.5.1 全流程时序图
 
 ```
 实验配置阶段
@@ -432,7 +629,7 @@ SELECT ...
   └─ 输出实验结果
 ```
 
-#### 4.4.2 协作关键点
+#### 4.5.2 协作关键点
 
 **双重过滤的叠加效应**：
 
@@ -535,12 +732,62 @@ WHERE s.date <= e.timestamp
 
 ---
 
-## 六、代码溯源索引
+## 六、事实校验清单
+
+### 6.1 函数签名与参数校验
+
+| 函数 | 文件 | 行号 | 签名是否匹配源码 | 备注 |
+|------|------|------|----------------|------|
+| `getSegmentCTE()` | `segment-cte.ts` | 8-83 | ✓ 匹配 | 第5参数是 `sqlVars?: SQLVars`，不是 `cteContext` |
+| `getExperimentUnitsQuery()` | `experiment-units-query.ts` | 22-243 | ✓ 匹配 | params 类型 `ExperimentUnitsQueryParams` |
+| `getExperimentMetricQuery()` | `experiment-metric-query.ts` | 38-614 | ✓ 匹配 | params 类型 `ExperimentMetricQueryParams` |
+| `getParsedCondition()` | `features.ts` | 125-208 | ✓ 匹配 | 返回 `ConditionInterface \| undefined` |
+| `getSavedGroupCondition()` | `features.ts` | 102-123 | ✓ 匹配 | 返回 `null \| ConditionInterface` |
+| `getSnapshotSettings()` | `experiments.ts` | 429-725 | ✓ 匹配 | 无 savedGroups 参数 |
+| `getExperimentUnitsTableQuery()` | `SqlIntegration.ts` | 807-818 | ✓ 匹配 | 需要 `unitsTableFullName` |
+
+### 6.2 类型定义校验
+
+| 类型 | 文件 | 行号 | 结构是否匹配源码 | 备注 |
+|------|------|------|----------------|------|
+| `savedGroupValidator` | `validators/saved-group.ts` | 9-26 | ✓ 匹配 | 结构真源 |
+| `segmentValidator` | `validators/segment.ts` | 9-27 | ✓ 匹配 | 结构真源，`filters` 是 `string[]` |
+| `savedGroupTargeting` | `validators/shared.ts` | 38-44 | ✓ 匹配 | `{ match, ids }` 结构 |
+| `ExperimentUnitsQueryParams` | `types/integrations.d.ts` | 308-310 | ✓ 匹配 | `{ settings, segment, includeIdJoins, ... }` |
+| `ExperimentMetricQueryParams` | `types/integrations.d.ts` | 398-404 | ✓ 匹配 | `{ metric, unitsSource, segment, ... }` |
+| `ExperimentSnapshotSettings` | `types/experiment-snapshot.d.ts` | 191-217 | ✓ 匹配 | 有 `segment`，无 `savedGroups` |
+
+### 6.3 关键链路校验
+
+| 链路 | 校验结果 | 备注 |
+|------|---------|------|
+| segment 从 snapshotSettings → unitQueryParams.segment | ✓ 正确 | `ExperimentResultsQueryRunner.ts:115-184` |
+| segment 从 unitQueryParams → `getSegmentCTE()` | ✓ 正确 | `experiment-units-query.ts:148-163` |
+| segment JOIN 条件 `s.${baseIdType} = e.${baseIdType}` | ✓ 正确 | `experiment-units-query.ts:220-224` |
+| 时间一致性 `s.date <= e.timestamp` | ✓ 正确 | `experiment-units-query.ts:239` |
+| savedGroup 不进入 snapshotSettings | ✓ 正确 | `experiments.ts:695-724` 无相关字段 |
+| savedGroup 不进入分析 SQL | ✓ 正确 | 整条分析链路无相关代码 |
+| unitsSource = "exposureTable" 读临时表 | ✓ 正确 | `experiment-metric-query.ts:305-306` |
+| unitsSource = "exposureQuery" 内嵌 units query | ✓ 正确 | `experiment-metric-query.ts:273-277` |
+
+### 6.4 结论校验
+
+| 结论 | 代码证据是否支持 | 备注 |
+|------|----------------|------|
+| Saved Group 在分配层过滤，不进入分析层 | ✓ 支持 | 三层代码证据 |
+| Segment 在分析层过滤，每次重跑重新计算 | ✓ 支持 | SQL 构建链路清晰 |
+| 修改 saved group 不影响历史快照结果 | ✓ 支持 | 曝光表已固化 |
+| 修改 segment 可改变历史快照结果 | ✓ 支持 | 每次重跑重新 JOIN |
+| units table 模式 segment 只计算一次 | ✓ 支持 | CREATE TABLE + 后续读临时表 |
+
+---
+
+## 七、代码溯源索引
 
 ### Saved Group 相关
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| 结构真源（validator） | `packages/shared/src/validators/saved-group.ts` | 9-26 |
+| 结构真源（validator） | `packages/shared/src/validators/saved-group.ts` | 7-26 |
 | 目标配置结构 | `packages/shared/src/validators/shared.ts` | 38-44 |
 | 类型别名（d.ts） | `packages/shared/types/saved-group.d.ts` | 1-39 |
 | 条件构建（服务端） | `packages/back-end/src/util/features.ts` | 102-208 |
@@ -552,10 +799,10 @@ WHERE s.date <= e.timestamp
 ### Segment 相关
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| 结构真源（validator） | `packages/shared/src/validators/segment.ts` | 9-27 |
+| 结构真源（validator） | `packages/shared/src/validators/segment.ts` | 7-27 |
 | 类型别名（d.ts） | `packages/shared/types/segment.d.ts` | 1-4 |
 | Segment CTE 构建 | `packages/back-end/src/integrations/sql/ctes/segment-cte.ts` | 8-83 |
-| 实验单元查询中的 segment JOIN | `packages/back-end/src/integrations/sql/queries/experiment-units-query.ts` | 148-163, 220-224 |
+| 实验单元查询中的 segment JOIN | `packages/back-end/src/integrations/sql/queries/experiment-units-query.ts` | 148-163, 220-224, 239 |
 | 指标查询中的 segment | `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | 48, 208-213, 273-307 |
 | 快照分析时 segment 读取 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 115-120 |
 | 快照设置构建（不含 saved group） | `packages/back-end/src/services/experiments.ts` | 695-724 |
@@ -569,3 +816,4 @@ WHERE s.date <= e.timestamp
 | 指标查询 unitsSource 分支 | `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | 208-213, 273-307 |
 | SnapshotSettings 类型定义 | `packages/shared/types/experiment-snapshot.d.ts` | 191-217 |
 | 临时表删除逻辑 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 337-354 |
+| 参数类型定义 | `packages/shared/types/integrations.d.ts` | 299-404 |
