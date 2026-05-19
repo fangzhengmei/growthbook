@@ -430,6 +430,171 @@ public async upsert(
 | T6 | - | `upsert` 更新缓存记录（第二次） |
 | T7 | - | 完成 |
 
+### 4.9 下游影响分析：各链路重复触发与去重保障
+
+两次 `refreshSDKPayloadCache` 调用都会在结束时执行 `triggerWebhookJobs()`（`services/features.ts:821`），因此所有下游链路都会被触发两次。以下是各链路的去重机制与实际风险分析。
+
+#### 4.9.1 调用链总览
+
+```
+refreshSDKPayloadCache()
+    │
+    ├─→ 构建并 upsert 缓存（Mongo）
+    │
+    └─→ triggerWebhookJobs(context, payloadKeys, connectionsUpdated, true)
+          │
+          ├─→ queueWebhooksByConnections()        ← 普通 SDK Webhook
+          ├─→ fireGlobalSdkWebhooks()              ← 全局 Webhook
+          ├─→ queueProxyUpdate()                   ← Proxy 更新
+          ├─→ queueLegacySdkWebhooks()             ← Legacy Webhook
+          └─→ purgeCDNCache()                       ← CDN 缓存清除
+```
+
+#### 4.9.2 各链路详细分析
+
+| 链路 | 代码位置 | 是否去重 | 去重键 | 仍可能重复动作 | 实际风险 |
+|------|---------|---------|--------|----------------|---------|
+| **普通 SDK Webhook** | `sdkWebhooks.ts:114-125` | ✅ **是** | `data.webhookId` | ❌ 无 | Agenda 的 `job.unique()` 确保同一 `webhookId` 只入队一次 |
+| **全局 Webhook** | `sdkWebhooks.ts:356-421` | ❌ **否** | 无 | ✅ 全部重复 | 直接 `runWebhookFetch()`，无队列、无去重，会收到两次通知 |
+| **Proxy 更新** | `proxyUpdate.ts:167-183` | ✅ **是** | `data.connectionId` + `data.useCloudProxy` | ❌ 无 | Agenda 的 `job.unique()` 确保同一连接 + 代理类型只入队一次 |
+| **Legacy Webhook** | `webhooks.ts:139-180` | ✅ **是** | `webhookId` | ❌ 无 | Agenda 的 `job.unique()` 确保同一 `webhookId` 只入队一次 |
+| **CDN Purge** | `cdn.util.ts:17-46` | ❌ **否** | 无 | ✅ 全部重复 | 直接调用 Fastly API，但 Fastly purge 幂等，无功能影响 |
+
+#### 4.9.3 普通 SDK Webhook 去重机制 `sdkWebhooks.ts:103-113`
+
+```typescript
+async function queueSingleSdkWebhookJob(webhook: WebhookInterface) {
+  const job = agenda.create(SDK_WEBHOOKS_JOB_NAME, {
+    webhookId: webhook.id,
+    retryCount: 0,
+  }) as SDKWebhookJob;
+  job.unique({
+    "data.webhookId": webhook.id,  // ← 去重键
+  });
+  job.schedule(new Date());
+  await job.save();
+}
+```
+
+> **说明**：Agenda 的 `unique()` 方法会在 MongoDB 中对 `data.webhookId` 建立唯一索引，同一 webhookId 的重复入队会被合并。
+
+#### 4.9.4 全局 Webhook 无去重 `sdkWebhooks.ts:356-421`
+
+```typescript
+export async function fireGlobalSdkWebhooks(
+  context: ReqContext | ApiReqContext,
+  connections: SDKConnectionInterface[],
+) {
+  if (!connections.length) return;
+
+  for (const connection of connections) {
+    const payload = await getFeatureDefinitionsWithCache({
+      context,
+      params: connection,
+    });
+
+    WEBHOOKS.forEach((webhook) => {
+      // ... 构造 webhook 对象
+      
+      // 直接调用，无队列，无去重
+      runWebhookFetch({
+        webhook: w,
+        key: connection.key,
+        payload,
+        global: true,
+        context: context,
+      }).catch((e) => {
+        logger.error(e, "Failed to fire global webhook");
+      });
+    });
+  }
+}
+```
+
+> **风险**：全局 webhook 会收到**两次完全相同的 payload.changed 通知**，接收方需要处理重复事件。
+
+#### 4.9.5 Proxy 更新去重机制 `proxyUpdate.ts:146-165`
+
+```typescript
+export async function queueSingleProxyUpdate(
+  orgId: string,
+  connection: SDKConnectionInterface,
+  useCloudProxy: boolean = false,
+) {
+  if (!connectionSupportsProxyUpdate(connection, useCloudProxy)) return;
+
+  const job = agenda.create(PROXY_UPDATE_JOB_NAME, {
+    orgId,
+    connectionId: connection.id,
+    retryCount: 0,
+    useCloudProxy,
+  }) as ProxyUpdateJob;
+  job.unique({
+    "data.connectionId": connection.id,       // ← 去重键 1
+    "data.useCloudProxy": useCloudProxy,      // ← 去重键 2
+  });
+  job.schedule(new Date());
+  await job.save();
+}
+```
+
+> **说明**：去重键是 `connectionId + useCloudProxy` 的组合，确保同一连接的同一代理类型只入队一次。
+
+#### 4.9.6 Legacy Webhook 去重机制 `webhooks.ts:172-178`
+
+```typescript
+const job = agenda.create(WEBHOOK_JOB_NAME, {
+  webhookId: webhook.id,
+  retryCount: 0,
+}) as WebhookJob;
+job.unique({ webhookId: webhook.id });  // ← 去重键
+job.schedule(new Date());
+await job.save();
+```
+
+#### 4.9.7 CDN Purge 无去重但幂等 `cdn.util.ts:17-46`
+
+```typescript
+export async function purgeCDNCache(
+  orgId: string,
+  surrogateKeys: string[],
+): Promise<void> {
+  if (!FASTLY_SERVICE_ID || !FASTLY_API_TOKEN) return;
+  if (!surrogateKeys.length) return;
+
+  const BATCH_SIZE = 256;
+  for (let i = 0; i < surrogateKeys.length; i += BATCH_SIZE) {
+    const batch = surrogateKeys.slice(i, i + BATCH_SIZE);
+    try {
+      // 直接调用 Fastly API，无去重
+      await fetch(`https://api.fastly.com/service/${FASTLY_SERVICE_ID}/purge`, {
+        method: "POST",
+        headers: {
+          "Fastly-Key": FASTLY_API_TOKEN,
+          "surrogate-key": batch.join(" "),
+          Accept: "application/json",
+        },
+      });
+    } catch (e) {
+      // ... 日志记录
+    }
+  }
+}
+```
+
+> **说明**：虽然会调用两次，但 Fastly 的 purge API 是幂等的，对同一 surrogate key 多次 purge 效果相同，无功能影响，仅浪费少量 API 调用配额。
+
+#### 4.9.8 下游影响总结
+
+| 影响类型 | 影响程度 | 说明 |
+|---------|---------|------|
+| **功能正确性** | ✅ 无影响 | 有去重的链路只执行一次，无去重的链路（全局 webhook、CDN purge）功能上幂等 |
+| **全局 Webhook 接收方** | ⚠️ 中等 | 会收到两次完全相同的通知，需要接收方处理重复事件 |
+| **API 调用次数** | ❌ 翻倍 | CDN purge API 调用翻倍，全局 webhook 外部调用翻倍 |
+| **数据库写入** | ✅ 无影响 | 有去重的链路通过 Agenda unique 索引避免重复写入 |
+| **代理更新** | ✅ 无影响 | 通过去重键避免重复 |
+| **Legacy Webhook** | ✅ 无影响 | 通过去重键避免重复 |
+
 ---
 
 ## 五、载荷构造与缓存
@@ -766,6 +931,7 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
 | 模块 | 文件路径 | 关键函数 |
 |------|---------|---------|
 | 工具函数 | `packages/back-end/src/util/api-key.util.ts` | `generateEncryptionKey`, `generateSigningKey` |
+| CDN 工具 | `packages/back-end/src/util/cdn.util.ts` | `purgeCDNCache`, `getSurrogateKeysFromEnvironments` |
 | 类型定义 | `packages/shared/types/sdk-connection.d.ts` | `SDKConnectionInterface` |
 | 后端模型 | `packages/back-end/src/models/SdkConnectionModel.ts` | `generateSDKConnectionKey`, `createSDKConnection`, `editSDKConnection`, `deleteSDKConnectionModel` |
 | 缓存模型 | `packages/back-end/src/models/SdkConnectionCacheModel.ts` | `getById`, `upsert` |
@@ -774,6 +940,10 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
 | 连接控制器 | `packages/back-end/src/routers/sdk-connection/sdk-connection.controller.ts` | `postSDKConnection`, `putSDKConnection`, `deleteSDKConnection` |
 | 连接路由 | `packages/back-end/src/routers/sdk-connection/sdk-connection.router.ts` | 路由定义 |
 | API 路由 | `packages/back-end/src/api/sdk-payload/getSdkPayload.ts` | `getSdkPayload` |
+| Webhook 任务调度 | `packages/back-end/src/jobs/updateAllJobs.ts` | `triggerWebhookJobs` |
+| SDK Webhook | `packages/back-end/src/jobs/sdkWebhooks.ts` | `queueWebhooksByConnections`, `fireGlobalSdkWebhooks`, `queueSingleSdkWebhookJob` |
+| Legacy Webhook | `packages/back-end/src/jobs/webhooks.ts` | `queueLegacySdkWebhooks` |
+| Proxy 更新 | `packages/back-end/src/jobs/proxyUpdate.ts` | `queueProxyUpdate`, `queueSingleProxyUpdate` |
 | 前端表单 | `packages/front-end/components/Features/SDKConnections/SDKConnectionForm.tsx` | 创建/编辑 SDK 连接 |
 | 前端详情 | `packages/front-end/pages/sdks/[sdkid].tsx` | 删除 SDK 连接 |
 | 客户端拉取 | `packages/sdk-js/src/feature-repository.ts` | `fetchFeatures`, `startAutoRefresh`, `onSSEError`, `enableChannel`, `disableChannel` |
@@ -807,14 +977,26 @@ public async setPayload(payload: FeatureApiResponse): Promise<void> {
     - ❌ 数据库负载翻倍（两次查询 + 两次 upsert）
     - ⚠️ 高并发场景下可能加剧数据库压力
 
-8.  **`queueSDKPayloadRefresh` 触发矩阵**：覆盖 12+ 个模块，包括 Feature、SDK Connection、Experiment、Project、Custom Field、Saved Group、Holdout、URL Redirect、Visual Changeset、Environment、Safe Rollout。
+8.  **下游链路去重保障矩阵**：
+    - ✅ 普通 SDK Webhook：有去重，去重键 `data.webhookId`（Agenda unique）
+    - ❌ 全局 Webhook：无去重，会收到两次完全相同的通知
+    - ✅ Proxy 更新：有去重，去重键 `data.connectionId + data.useCloudProxy`
+    - ✅ Legacy Webhook：有去重，去重键 `webhookId`
+    - ❌ CDN Purge：无去重，但 Fastly API 幂等，无功能影响
 
-9.  **缓存键 = 连接 Key**：每个 SDK 连接有独立的缓存，以 `connection.key` 为键存储在 `sdkcache` 集合。
+9.  **下游实际风险**：
+    - ⚠️ 全局 Webhook 接收方需要处理重复事件
+    - ❌ CDN purge API 调用翻倍（但功能上无影响）
+    - ✅ 其他链路通过 Agenda unique 索引避免重复执行
 
-10. **缓存失效 = 覆盖更新**：没有显式删除缓存的操作，通过 `queueSDKPayloadRefresh()` 触发 `upsert` 覆盖更新。
+10. **`queueSDKPayloadRefresh` 触发矩阵**：覆盖 12+ 个模块，包括 Feature、SDK Connection、Experiment、Project、Custom Field、Saved Group、Holdout、URL Redirect、Visual Changeset、Environment、Safe Rollout。
 
-11. **密钥吊销 = 删除连接**：删除连接记录后，`findSDKConnectionByKey()` 会抛出 "Invalid API Key" 错误，缓存记录保留但无法访问。
+11. **缓存键 = 连接 Key**：每个 SDK 连接有独立的缓存，以 `connection.key` 为键存储在 `sdkcache` 集合。
 
-12. **SSE 连接独立**：`/sub/:key` 端点由独立代理服务处理，推送 `features-updated`（通知重拉）或 `features`（直接推送数据）事件。
+12. **缓存失效 = 覆盖更新**：没有显式删除缓存的操作，通过 `queueSDKPayloadRefresh()` 触发 `upsert` 覆盖更新。
 
-13. **客户端重试机制**：SSE 连接错误采用指数退避（`3^(errors-3) * (1000 + random(0-1000))` ms），最大 5 分钟间隔。
+13. **密钥吊销 = 删除连接**：删除连接记录后，`findSDKConnectionByKey()` 会抛出 "Invalid API Key" 错误，缓存记录保留但无法访问。
+
+14. **SSE 连接独立**：`/sub/:key` 端点由独立代理服务处理，推送 `features-updated`（通知重拉）或 `features`（直接推送数据）事件。
+
+15. **客户端重试机制**：SSE 连接错误采用指数退避（`3^(errors-3) * (1000 + random(0-1000))` ms），最大 5 分钟间隔。
