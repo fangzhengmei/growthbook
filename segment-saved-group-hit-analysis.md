@@ -9,29 +9,51 @@
 | **生效时机** | 实验分配阶段 | 实验评估 / 回溯阶段 |
 | **数据来源** | GrowthBook 内部维护的 ID 列表 | 数仓用户表 / 事实表 |
 | **可回溯性** | 分配后固定，无法回溯修改 | 分析时可更换 segment 重新计算 |
-| **代码位置** | `packages/sdk-js/src/mongrule.ts` + `packages/back-end/src/util/features.ts` | `packages/back-end/src/integrations/sql/queries/experiment-units-query.ts` + `packages/back-end/src/integrations/sql/ctes/segment-cte.ts` |
+| **结构真源** | `packages/shared/src/validators/saved-group.ts` | `packages/shared/src/validators/segment.ts` |
+| **分析层代码** | 不进入分析 SQL | `packages/back-end/src/integrations/sql/queries/experiment-units-query.ts` + `packages/back-end/src/integrations/sql/ctes/segment-cte.ts` |
 
 ---
 
 ## 二、Saved Group 命中判定机制
 
-### 2.1 数据结构
+### 2.1 结构真源
 
-Saved Group 有两种类型（`packages/shared/types/saved-group.d.ts`）：
+Saved Group 的类型定义真源在 Zod validator 中（`packages/shared/src/validators/saved-group.ts:9-26`）：
 
 ```typescript
-type SavedGroupType = "list" | "condition";
+export const savedGroupTypeValidator = z.enum(["condition", "list"]);
 
-interface SavedGroupInterface {
-  id: string;
-  groupName: string;
-  type: SavedGroupType;
-  attributeKey?: string;      // list 类型：匹配的用户属性字段
-  values?: string[];          // list 类型：ID 列表
-  condition?: string;         // condition 类型：JSON 条件表达式
-  useEmptyListGroup?: boolean;
-  // ...
-}
+export const savedGroupValidator = z
+  .object({
+    id: z.string(),
+    organization: z.string(),
+    groupName: z.string(),
+    owner: ownerField,
+    type: savedGroupTypeValidator,
+    condition: z.string().optional(),      // condition 类型：JSON 字符串
+    attributeKey: z.string().optional(),   // list 类型：匹配字段
+    values: z.array(z.string()).optional(), // list 类型：ID 列表
+    dateUpdated: z.date(),
+    dateCreated: z.date(),
+    description: z.string().optional(),
+    projects: z.array(z.string()).optional(),
+    useEmptyListGroup: z.boolean().optional(),
+    archived: z.boolean().optional(),
+  })
+  .strict();
+```
+
+**注意**：`packages/shared/types/saved-group.d.ts` 中的类型只是从 validator 派生的别名（`z.infer<typeof savedGroupValidator>`），不包含结构定义。
+
+Saved Group 在实验 phase 中的目标配置结构（`packages/shared/src/validators/shared.ts:38-44`）：
+
+```typescript
+export const savedGroupTargeting = z
+  .object({
+    match: z.enum(["all", "none", "any"]),  // 匹配模式
+    ids: z.array(z.string()),                // saved group ID 列表
+  })
+  .strict();
 ```
 
 ### 2.2 条件构建（服务端）
@@ -114,30 +136,39 @@ case "$notInGroup":
 
 ## 三、Segment 命中判定机制
 
-### 3.1 数据结构
+### 3.1 结构真源
 
-Segment 同样有两种类型（`packages/shared/types/segment.d.ts`）：
+Segment 的类型定义真源在 Zod validator 中（`packages/shared/src/validators/segment.ts:9-27`）：
 
 ```typescript
-interface SegmentInterface {
-  id: string;
-  name: string;
-  type: "SQL" | "FACT";
-  userIdType: "user_id" | "anonymous_id";  // segment 使用的 ID 类型
-  datasource: string;                      // 关联数据源
-  
-  // SQL 类型
-  sql?: string;                // 用户自定义 SQL，需返回 (user_id, date) 两列
-  
-  // FACT 类型
-  factTableId?: string;        // 关联事实表
-  filters?: Filter[];          // 过滤条件
-}
+const TYPES = ["SQL", "FACT"] as const;
+
+export const segmentValidator = z
+  .object({
+    id: z.string(),
+    organization: z.string(),
+    owner: ownerField,
+    datasource: z.string(),
+    dateCreated: z.date(),
+    dateUpdated: z.date(),
+    name: z.string(),
+    description: z.string(),
+    userIdType: z.string(),       // segment 使用的 ID 类型
+    type: z.enum(TYPES),          // "SQL" | "FACT"
+    managedBy: z.enum(["", "api", "config"]).optional(),
+    sql: z.string().optional(),   // SQL 类型：用户自定义 SQL
+    factTableId: z.string().optional(), // FACT 类型：关联事实表
+    filters: z.array(z.string()).optional(), // FACT 类型：过滤条件
+    projects: z.array(z.string()).optional(),
+  })
+  .strict();
 ```
+
+**注意**：`packages/shared/types/segment.d.ts` 中的类型只是从 validator 派生的别名（`z.infer<typeof segmentValidator>`），不包含结构定义。
 
 ### 3.2 SQL 过滤逻辑（分析端）
 
-Segment 过滤发生在实验单元查询 `__experimentUnits` CTE 中（`packages/back-end/src/integrations/sql/queries/experiment-units-query.ts:148-163, 218-239`）：
+Segment 过滤发生在实验单元查询 `__experimentUnits` CTE 中（`packages/back-end/src/integrations/sql/queries/experiment-units-query.ts:148-163, 220-224`）：
 
 ```sql
 WITH
@@ -175,7 +206,7 @@ WITH
 
 ### 3.3 Segment CTE 构建
 
-`getSegmentCTE()` 负责生成 segment 的 CTE SQL（`packages/back-end/src/integrations/sql/ctes/segment-cte.ts`）：
+`getSegmentCTE()` 负责生成 segment 的 CTE SQL（`packages/back-end/src/integrations/sql/ctes/segment-cte.ts:8-83`）：
 
 ```typescript
 function getSegmentCTE(
@@ -184,7 +215,10 @@ function getSegmentCTE(
   baseIdType: string,
   idJoinMap: Record<string, string>,
   factTableMap: FactTableMap,
+  cteContext?: CteContext,
 ): string {
+  let segmentSql: string;
+  
   if (segment.type === "SQL") {
     segmentSql = segment.sql;
   } else {
@@ -192,6 +226,7 @@ function getSegmentCTE(
     segmentSql = getFactSegmentCTE(dialect, {
       factTable,
       filters: segment.filters,
+      cteContext,
       // ...
     });
   }
@@ -251,15 +286,19 @@ ExperimentResultsQueryRunner.startQueries()
 export function getSnapshotSettings({
   experiment,
   phaseIndex,
-  // ...
-}): ExperimentSnapshotSettings {
+  // ... 其他参数
+}: { /* ... */ }): ExperimentSnapshotSettings {
   const phase = experiment.phases[phaseIndex];
   
   return {
-    // ... 其他字段
+    activationMetric: experiment.activationMetric || null,
+    attributionModel: experiment.attributionModel || "firstExposure",
+    lookbackOverride: lookbackOverride,
+    skipPartialData: !!experiment.skipPartialData,
     segment: experiment.segment || "",           // ✓ segment 被读取
     queryFilter: experiment.queryFilter || "",   // ✓ queryFilter 被读取
-    // ...
+    datasourceId: experiment.datasource || "",
+    // ... 其他字段
     // ✗ 注意：这里没有任何 phase.savedGroups 的读取逻辑
     // ✗ 没有任何 saved group 相关字段被写入 snapshotSettings
   };
@@ -282,13 +321,15 @@ export interface ExperimentSnapshotSettings {
 **代码证据 2：查询构建层面**
 
 在所有分析查询构建代码中（`experiment-units-query.ts`、`experiment-metric-query.ts`、`SqlIntegration.ts`）：
-- 只有 `segment` 参数被传入和使用
+- 函数参数 `ExperimentUnitsQueryParams` 只有 `segment` 字段，没有 saved group 字段
+- 只有 `segment` 参数被传入和使用于构建 SQL
 - 没有任何代码读取 `phase.savedGroups` 并在分析 SQL 中加入过滤条件
 
 **代码证据 3：分配逻辑与分析逻辑的隔离**
 
 - `phase.savedGroups` 仅在 `getFeatureDefinition()` → `getParsedCondition()` 中被使用（构建 SDK payload）
 - 分析查询链路完全不依赖 `phase.savedGroups`，只依赖曝光表中的数据
+- 曝光表中的数据是 SDK 侧经过 saved group 过滤后产生的
 
 ### 4.3 Units Table 与 Exposure Query 两条路径
 
@@ -306,7 +347,7 @@ const useUnitsTable =
 ```
 
 **执行流程**：
-1. 先执行 `getExperimentUnitsTableQuery()`：
+1. 先执行 `getExperimentUnitsTableQuery()`（`SqlIntegration.ts:807-818`）：
    ```sql
    CREATE OR REPLACE TABLE growthbook_tmp_units_xxx AS (
      WITH __experimentUnits AS (
@@ -318,7 +359,7 @@ const useUnitsTable =
      SELECT * FROM __experimentUnits
    );
    ```
-2. 所有后续指标查询通过 `unitsSource: "exposureTable"` 直接读取该临时表：
+2. 所有后续指标查询通过 `unitsSource: "exposureTable"` 直接读取该临时表（`experiment-metric-query.ts:305-306`）：
    ```sql
    SELECT ... FROM growthbook_tmp_units_xxx
    -- 无需再次 JOIN segment
@@ -328,9 +369,9 @@ const useUnitsTable =
 
 #### 路径 B：Exposure Query（内嵌模式）
 
-**触发条件**：`useUnitsTable = false`（默认）
+**触发条件**：`useUnitsTable = false`（默认模式）
 
-**执行流程**：每个指标查询内嵌完整的 `__experimentUnits` CTE：
+**执行流程**：每个指标查询内嵌完整的 `__experimentUnits` CTE（`experiment-metric-query.ts:273-277`）：
 ```sql
 -- getExperimentMetricQuery() 生成的 SQL
 WITH
@@ -423,9 +464,24 @@ WHERE s.date <= e.timestamp
 
 ---
 
-## 五、"重跑历史快照"场景下的边界与常见误判
+## 五、"重跑历史快照"场景下的行为边界
 
-### 5.1 两套机制的行为边界
+### 5.1 固化 vs 重算判定清单
+
+| 行为 | 固化/重算 | 说明 | 代码位置 |
+|------|----------|------|---------|
+| **Saved Group 过滤** | 🔒 固化 | 分配时已完成，曝光表中只含命中用户，重跑快照不重新判定 | `packages/sdk-js/src/mongrule.ts:238-241` |
+| **变体分配结果** | 🔒 固化 | 已记录在曝光表中，重跑快照不重新 hash 分配 | 曝光表 `variation_id` 字段 |
+| **曝光时间戳** | 🔒 固化 | 已记录在曝光表中 | 曝光表 `timestamp` 字段 |
+| **Segment 过滤** | 🔄 重算 | 每次重跑都重新执行 `JOIN __segment` | `experiment-units-query.ts:220-224` |
+| **Metric 计算** | 🔄 重算 | 每次重跑都重新查询指标数据 | `experiment-metric-query.ts` |
+| **归因模型** | 🔄 重算 | 在 `getSnapshotSettings` 中读取后应用 | `experiments.ts:697` |
+| **Lookback 窗口** | 🔄 重算 | 在 `getSnapshotSettings` 中读取后应用 | `experiments.ts:698` |
+| **维度下钻** | 🔄 重算 | 每次重跑都重新 JOIN 维度表 | `ExperimentResultsQueryRunner.ts:176-178` |
+| **统计显著性** | 🔄 重算 | 每次重跑都重新计算 | 分析引擎 |
+| **Query Filter** | 🔄 重算 | 在 `getSnapshotSettings` 中读取后应用于曝光查询 | `experiments.ts:701` |
+
+### 5.2 两套机制的行为边界
 
 | 场景 | Saved Group 行为 | Segment 行为 |
 |------|-----------------|-------------|
@@ -436,7 +492,7 @@ WHERE s.date <= e.timestamp
 | **删除 saved group 后重跑** | 无影响（曝光已固化） | 无影响 |
 | **删除 segment 后重跑** | 无影响 | 分析时跳过 segment 过滤，样本量增加 |
 
-### 5.2 常见误判
+### 5.3 常见误判
 
 #### ❌ 误判 1："修改 saved group 后重跑快照，结果应该会变"
 
@@ -465,7 +521,7 @@ WHERE s.date <= e.timestamp
 - 临时表在所有查询完成后会被删除（`ExperimentResultsQueryRunner.ts:337-354`）
 - 如果查询失败，临时表可能残留（取决于 `dropUnitsTable` 配置）
 
-### 5.3 调试建议
+### 5.4 调试建议
 
 **确认 saved group 是否生效**：
 - 查看曝光表中的用户数是否符合预期
@@ -484,7 +540,9 @@ WHERE s.date <= e.timestamp
 ### Saved Group 相关
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| 类型定义 | `packages/shared/types/saved-group.d.ts` | 1-39 |
+| 结构真源（validator） | `packages/shared/src/validators/saved-group.ts` | 9-26 |
+| 目标配置结构 | `packages/shared/src/validators/shared.ts` | 38-44 |
+| 类型别名（d.ts） | `packages/shared/types/saved-group.d.ts` | 1-39 |
 | 条件构建（服务端） | `packages/back-end/src/util/features.ts` | 102-208 |
 | 条件评估（SDK） | `packages/sdk-js/src/mongrule.ts` | 238-241 |
 | 旧版 SDK 展开逻辑 | `packages/back-end/src/util/features.ts` | 565-568, 757-768 |
@@ -494,9 +552,10 @@ WHERE s.date <= e.timestamp
 ### Segment 相关
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| 类型定义 | `packages/shared/types/segment.d.ts` | 1-4 |
+| 结构真源（validator） | `packages/shared/src/validators/segment.ts` | 9-27 |
+| 类型别名（d.ts） | `packages/shared/types/segment.d.ts` | 1-4 |
 | Segment CTE 构建 | `packages/back-end/src/integrations/sql/ctes/segment-cte.ts` | 8-83 |
-| 实验单元查询中的 segment JOIN | `packages/back-end/src/integrations/sql/queries/experiment-units-query.ts` | 148-163, 220-239 |
+| 实验单元查询中的 segment JOIN | `packages/back-end/src/integrations/sql/queries/experiment-units-query.ts` | 148-163, 220-224 |
 | 指标查询中的 segment | `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | 48, 208-213, 273-307 |
 | 快照分析时 segment 读取 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 115-120 |
 | 快照设置构建（不含 saved group） | `packages/back-end/src/services/experiments.ts` | 695-724 |
@@ -506,7 +565,7 @@ WHERE s.date <= e.timestamp
 |------|------|------|
 | QueryRunner 入口 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 87-357 |
 | Units Table 路径判断 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 139-145 |
-| Units Table 创建 | `packages/back-end/src/integrations/SqlIntegration.ts` | 789-818 |
+| Units Table 创建 | `packages/back-end/src/integrations/SqlIntegration.ts` | 807-818 |
 | 指标查询 unitsSource 分支 | `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | 208-213, 273-307 |
 | SnapshotSettings 类型定义 | `packages/shared/types/experiment-snapshot.d.ts` | 191-217 |
 | 临时表删除逻辑 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 337-354 |
