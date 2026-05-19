@@ -53,9 +53,11 @@ slackEventHandler(event, context);
 |-----|----------|---------|
 | 事件写入 DB | 同步 | 事件丢失 |
 | EventNotifier.perform() 入队 | 同步 | 事件不会被分发 |
-| Agenda 调度 jobHandler | 异步 | 可重试 |
+| Agenda 调度 jobHandler | 异步 | **无重试**，事件静默丢失 |
 | webHooksEventHandler 执行 | 异步并发 | 不影响 Slack 通知 |
 | 单个 webhook 请求发送 | 异步 | 触发该 webhook 的重试机制 |
+
+> **重要说明**：`eventCreated` job 没有注册 `fail` 事件监听器，如果 `getEvent()` 失败或 `getContextForAgendaJobByOrgId()` 抛出异常，job 会标记为失败但**不会重试**。由于 `webHooksEventHandler` 和 `slackEventHandler` 调用没有 `await`，它们内部的异常**不会导致 job 失败**。
 
 ---
 
@@ -405,11 +407,13 @@ agenda.on("fail:" + SDK_WEBHOOKS_JOB_NAME, async (error: Error, job: SDKWebhookJ
 ```typescript
 const readResponseBody = async (res: Response): Promise<string> => {
   for await (const chunk of res.body) {
-    received += chunk.length;
+    received += chunk.length;  // 累加每个 chunk 的字节长度
     chunks.push(chunk.toString());
 
+    // 条件：received > maxContentSize，严格大于才触发
+    // 例如 maxContentSize=1000 时，received=1001 触发中断
     if (received > abortOptions.maxContentSize) {
-      abortController.abort();  // 超限主动中断
+      abortController.abort();
       break;
     }
   }
@@ -440,7 +444,7 @@ try {
 | 场景 | HTTP 状态码 | 行为 | 结果判定 |
 |-----|------------|------|---------|
 | 正常响应 | 200 OK | 完整读取响应体 | ✅ 成功 |
-| 响应体超限（≤1000字符限制） | 200 OK | 中断读取，返回部分内容 | ✅ **被判定为成功！** |
+| 响应体超限（>1000 字节） | 200 OK | 中断读取，返回已读取的部分内容 | ✅ **被判定为成功！** |
 | 服务端错误 | 500 Internal Server Error | 正常读取错误响应 | ❌ 失败，触发重试 |
 | 网络超时 | - | 超时中断 | ❌ 失败，触发重试 |
 | 连接拒绝 | - | 连接失败 | ❌ 失败，触发重试 |
@@ -458,7 +462,9 @@ try {
 - 旧版 SDK Webhook：同上
 - 新版 SDK Webhook：同上
 
-**配置值**：`maxContentSize = 1000` 字符（约 1KB）
+**配置值**：`maxContentSize = 1000` 字节（约 1KB）
+
+> **计数方式说明**：`received += chunk.length` 统计的是响应体的字节长度，不是字符数。对于 UTF-8 编码的多字节字符（如中文），1 个字符可能占 2-4 个字节，因此实际可容纳的字符数可能少于 1000。
 
 ---
 
@@ -501,7 +507,7 @@ try {
 | **队列框架** | 全部使用 Agenda |
 | **幂等保障** | `job.unique()` 防止重复入队 |
 | **HTTP 客户端** | 统一使用 `cancellableFetch()` |
-| **超时配置** | 30 秒超时，1000 字符响应体限制 |
+| **超时配置** | 30 秒超时，1000 字节响应体限制 |
 | **审计日志** | 每次调用都记录详细日志 |
 | **代理支持** | 支持通过代理发送请求 |
 | **响应体超限处理** | 都被视为成功（状态码优先） |
