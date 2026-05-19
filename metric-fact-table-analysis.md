@@ -6,128 +6,255 @@ GrowthBook 中指标定义支持两条独立路径：
 1. **SQL 直接定义路径**（Legacy Metric）：用户直接编写 SQL 定义指标
 2. **Fact Table 路径**（Fact Metric）：指向预定义的 Fact Table，通过列引用和聚合方式定义指标
 
-两条路径在查询时经过**明确的分叉点**进入各自的 SQL 生成流程，最终在**统计引擎层**实现完全汇合。
+两条路径**共享大量前置准备步骤**，在 SQL 生成的核心环节分叉进入各自独立的优化路径，最终在统计引擎层实现三层汇合。
 
 ---
 
-## 1. 类型系统与分叉前准备
+## 1. 共享前置步骤（两条路径共用）
 
-### 1.1 核心类型定义
+### 1.1 共享步骤总览
 
-**共享类型联合** (`packages/shared/src/experiments/experiments.ts:54`)：
-```typescript
-export type ExperimentMetricInterface = MetricInterface | FactMetricInterface;
+在 `startExperimentResultQueries()` 中，两条路径共享以下前置步骤：
+
+```
+startExperimentResultQueries()
+├── 1. 基础参数解析
+│   ├── 从 snapshotSettings 提取 selectedMetrics
+│   ├── 解析 segmentObj
+│   ├── 查找 exposureQuery
+│   └── 解析 snapshotDimensions
+├── 2. Units Table 准备（可选）
+│   ├── 判断是否使用临时 units table
+│   └── （如需要）启动 experimentUnitsTable 查询
+├── 3. 【分叉点】getFactMetricGroups() 分组
+│   └── 将指标分为 legacyMetricSingles 和 factMetricGroups
+└── 4. 分叉执行：各自的 SQL 生成与查询
 ```
 
-- `MetricInterface`（`packages/shared/types/metric.d.ts:43`）：传统 SQL 指标
-  - 核心字段：`sql`（用户编写的 SQL）、`queryFormat`（"sql" 或 "builder"）、`type`（binomial/count/duration/revenue）
-  - 可选字段：`table`、`column`、`conditions`（Query Builder 模式）
+### 1.2 共享步骤 1：基础参数解析
 
-- `FactMetricInterface`（`packages/shared/types/fact-table.d.ts:106`）：Fact Table 指标
-  - 核心字段：`metricType`（mean/proportion/ratio/quantile 等）、`numerator`（分子列引用）、`denominator`（分母列引用）
-  - 列引用 `ColumnRef`：包含 `factTableId`、`column`、`aggregation`、`filters` 等
+**文件**：`ExperimentResultsQueryRunner.ts:87-134`
 
-### 1.2 类型判断函数
+两条路径共享的参数准备：
 
-**类型守卫** (`packages/shared/src/experiments/experiments.ts:83-94`)：
 ```typescript
-export function isFactMetric(m: ExperimentMetricInterface): m is FactMetricInterface {
-  return "metricType" in m;  // Fact Metric 独有字段
+// 1. 提取所有选中的指标（两种类型混合在同一个数组中）
+const selectedMetrics = snapshotSettings.metricSettings
+  .map((m) => metricMap.get(m.id))
+  .filter((m) => m) as ExperimentMetricInterface[];
+
+// 2. 解析 segment
+let segmentObj: SegmentInterface | null = null;
+if (snapshotSettings.segment) {
+  segmentObj = await context.models.segments.getById(snapshotSettings.segment);
 }
 
-export function isLegacyMetric(m: ExperimentMetricInterface): m is MetricInterface {
-  return !isFactMetric(m);
+// 3. 查找 exposure query
+const exposureQuery = (settings?.queries?.exposure || []).find(
+  (q) => q.id === snapshotSettings.exposureQueryId,
+);
+
+// 4. 解析维度
+const snapshotDimensions: Dimension[] = (await Promise.all(
+  snapshotSettings.dimensions.map(
+    async (d) => await parseDimension(d.id, d.slices, org.id),
+  ),
+)).filter((d): d is Dimension => d !== null);
+```
+
+### 1.3 共享步骤 2：Units Table 准备
+
+**文件**：`ExperimentResultsQueryRunner.ts:138-206`
+
+两条路径共享 units table 的创建逻辑：
+
+```typescript
+const useUnitsTable = (integration.getSourceProperties().supportsWritingTables && ...);
+let unitQuery: QueryPointer | null = null;
+
+if (useUnitsTable) {
+  unitQuery = await startQuery({
+    name: queryParentId,
+    query: integration.getExperimentUnitsTableQuery(unitQueryParams),
+    run: (query, setExternalId, queryMetadata) =>
+      integration.runExperimentUnitsQuery(query, setExternalId, queryMetadata),
+    queryType: "experimentUnits",
+  });
+  queries.push(unitQuery);
 }
+```
+
+**关键点**：后续所有 metric 查询（无论 Legacy 还是 Fact）都将 `unitQuery` 作为依赖：
+```typescript
+// Legacy 路径
+dependencies: unitQuery ? [unitQuery.query] : [],
+
+// Fact 路径
+dependencies: unitQuery ? [unitQuery.query] : [],
+```
+
+### 1.4 共享步骤 3：SQL 生成层的公共前置
+
+在各自的 SQL 生成函数内部，两条路径也共享大量前置逻辑：
+
+| 共享步骤 | Legacy 位置 | Fact 位置 | 共享函数 |
+|---------|-------------|-----------|---------|
+| Activation Metric 处理 | experiment-metric-query.ts:58-61 | experiment-fact-metrics-query.ts:42-45 | `processActivationMetric()` |
+| Metric Overrides 应用 | experiment-metric-query.ts:63-64 | experiment-fact-metrics-query.ts:47-49 | `applyMetricOverrides()` |
+| 维度处理 | experiment-metric-query.ts:67-72 | experiment-fact-metrics-query.ts:51-56 | `processDimensions()` |
+| Exposure Query 获取 | experiment-metric-query.ts:74-76 | experiment-fact-metrics-query.ts:73-75 | `getExposureQuery()` |
+| Identities CTE 生成 | experiment-metric-query.ts:201-225 | experiment-fact-metrics-query.ts:105-126 | `getIdentitiesCTE()` |
+| 实验结束日期计算 | experiment-metric-query.ts:228-235 | experiment-fact-metrics-query.ts:129 | `getExperimentEndDate()` |
+| 维度列生成 | experiment-metric-query.ts:237-248 | experiment-fact-metrics-query.ts:135-146 | `getDimensionCol()` |
+| 激活用户过滤逻辑 | experiment-metric-query.ts:250-266 | experiment-fact-metrics-query.ts:148-166 | 相同逻辑 |
+
+**示例：Identities CTE 生成（两条路径代码几乎完全相同）**
+
+```typescript
+// Legacy 路径 (experiment-metric-query.ts:215-225)
+const { baseIdType, idJoinMap, idJoinSQL } = getIdentitiesCTE(
+  dialect,
+  datasource.settings,
+  {
+    objects: idTypeObjects,
+    from: settings.startDate,
+    to: settings.endDate,
+    forcedBaseIdType: userIdType,
+    experimentId: settings.experimentId,
+  },
+);
+
+// Fact 路径 (experiment-fact-metrics-query.ts:116-126)
+const { baseIdType, idJoinMap, idJoinSQL } = getIdentitiesCTE(
+  dialect,
+  datasource.settings,
+  {
+    objects: idTypeObjects,
+    from: settings.startDate,
+    to: settings.endDate,
+    forcedBaseIdType: userIdType,
+    experimentId: settings.experimentId,
+  },
+);
 ```
 
 ---
 
-## 2. 分叉点：查询计划层的路径选择
+## 2. 分叉点：从共享到各自独立
 
-### 2.1 分叉核心函数：`getFactMetricGroups()`
+### 2.1 分叉点 1：查询计划层分组
 
-**文件**：`packages/back-end/src/services/experimentQueries/experimentQueries.ts:256-351`
+**位置**：`ExperimentResultsQueryRunner.ts:208`
 
-这是两条路径的**正式分叉点**。该函数接收所有指标，按类型和优化可能性分组：
-
-```typescript
-export function getFactMetricGroups(metrics, settings, integration, organization): GroupedMetrics {
-  // 第一步：按类型彻底分流
-  const legacyMetrics: MetricInterface[] = metrics.filter(isLegacyMetric);
-  const factMetrics: FactMetricInterface[] = metrics.filter(isFactMetric);
-  
-  // 第二步：Fact Metric 分组优化（企业版功能）
-  // 分组策略：
-  // 1. 共享同一 Fact Table 的指标可以合并查询
-  // 2. Ratio 指标需要分子分母在同一 Fact Table
-  // 3. Quantile 指标单独分组（避免拖慢主查询）
-  // 4. 按数据源能力（列数限制、百分位支持）分批
-  
-  return {
-    factMetricGroups: FactMetricInterface[][],  // 可合并的 Fact Metric 组
-    legacyMetricSingles: MetricInterface[]      // 传统 SQL 指标（单独查询）
-  };
-}
-```
-
-### 2.2 分组键生成：`getFactMetricGroup()`
-
-**文件**：`packages/back-end/src/services/experimentQueries/experimentQueries.ts:224-247`
-
-```typescript
-export function getFactMetricGroup(metric: FactMetricInterface) {
-  // Ratio 指标跨表时单独分组
-  if (isRatioMetric(metric) && metric.numerator.factTableId !== metric.denominator?.factTableId) {
-    return `${tableIds[0]} ${tableIds[1]} (cross-table ratio metrics)`;
-  }
-  // Quantile 指标单独分组
-  if (quantileMetricType(metric)) {
-    return `${metric.numerator.factTableId}_qtile`;
-  }
-  // 默认按 Fact Table ID 分组
-  return metric.numerator.factTableId || "";
-}
-```
-
-### 2.3 分叉执行：`startExperimentResultQueries()`
-
-**文件**：`packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts:208-297`
-
-从这里开始，两条路径进入**完全独立**的 SQL 生成和执行流程：
+这是两条路径的**第一个显式分叉点**：
 
 ```typescript
 // ========== 分叉点 ==========
-const { factMetricGroups, legacyMetricSingles } = getFactMetricGroups(...);
+const { factMetricGroups, legacyMetricSingles } = getFactMetricGroups(
+  selectedMetrics,
+  params.snapshotSettings,
+  integration,
+  org,
+);
 
 // ========== 路径 A：Legacy Metric ==========
-// 每个指标单独生成查询、单独执行
 for (const m of legacyMetricSingles) {
+  // ... 每个指标单独处理
   const queryParams: ExperimentMetricQueryParams = { metric: m, ... };
   queries.push(await startQuery({
     name: m.id,    // key = metric ID
-    query: integration.getExperimentMetricQuery(queryParams),  // 单指标 SQL 生成
+    query: integration.getExperimentMetricQuery(queryParams),
     run: (query) => integration.runExperimentMetricQuery(query),
     queryType: "experimentMetric",
   }));
 }
 
 // ========== 路径 B：Fact Metric ==========
-// 按组批量生成查询、批量执行
 for (const [i, m] of factMetricGroups.entries()) {
+  // ... 按组批量处理
   const queryParams: ExperimentFactMetricsQueryParams = { metrics: m, ... };
   queries.push(await startQuery({
     name: `group_${i}`,  // key = group_前缀
-    query: integration.getExperimentFactMetricsQuery(queryParams),  // 多指标 SQL 生成
+    query: integration.getExperimentFactMetricsQuery(queryParams),
     run: (query) => integration.runExperimentFactMetricsQuery(query),
     queryType: "experimentMultiMetric",
   }));
 }
 ```
 
-**关键分叉标记**：
-- Legacy 路径查询的 key = `metric.id`（如 `"metric_abc123"`）
-- Fact 路径查询的 key = `group_${i}`（如 `"group_0"`、`"group_1"`）
-- 这个 key 约定在后续汇合点用于识别查询来源
+**分叉标记**：
+- Legacy 查询 key = `metric.id`（如 `"metric_abc123"`）
+- Fact 查询 key = `group_${i}`（如 `"group_0"`、`"group_1"`）
+
+### 2.2 分叉点 2：SQL 生成核心逻辑
+
+在各自的 SQL 生成函数中，经过共享前置步骤后，从**指标数据获取**开始进入各自独立的逻辑：
+
+#### Legacy 路径：`getExperimentMetricQuery()`
+```
+getExperimentMetricQuery()
+├── [共享前置] processActivationMetric()
+├── [共享前置] applyMetricOverrides()
+├── [共享前置] processDimensions()
+├── [共享前置] getExposureQuery()
+├── [共享前置] getIdentitiesCTE()
+├── [共享前置] getExperimentEndDate()
+├── [共享前置] getDimensionCol()
+│
+├── 【Legacy 独有】单指标特有处理
+│   ├── 单个 metric 的类型判断（ratio/funnel/quantile）
+│   ├── 单个 metric 的封盖设置处理
+│   ├── 单个 metric 的日期范围计算
+│   └── 单个 denominator metric 的处理
+│
+├── 【Legacy 独有】核心 CTE 生成
+│   ├── getMetricCTE() → 单指标 CTE（使用 metric.sql）
+│   ├── （可选）__denominator CTE → 分母 CTE
+│   ├── （可选）__userCovariateMetric CTE → CUPED 协变量
+│   ├── （可选）__capValue CTE → 百分位封盖
+│   └── __userMetricAgg CTE → 按用户聚合
+│
+└── 【Legacy 独有】最终统计 SELECT（内联逻辑，无独立函数）
+```
+
+#### Fact 路径：`getExperimentFactMetricsQuery()`
+```
+getExperimentFactMetricsQuery()
+├── [共享前置] processActivationMetric()
+├── [共享前置] applyMetricOverrides()
+├── [共享前置] processDimensions()
+├── [共享前置] getExposureQuery()
+├── [共享前置] getIdentitiesCTE()
+├── [共享前置] getExperimentEndDate()
+├── [共享前置] getDimensionCol()
+│
+├── 【Fact 独有】多指标批量处理
+│   ├── getFactTablesForMetrics() → 收集涉及的所有 Fact Table
+│   ├── getMetricData() → 解析每个指标的聚合元数据
+│   ├── 批量计算所有指标的日期范围（取并集）
+│   └── 批量处理所有指标的封盖设置
+│
+├── 【Fact 独有】核心 CTE 生成
+│   ├── getFactMetricCTE() × N → 每个 Fact Table 一个 CTE（使用 factTable.sql）
+│   ├── （可选）Quantile 相关 CTE → KLL sketch 处理
+│   ├── __userMetricJoin CTE → 多 Fact Table JOIN
+│   └── __userMetricAgg CTE → 按用户批量聚合
+│
+└── 【Fact 独有】批量统计 CTE
+    └── getExperimentFactMetricStatisticsCTE() → 一次性计算所有指标的统计值
+```
+
+### 2.3 关键分叉函数对比
+
+| 方面 | Legacy Metric | Fact Metric |
+|------|--------------|-------------|
+| **指标 SQL 源** | `metric.sql`（用户编写） | `factTable.sql`（预定义） |
+| **CTE 生成函数** | `getMetricCTE()`（单指标） | `getFactMetricCTE()`（多指标批量） |
+| **SQL 结构** | `__metric` → `__userMetricJoin` → `__userMetricAgg` → SELECT | `__factTableX` × N → `__userMetricJoin` → `__userMetricAgg` → `__statistics` |
+| **统计逻辑** | 内联在主函数中 | `getExperimentFactMetricStatisticsCTE()` 独立函数 |
+| **列解析** | `getMetricColumns()` | `getFactMetricColumn()` |
+| **行数** | 1 指标 = 1 个 SQL 查询 | N 指标（同 Fact Table）= 1 个 SQL 查询 |
+| **行格式** | 单行单指标，无前缀 | 单行多指标，`m{i}_` 前缀 |
 
 ---
 
@@ -137,56 +264,78 @@ for (const [i, m] of factMetricGroups.entries()) {
 
 **文件**：`packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts:38-615`
 
-为单个 Legacy Metric 生成完整 SQL，流程如下：
-
-```
-getExperimentMetricQuery()
-├── getExposureQuery()          # 获取曝光数据
-├── getIdentitiesCTE()          # 用户身份映射
-├── getMetricCTE()              # 指标 CTE（核心）
-│   └── getMetricColumns()      # 解析指标列
-├── （可选）__denominator CTE   # Ratio 指标的分母 CTE
-├── （可选）__userCovariateMetric CTE  # CUPED 协变量
-├── （可选）__capValue CTE      # 百分位封盖
-├── __userMetricAgg CTE         # 按用户聚合
-└── 最终统计 SELECT             # 内联统计逻辑，无独立函数
-```
-
-### 3.2 核心 CTE：`getMetricCTE()`
-
-**文件**：`packages/back-end/src/integrations/sql/ctes/metric-cte.ts:16-170`
-
-> ⚠️ 注意：虽然这个函数内部通过 `isFactMetric()` 判断支持两种类型，但在 Legacy 路径中只用于处理 Legacy Metric。
+为单个 Legacy Metric 生成完整 SQL：
 
 ```typescript
-export function getMetricCTE(dialect, { metric, ... }) {
-  const cols = getMetricColumns(dialect, metric, factTableMap, "m", useDenominator);
+export function getExperimentMetricQuery(dialect, datasource, params) {
+  const { metric: metricDoc, denominatorMetrics, activationMetric } = params;
   
-  const isFact = isFactMetric(metric);
-  const queryFormat = isFact ? "fact" : getMetricQueryFormat(metric);
+  // ========== 共享前置 ==========
+  const activationMetric = processActivationMetric(activationMetricDoc, settings);
+  applyMetricOverrides(metric, settings);
+  const { unitDimensions } = processDimensions(dialect, params.dimensions, settings, activationMetric);
+  const userIdType = getExposureQuery(datasource, settings.exposureQueryId).userIdType;
+  const { baseIdType, idJoinMap, idJoinSQL } = getIdentitiesCTE(...);
+  const endDate = getExperimentEndDate(settings, maxHoursToConvert);
+  const dimensionCols = params.dimensions.map(d => getDimensionCol(dialect, d));
   
-  let sql = "";
-  if (isFact && factTable && columnRef) {
-    sql = factTable.sql;  // Fact Table SQL
-  } else if (!isFact && queryFormat === "sql") {
-    sql = metric.sql || "";  // Legacy: 用户编写的 SQL
-  }
-  // Query Builder 模式：直接使用 metric.table
+  // ========== Legacy 独有 ==========
+  const ratioMetric = isRatioMetric(metric, denominator);
+  const regressionAdjusted = settings.regressionAdjustmentEnabled && 
+    isRegressionAdjusted(metric, denominator) && !isRatioMetric(metric, denominator);
   
-  return compileSqlTemplate(`
-    SELECT ${userIdCol} as ${baseIdType}, ${cols.value} as value, ...
-    FROM (${sql}) m
-    ...
-  `);
+  // 单个 metric 的日期范围
+  const metricStart = getMetricStart(settings.startDate, minMetricDelay, regressionAdjustmentHours);
+  const metricEnd = getMetricEnd(orderedMetrics, settings.endDate, overrideConversionWindows);
+  
+  // 封盖设置
+  const capCoalesceMetric = capCoalesceValue(dialect, { valueCol: "m.value", metric, ... });
+  
+  // ========== 核心 CTE 生成 ==========
+  return format(`
+WITH
+  ${idJoinSQL}
+  ${getExperimentUnitsQuery(...)}  -- 或 units table 引用
+  
+  -- 指标 CTE
+  , __metric as (${getMetricCTE(dialect, { metric, ... })})
+  
+  -- （可选）分母 CTE
+  ${denominator ? `, __denominator as (${getMetricCTE(dialect, { metric: denominator, ... })})` : ""}
+  
+  -- （可选）CUPED 协变量
+  ${regressionAdjusted ? `, __userCovariateMetric as (SELECT ... FROM __metric WHERE ...)` : ""}
+  
+  -- （可选）百分位封盖
+  ${isPercentileCapped ? `, __capValue AS (${dialect.percentileCapSelectClause(...)})` : ""}
+  
+  -- 按用户聚合
+  , __userMetricAgg AS (
+    SELECT d.variation, d.${baseIdType}, ${getAggregateMetricColumnLegacyMetrics(dialect, { metric })} as value
+    FROM __distinctUsers d JOIN __metric m ON m.${baseIdType} = d.${baseIdType}
+    WHERE m.timestamp >= d.first_exposure_timestamp
+    GROUP BY d.variation, d.${baseIdType}
+  )
+  
+  -- 最终统计
+  SELECT
+    m.variation AS variation,
+    COUNT(*) AS users,
+    SUM(${capCoalesceMetric}) AS main_sum,
+    SUM(POWER(${capCoalesceMetric}, 2)) AS main_sum_squares,
+    ${ratioMetric ? `, SUM(${capCoalesceDenominator}) AS denominator_sum, ...` : ""}
+    ${regressionAdjusted ? `, SUM(${capCoalesceCovariate}) AS covariate_sum, ...` : ""}
+  FROM __userMetricAgg m
+  ${ratioMetric ? "LEFT JOIN __userDenominatorAgg d ON ..." : ""}
+  GROUP BY m.variation
+`);
 }
 ```
 
-### 3.3 输出行格式
-
-**文件**：`packages/shared/types/integrations.d.ts:606-632`
+### 3.2 输出行格式
 
 ```typescript
-export type ExperimentMetricQueryResponseRows = {
+{
   variation: string;
   users: number;
   count: number;
@@ -195,14 +344,12 @@ export type ExperimentMetricQueryResponseRows = {
   denominator_sum?: number;   // 无前缀
   covariate_sum?: number;     // 无前缀
   // ... 其他字段
-}[];
+}
 ```
 
-**特点**：每行只包含**一个指标**的数据，字段名直接使用 `main_sum`、`denominator_sum` 等，无前缀。
+### 3.3 结果处理：`runExperimentMetricQuery()`
 
-### 3.4 结果处理：`runExperimentMetricQuery()`
-
-**文件**：`packages/back-end/src/integrations/SqlIntegration.ts:511-619`
+**文件**：`SqlIntegration.ts:511-619`
 
 ```typescript
 async runExperimentMetricQuery(query, setExternalId, queryMetadata) {
@@ -228,105 +375,124 @@ async runExperimentMetricQuery(query, setExternalId, queryMetadata) {
 
 **文件**：`packages/back-end/src/integrations/sql/queries/experiment-fact-metrics-query.ts:32-660`
 
-为一组 Fact Metric 生成批量优化的 SQL，流程如下：
-
-```
-getExperimentFactMetricsQuery()
-├── getFactTablesForMetrics()       # 收集涉及的所有 Fact Table
-├── getMetricData()                 # 解析每个指标的聚合元数据
-├── getExposureQuery()              # 获取曝光数据
-├── getIdentitiesCTE()              # 用户身份映射
-├── getFactMetricCTE() × N          # 每个 Fact Table 一个 CTE
-│   └── getFactMetricColumn()       # 解析列引用（支持多指标）
-├── （可选）Quantile 相关 CTE       # KLL sketch / 百分位计算
-├── __userMetricJoin CTE            # 多 Fact Table JOIN
-├── __userMetricAgg CTE             # 按用户批量聚合
-└── getExperimentFactMetricStatisticsCTE()  # 批量统计 CTE
-```
-
-### 4.2 核心 CTE：`getFactMetricCTE()`
-
-**文件**：`packages/back-end/src/integrations/sql/ctes/fact-metric-cte.ts:20-217`
-
-> ✅ 这是 Fact Metric 专用的 CTE 生成函数，**不被 Legacy 路径使用**。核心优化是在单个 CTE 中投影多个指标的列。
+为一组 Fact Metric 生成批量优化的 SQL：
 
 ```typescript
-export function getFactMetricCTE(dialect, { metricsWithIndices, factTable, ... }) {
-  const sql = factTable.sql;  // 使用预定义的 Fact Table SQL
-  const where: string[] = [];
+export function getExperimentFactMetricsQuery(dialect, datasource, params) {
+  const { metrics, activationMetric, settings } = params;
+  const metricsWithIndices = metrics.map((m, i) => ({ metric: m, index: i }));
   
-  // 日期过滤（谓词下推）
-  if (startDate) where.push(`m.timestamp >= ${dialect.toTimestamp(startDate)}`);
-  if (endDate) where.push(`m.timestamp <= ${dialect.toTimestamp(endDate)}`);
+  // ========== 共享前置 ==========
+  const activationMetric = processActivationMetric(params.activationMetric, settings);
+  metricsWithIndices.forEach(m => applyMetricOverrides(m.metric, settings));
+  const { unitDimensions } = processDimensions(dialect, params.dimensions, settings, activationMetric);
+  const userIdType = getExposureQuery(datasource, settings.exposureQueryId).userIdType;
   
-  // 为该 Fact Table 上的所有指标投影列
-  const metricCols: string[] = [];
-  metricsWithIndices.forEach(({ metric, index }) => {
-    if (metric.numerator?.factTableId === factTable.id) {
-      const value = getFactMetricColumn(dialect, metric, metric.numerator, factTable, "m").value;
-      const filters = getColumnRefWhereClause(...);
-      const column = filters.length > 0 
-        ? `CASE WHEN (${filters.join(" AND ")}) THEN ${value} ELSE NULL END`
-        : value;
-      // 使用 m{index}_ 前缀区不同指标
-      metricCols.push(`${column} as m${index}_value`);
-    }
-    // Ratio 指标的分母列也投影到同一 CTE
-    if (isRatioMetric(metric) && metric.denominator?.factTableId === factTable.id) {
-      // ... 类似逻辑，输出 m${index}_denominator
-    }
+  // ========== Fact 独有：批量处理 ==========
+  const factTablesWithIndices = getFactTablesForMetrics(metricsWithIndices, factTableMap);
+  const metricData = metricsWithIndices.map(m => 
+    getMetricData(dialect, m, settings, activationMetric, factTablesWithIndices, ...)
+  );
+  
+  // 批量计算日期范围（取所有指标的并集）
+  const metricStart = metricData.reduce((min, d) => d.metricStart < min ? d.metricStart : min, settings.startDate);
+  const metricEnd = metricData.reduce((max, d) => d.metricEnd && d.metricEnd > max ? d.metricEnd : max, settings.endDate);
+  
+  // ========== 共享前置 ==========
+  const { baseIdType, idJoinMap, idJoinSQL } = getIdentitiesCTE(...);
+  const endDate = getExperimentEndDate(settings, maxHoursToConvert);
+  const dimensionCols = params.dimensions.map(d => getDimensionCol(dialect, d));
+  
+  // ========== Fact 独有：核心 CTE 生成 ==========
+  
+  // 1. 为每个 Fact Table 生成 CTE
+  const factTableCTEs = factTablesWithIndices.map((f, sourceIndex) => {
+    return getFactMetricCTE(dialect, {
+      metricsWithIndices: metricsWithIndices.filter(m => 
+        m.metric.numerator?.factTableId === f.factTable.id ||
+        (isRatioMetric(m.metric) && m.metric.denominator?.factTableId === f.factTable.id)
+      ),
+      factTable: f.factTable,
+      baseIdType, idJoinMap, startDate: metricStart, endDate: metricEnd, ...
+    });
   });
   
-  return compileSqlTemplate(`
-    SELECT
-      ${userIdCol} as ${baseIdType},
-      ${timestampDateTimeColumn} as timestamp,
-      ${metricCols.join(",\n")}  -- 多指标列，带 m{i}_ 前缀
-    FROM (${sql}) m
-    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-  `);
+  // 2. 生成用户-指标 JOIN CTE
+  const userMetricJoinCTE = `
+    , __userMetricJoin AS (
+      SELECT
+        d.variation, d.${baseIdType}, d.first_exposure_timestamp, ...
+        ${metricData.map(m => `, f${m.numeratorSourceIndex}.m${m.metricIndex}_value AS ${m.alias}_value`).join("")}
+      FROM __distinctUsers d
+      ${metricData.map(m => 
+        `LEFT JOIN __factTable${m.numeratorSourceIndex} f${m.numeratorSourceIndex} ON ...`
+      ).join("")}
+      WHERE ...
+    )
+  `;
+  
+  // 3. 生成用户聚合 CTE
+  const userMetricAggCTE = `
+    , __userMetricAgg AS (
+      SELECT
+        variation, ${baseIdType},
+        ${metricData.map(m => `${m.numeratorAggFns.reAggregationFunction(m.alias + "_value")} AS ${m.alias}_value`).join(",")}
+      FROM __userMetricJoin
+      GROUP BY variation, ${baseIdType}
+    )
+  `;
+  
+  // 4. 生成批量统计 CTE
+  const statisticsCTE = getExperimentFactMetricStatisticsCTE(dialect, {
+    metricData, dimensionCols, banditDates, ...
+  });
+  
+  // ========== 最终 SQL 组装 ==========
+  return format(`
+WITH
+  ${idJoinSQL}
+  ${getExperimentUnitsQuery(...)}
+  ${factTableCTEs.join(",")}
+  ${userMetricJoinCTE}
+  ${userMetricAggCTE}
+  ${statisticsCTE}
+SELECT * FROM __statistics
+`);
 }
 ```
 
-### 4.3 批量统计 CTE：`getExperimentFactMetricStatisticsCTE()`
-
-**文件**：`packages/back-end/src/integrations/sql/ctes/experiment-fact-metric-statistics-cte.ts`
-
-Fact Metric 专用的批量统计函数，一次性计算所有指标的统计值。
-
-### 4.4 输出行格式
-
-**文件**：`packages/shared/types/integrations.d.ts:633-638`
+### 4.2 输出行格式
 
 ```typescript
-export type ExperimentFactMetricsQueryResponseRows = {
+{
   variation: string;
   users: number;
   count: number;
   // 多指标前缀字段：
-  // m0_id, m0_main_sum, m0_main_sum_squares, ...
-  // m1_id, m1_main_sum, m1_main_sum_squares, ...
-  [key: string]: number | string;
-}[];
+  m0_id: string;
+  m0_main_sum: number;
+  m0_main_sum_squares: number;
+  m1_id: string;
+  m1_main_sum: number;
+  m1_main_sum_squares: number;
+  // ... 更多指标
+}
 ```
 
-**特点**：每行包含**多个指标**的数据，每个指标的字段带 `m{i}_` 前缀，通过 `m{i}_id` 标识指标 ID。
+### 4.3 结果处理：`processExperimentFactMetricsQueryRows()`
 
-### 4.5 结果处理：`processExperimentFactMetricsQueryRows()`
-
-**文件**：`packages/back-end/src/integrations/sql/processing/process-experiment-fact-metrics-query-rows.ts:11-51`
+**文件**：`process-experiment-fact-metrics-query-rows.ts:11-51`
 
 ```typescript
 export function processExperimentFactMetricsQueryRows(rows) {
   return rows.map(row => {
     let metricData = {};
-    // 遍历所有可能的指标槽位（最多 MAX_METRICS_PER_QUERY 个）
+    // 遍历所有可能的指标槽位
     for (let i = 0; i < MAX_METRICS_PER_QUERY; i++) {
       const prefix = `m${i}_`;
-      if (!row[prefix + "id"]) break;  // 没有更多指标
+      if (!row[prefix + "id"]) break;
       
       metricData[prefix + "id"] = row[prefix + "id"];
-      // 解析所有浮点字段
       ALL_NON_QUANTILE_METRIC_FLOAT_COLS.forEach(col => {
         if (row[prefix + col] !== undefined) {
           metricData[prefix + col] = parseFloat(row[prefix + col]) || 0;
@@ -337,7 +503,7 @@ export function processExperimentFactMetricsQueryRows(rows) {
       variation: row.variation ?? "",
       users: parseIntWithDefault(row.users, 0),
       count: parseIntWithDefault(row.users, 0),
-      ...metricData,  // 展开所有带前缀的指标字段
+      ...metricData,
     };
   });
 }
@@ -351,22 +517,16 @@ export function processExperimentFactMetricsQueryRows(rows) {
 
 **文件**：`packages/back-end/src/services/stats.ts:345-455`
 
-这是两条路径的**核心汇合点**。该函数接收 `QueryMap`（包含所有查询结果），通过查询 key 的命名约定识别来源，统一转换为统计引擎可接受的格式。
+这是两条路径的**核心汇合点**。通过查询 key 的命名约定识别来源，统一转换格式：
 
 ```typescript
-export function getMetricsAndQueryDataForStatsEngine(
-  queryData: QueryMap,
-  metricMap: Map<string, ExperimentMetricInterface>,
-  settings: ExperimentSnapshotSettings,
-) {
+export function getMetricsAndQueryDataForStatsEngine(queryData, metricMap, settings) {
   const queryResults: QueryResultsForStatsEngine[] = [];
   const metricSettings: Record<string, MetricSettingsForStatsEngine> = {};
 
-  // 遍历所有查询结果，通过 key 前缀判断来源
   queryData.forEach((query, key) => {
     
-    // ========== 识别 Fact Metric 查询 ==========
-    // key 匹配 group_ 前缀，或 queryType 为 experimentIncrementalRefreshStatistics
+    // ========== Fact Metric 查询识别 ==========
     if (key.match(/group_/) || query.queryType === "experimentIncrementalRefreshStatistics") {
       const rows = query.result as ExperimentFactMetricsQueryResponseRows;
       if (!rows?.length) return;
@@ -381,7 +541,6 @@ export function getMetricsAndQueryDataForStatsEngine(
         const metric = metricMap.get(metricId);
         if (metric) {
           metricIds.push(metricId);
-          // 为每个指标生成统计引擎配置
           metricSettings[metricId] = getMetricSettingsForStatsEngine(
             metric, metricMap, settings, true  // true = optimizedFactMetric
           );
@@ -398,11 +557,9 @@ export function getMetricsAndQueryDataForStatsEngine(
       return;
     }
 
-    // ========== 识别 Legacy Metric 查询 ==========
-    // key 就是 metric ID
+    // ========== Legacy Metric 查询识别 ==========
     const metric = metricMap.get(key);
     if (!metric) return;
-    // 为单个指标生成统计引擎配置
     metricSettings[key] = getMetricSettingsForStatsEngine(
       metric, metricMap, settings, false  // false = 非优化模式
     );
@@ -430,65 +587,20 @@ export interface QueryResultsForStatsEngine {
 ```
 
 **关键统一机制**：
-- `metrics` 字段是自描述的，明确指示当前行数据包含哪些指标
-- Legacy Metric：`metrics` 是单元素数组（如 `["metric_123"]`）
-- Fact Metric：`metrics` 是多元素数组（如 `["metric_123", "metric_456", null]`）
+- `metrics` 数组是自描述的，明确指示当前行数据包含哪些指标
+- Legacy：`metrics` 是单元素数组（如 `["metric_123"]`）
+- Fact：`metrics` 是多元素数组（如 `["metric_123", "metric_456", null]`）
 - 统计引擎内部根据 `metrics` 数组和行数据的前缀/字段名对应关系，正确提取每个指标的统计值
 
-### 5.3 指标元数据统一：`getMetricSettingsForStatsEngine()`
-
-**文件**：`packages/back-end/src/services/stats.ts:267-343`
-
-为两种类型的指标生成统一的统计引擎配置，内部通过类型守卫透明处理：
-
-```typescript
-export function getMetricSettingsForStatsEngine(
-  metricDoc: ExperimentMetricInterface,  // 联合类型，两种都可能
-  metricMap: Map<string, ExperimentMetricInterface>,
-  settings: ExperimentSnapshotSettings,
-  optimizedFactMetric: boolean = false,
-): MetricSettingsForStatsEngine {
-  const metric = cloneDeep(metricDoc);
-  applyMetricOverrides(metric, settings);
-
-  // 统一判断指标类型（内部使用 isFactMetric 等守卫）
-  const ratioMetric = isRatioMetric(metric, denominator);
-  const quantileMetric = quantileMetricType(metric);
-  const regressionAdjusted = settings.regressionAdjustmentEnabled && 
-    isRegressionAdjusted(metric, denominator) &&
-    (!isRatioMetric(metric, denominator) || optimizedFactMetric);
-  
-  const mainMetricType = quantileMetric ? "quantile" :
-                         isBinomialMetric(metric) ? "binomial" : "count";
-
-  return {
-    id: metric.id,
-    name: metric.name,
-    inverse: !!metric.inverse,
-    statistic_type: quantileMetric === "unit" ? "quantile_unit" :
-                    quantileMetric === "event" ? "quantile_event" :
-                    ratioMetric && regressionAdjusted ? "ratio_ra" :
-                    ratioMetric && !regressionAdjusted ? "ratio" :
-                    regressionAdjusted ? "mean_ra" : "mean",
-    main_metric_type: mainMetricType,
-    // ... 其他配置字段
-    compute_uncapped_metric: eligibleForUncappedMetric(metric),
-  };
-}
-```
-
-### 5.4 第二汇合点：`runStatsEngine()`
+### 5.3 第二汇合点：`runStatsEngine()`
 
 **文件**：`packages/back-end/src/services/stats.ts:140-176`
 
 统一调用 Python 统计引擎（gbstats），**完全不区分指标来源**：
 
 ```typescript
-export async function runStatsEngine(
-  statsData: ExperimentDataForStatsEngine[],
-): Promise<MultipleExperimentMetricAnalysis[]> {
+export async function runStatsEngine(statsData) {
   if (process.env.EXTERNAL_PYTHON_SERVER_URL) {
-    // 调用外部统计服务
     const retVal = await fetch(`${process.env.EXTERNAL_PYTHON_SERVER_URL}/stats`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -497,7 +609,6 @@ export async function runStatsEngine(
     const { results } = await retVal.json();
     return results;
   } else {
-    // 调用本地 Python 进程池
     const server = await statsServerPool.acquire();
     try {
       return await server.call(statsData);
@@ -508,17 +619,7 @@ export async function runStatsEngine(
 }
 ```
 
-**统计引擎输入结构**（`packages/shared/types/stats.d.ts:260-270`）：
-```typescript
-export interface DataForStatsEngine {
-  analyses: AnalysisSettingsForStatsEngine[];
-  metrics: Record<string, MetricSettingsForStatsEngine>;  // 所有指标元数据
-  query_results: QueryResultsForStatsEngine[];            // 统一格式的查询结果
-  bandit_settings?: BanditSettingsForStatsEngine;
-}
-```
-
-### 5.5 第三汇合点：`parseStatsEngineResult()`
+### 5.4 第三汇合点：`parseStatsEngineResult()`
 
 **文件**：`packages/back-end/src/services/stats.ts:464-588`
 
@@ -549,7 +650,7 @@ function parseStatsEngineResult({ analysisSettings, snapshotSettings, queryResul
       });
     });
     
-    // 计算 SRM 等额外信息
+    // 计算 SRM
     const dimensions = Array.from(dimensionMap.values());
     dimensions.forEach(dimension => {
       dimension.srm = checkSrm(
@@ -569,88 +670,124 @@ function parseStatsEngineResult({ analysisSettings, snapshotSettings, queryResul
 
 ## 6. 完整流程总览
 
-### 6.1 分叉与汇合全景图
+### 6.1 共享-分叉-汇合全景图
 
 ```
-              所有指标 (ExperimentMetricInterface[])
-                              │
-                              ▼
-              getFactMetricGroups() 【分叉点】
-                              │
-           ┌──────────────────┴──────────────────┐
-           │                                     │
-           ▼                                     ▼
-  legacyMetricSingles                    factMetricGroups
-           │                                     │
-           ▼                                     ▼
-  循环每个指标                          循环每个指标组
-           │                                     │
-           ▼                                     ▼
-  getExperimentMetricQuery()           getExperimentFactMetricsQuery()
-           │                                     │
-           ├─ getMetricCTE()                     ├─ getFactTablesForMetrics()
-           │  (单指标CTE)                        ├─ getMetricData()
-           │                                     ├─ getFactMetricCTE() × N
-           ▼                                     │  (多指标批量CTE)
-  runExperimentMetricQuery()                     ├─ 其他辅助CTE
-           │                                     ├─ __userMetricJoin
-           ▼                                     ├─ __userMetricAgg
-  { variation, main_sum, ... }                   ▼
-  (单行单指标, 无前缀)                  getExperimentFactMetricStatisticsCTE()
-                                                 │
-                                                 ▼
-                                       runExperimentFactMetricsQuery()
-                                                 │
-                                                 ▼
-                                       { variation, m0_main_sum, m1_main_sum, ... }
-                                       (单行多指标, 带 m{i}_ 前缀)
-                                                 │
-           ┌─────────────────────────────────────┘
-           │
-           ▼
-  getMetricsAndQueryDataForStatsEngine() 【第一汇合点】
-           │  - 通过 key 前缀识别来源
-           │  - 统一为 QueryResultsForStatsEngine 格式
-           │  - metrics 数组标记每行指标
-           ▼
-  runStatsEngine() 【第二汇合点】
-           │  - Python gbstats 统一分析
-           │  - 完全不区分来源
-           ▼
-  parseStatsEngineResult() 【第三汇合点】
-           │  - 结果格式完全统一
-           │  - 按 metric ID 聚合
-           ▼
-  ExperimentReportResults
+              startExperimentResultQueries()
+                      │
+              ┌───────▼───────┐
+              │  共享前置步骤  │
+              ├───────────────┤
+              │ 1. 基础参数解析 │
+              │    - selectedMetrics │
+              │    - segmentObj │
+              │    - exposureQuery │
+              │    - snapshotDimensions │
+              ├───────────────┤
+              │ 2. Units Table  │
+              │    - useUnitsTable 判断 │
+              │    - （可选）unitQuery 启动 │
+              └───────┬───────┘
+                      │
+              ┌───────▼───────┐ 【分叉点】
+              │ getFactMetricGroups() │
+              │  - legacyMetricSingles │
+              │  - factMetricGroups │
+              └───┬───────────┬───┘
+                  │           │
+    ┌─────────────▼─┐       ┌─▼─────────────┐
+    │ Legacy 循环   │       │ Fact 循环      │
+    │ 每个指标      │       │ 每个组         │
+    └───────┬───────┘       └───────┬───────┘
+            │                       │
+┌───────────▼──────────┐  ┌────────▼────────────┐
+│ getExperimentMetricQuery() │ │ getExperimentFactMetricsQuery() │
+├──────────────────────┤  ├─────────────────────┤
+│ [共享前置]           │  │ [共享前置]          │
+│ - processActivationMetric │ │ - processActivationMetric │
+│ - applyMetricOverrides     │ │ - applyMetricOverrides     │
+│ - processDimensions        │ │ - processDimensions        │
+│ - getExposureQuery         │ │ - getExposureQuery         │
+│ - getIdentitiesCTE         │ │ - getIdentitiesCTE         │
+│ - getExperimentEndDate     │ │ - getExperimentEndDate     │
+│ - getDimensionCol          │ │ - getDimensionCol          │
+├──────────────────────┤  ├─────────────────────┤
+│ [Legacy 独有]        │  │ [Fact 独有]         │
+│ - 单指标类型判断     │  │ - getFactTablesForMetrics() │
+│ - 单指标封盖设置     │  │ - getMetricData()           │
+│ - 单指标日期计算     │  │ - 批量日期计算              │
+│ - getMetricCTE()    │  │ - getFactMetricCTE() × N    │
+│ - 内联统计 SELECT   │  │ - getExperimentFactMetricStatisticsCTE() │
+└───────────┬──────────┘  └──────────┬────────────┘
+            │                         │
+┌───────────▼──────────┐  ┌──────────▼────────────┐
+│ runExperimentMetricQuery() │ │ runExperimentFactMetricsQuery() │
+│ - 直接字段映射        │  │ - 前缀解析 + ID 提取  │
+└───────────┬──────────┘  └──────────┬────────────┘
+            │                         │
+            └─────────────┬───────────┘
+                          │
+              ┌───────────▼───────────┐ 【第一汇合点】
+              │ getMetricsAndQueryDataForStatsEngine() │
+              │ - 通过 key 前缀识别来源            │
+              │ - 统一为 QueryResultsForStatsEngine │
+              └───────────┬───────────┘
+                          │
+              ┌───────────▼───────────┐ 【第二汇合点】
+              │   runStatsEngine()     │
+              │ - Python gbstats 统一分析 │
+              └───────────┬───────────┘
+                          │
+              ┌───────────▼───────────┐ 【第三汇合点】
+              │ parseStatsEngineResult() │
+              │ - 结果格式完全统一        │
+              │ - 按 metric ID 聚合       │
+              └───────────┬───────────┘
+                          ▼
+              ExperimentReportResults
 ```
 
-### 6.2 关键节点汇总
+### 6.2 关键节点时间线
 
-| 节点 | 函数 | 位置 | 作用 |
-|------|------|------|------|
-| **分叉点** | `getFactMetricGroups()` | experimentQueries.ts:256 | 将指标分为 Legacy 单查询组和 Fact 批量组 |
-| Legacy SQL 入口 | `getExperimentMetricQuery()` | experiment-metric-query.ts:38 | 单指标 SQL 生成 |
-| Legacy CTE | `getMetricCTE()` | metric-cte.ts:16 | 单指标 CTE 生成 |
-| Legacy 执行 | `runExperimentMetricQuery()` | SqlIntegration.ts:511 | 单指标查询执行与结果解析 |
-| Fact SQL 入口 | `getExperimentFactMetricsQuery()` | experiment-fact-metrics-query.ts:32 | 多指标批量 SQL 生成 |
-| Fact CTE | `getFactMetricCTE()` | fact-metric-cte.ts:20 | 多指标批量 CTE 生成 |
-| Fact 执行 | `runExperimentFactMetricsQuery()` | SqlIntegration.ts:486 | 多指标查询执行与结果解析 |
-| **第一汇合点** | `getMetricsAndQueryDataForStatsEngine()` | stats.ts:345 | 统一数据格式，生成 `QueryResultsForStatsEngine` |
-| **第二汇合点** | `runStatsEngine()` | stats.ts:140 | 统一调用 Python 统计引擎 |
-| **第三汇合点** | `parseStatsEngineResult()` | stats.ts:464 | 统一解析统计结果 |
+| 顺序 | 阶段 | 节点 | 共享/分叉/汇合 |
+|------|------|------|----------------|
+| 1 | 前置 | 基础参数解析（selectedMetrics、segment、exposureQuery、dimensions） | 共享 |
+| 2 | 前置 | Units Table 准备（可选） | 共享 |
+| 3 | 分叉 | `getFactMetricGroups()` 分组 | 分叉点 |
+| 4 | SQL 生成 | `processActivationMetric()` | 共享（各自函数内） |
+| 5 | SQL 生成 | `applyMetricOverrides()` | 共享（各自函数内） |
+| 6 | SQL 生成 | `processDimensions()` | 共享（各自函数内） |
+| 7 | SQL 生成 | `getExposureQuery()` | 共享（各自函数内） |
+| 8 | SQL 生成 | `getIdentitiesCTE()` | 共享（各自函数内） |
+| 9 | SQL 生成 | `getExperimentEndDate()` | 共享（各自函数内） |
+| 10 | SQL 生成 | `getDimensionCol()` | 共享（各自函数内） |
+| 11 | SQL 生成 | Legacy: 单指标特有处理 / Fact: 批量指标处理 | 分叉 |
+| 12 | SQL 生成 | Legacy: `getMetricCTE()` / Fact: `getFactMetricCTE()` | 分叉 |
+| 13 | SQL 生成 | Legacy: 内联统计 SELECT / Fact: `getExperimentFactMetricStatisticsCTE()` | 分叉 |
+| 14 | 执行 | `runExperimentMetricQuery()` / `runExperimentFactMetricsQuery()` | 分叉 |
+| 15 | 汇合 | `getMetricsAndQueryDataForStatsEngine()` | 第一汇合点 |
+| 16 | 汇合 | `runStatsEngine()` | 第二汇合点 |
+| 17 | 汇合 | `parseStatsEngineResult()` | 第三汇合点 |
 
 ---
 
 ## 7. 关键设计要点
 
-### 7.1 分叉设计的权衡
+### 7.1 共享步骤的设计价值
+
+1. **代码复用**：Activation Metric、Identities CTE、维度处理等复杂逻辑在两条路径间完全复用
+2. **一致性保证**：共享步骤确保两条路径在用户识别、维度解析、日期计算等基础逻辑上完全一致
+3. **维护成本**：共享逻辑只需维护一份，修改时无需担心两条路径不一致
+4. **平滑迁移**：新功能（如 CUPED、Bandit）在共享层实现后，两条路径可同时受益
+
+### 7.2 分叉设计的权衡
 
 | 设计选择 | 优点 | 缺点 |
 |---------|------|------|
 | Legacy 路径单指标查询 | 简单、兼容、易于调试 | 查询数量多、表扫描重复 |
 | Fact 路径批量查询 | 共享表扫描、列裁剪、谓词下推，性能更优 | 实现复杂、SQL 体积大 |
 
-### 7.2 汇合设计的精妙之处
+### 7.3 汇合设计的精妙之处
 
 1. **Key 约定**：通过查询 key 的命名约定（`metric.id` vs `group_${i}`）实现来源识别，无需额外元数据
 2. **自描述数据**：`metrics` 数组使 `QueryResultsForStatsEngine` 自包含，统计引擎无需关心数据来源
@@ -658,14 +795,15 @@ function parseStatsEngineResult({ analysisSettings, snapshotSettings, queryResul
 4. **元数据分离**：`metricSettings` 单独提供所有指标的统计配置，与行数据解耦
 5. **三层汇合**：数据格式 → 统计分析 → 结果解析，每层都实现完全解耦
 
-### 7.3 两条路径的详细对比
+### 7.4 两条路径的详细对比
 
 | 维度 | SQL 直接定义 (Legacy) | Fact Table |
 |------|----------------------|------------|
 | 分叉入口 | `legacyMetricSingles` 循环 | `factMetricGroups` 循环 |
 | SQL 生成函数 | `getExperimentMetricQuery()` | `getExperimentFactMetricsQuery()` |
+| 共享前置步骤 | ✅ 全部共享 | ✅ 全部共享 |
+| 指标 SQL 源 | 用户编写的 `metric.sql` | 预定义 `factTable.sql` |
 | 核心 CTE 函数 | `getMetricCTE()`（单指标） | `getFactMetricCTE()`（多指标批量） |
-| SQL 源 | 用户编写的 `metric.sql` | 预定义 `factTable.sql` |
 | 统计逻辑 | 内联在主函数中 | `getExperimentFactMetricStatisticsCTE()` 独立函数 |
 | 查询 key | `metric.id` | `group_${i}` |
 | 行格式 | 单行单指标，无前缀 | 单行多指标，`m{i}_` 前缀 |
@@ -687,14 +825,16 @@ function parseStatsEngineResult({ analysisSettings, snapshotSettings, queryResul
 | `packages/shared/types/stats.d.ts` | 统计引擎输入输出类型定义 |
 | `packages/shared/src/experiments/experiments.ts` | 类型守卫、通用工具函数 |
 | `packages/back-end/src/services/experimentQueries/experimentQueries.ts` | 分叉点 `getFactMetricGroups()` |
-| `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 查询计划生成与分叉执行 |
+| `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 查询计划生成、共享前置、分叉执行 |
 | `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | Legacy Metric SQL 生成 |
 | `packages/back-end/src/integrations/sql/queries/experiment-fact-metrics-query.ts` | Fact Metric SQL 生成 |
 | `packages/back-end/src/integrations/sql/ctes/metric-cte.ts` | Legacy 单指标 CTE 生成 |
 | `packages/back-end/src/integrations/sql/ctes/fact-metric-cte.ts` | Fact 多指标批量 CTE 生成 |
 | `packages/back-end/src/integrations/sql/ctes/experiment-fact-metric-statistics-cte.ts` | Fact 批量统计 CTE |
+| `packages/back-end/src/integrations/sql/ctes/identities-cte.ts` | 共享 Identities CTE 生成 |
 | `packages/back-end/src/integrations/sql/columns/metric-columns.ts` | Legacy 列解析 `getMetricColumns()` |
 | `packages/back-end/src/integrations/sql/columns/fact-metric-column.ts` | Fact 列解析 `getFactMetricColumn()` |
+| `packages/back-end/src/integrations/sql/processing/process-activation-metric.ts` | 共享 Activation Metric 处理 |
 | `packages/back-end/src/integrations/sql/processing/process-experiment-fact-metrics-query-rows.ts` | Fact 行前缀解析 |
 | `packages/back-end/src/integrations/SqlIntegration.ts` | SQL 执行与结果处理 |
 | `packages/back-end/src/services/stats.ts` | 汇合点 `getMetricsAndQueryDataForStatsEngine()`、`runStatsEngine()`、`parseStatsEngineResult()` |
