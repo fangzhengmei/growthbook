@@ -583,3 +583,411 @@ interface QueryExecutionResult {
 | 可视化配置验证 | `packages/shared/src/validators/saved-queries.ts` |
 | 前端 Dashboard 编辑器 | `packages/front-end/enterprise/components/Dashboards/DashboardEditor/index.tsx` |
 | SqlExplorer Block | `packages/front-end/enterprise/components/Dashboards/DashboardEditor/DashboardBlock/SqlExplorerBlock.tsx` |
+| Dashboard Block 验证器 | `packages/shared/src/enterprise/validators/dashboard-block.ts` |
+| Dashboard 工具函数 | `packages/shared/src/enterprise/dashboards/utils.ts` |
+| Dashboard 更新显示 | `packages/front-end/enterprise/components/Dashboards/DashboardEditor/DashboardUpdateDisplay.tsx` |
+| Dashboard Snapshot Provider | `packages/front-end/enterprise/components/Dashboards/DashboardSnapshotProvider.tsx` |
+
+---
+
+## 八、Sql-Explorer Block 深度拆解
+
+### 8.1 从保存请求体开始的完整旅程
+
+#### 8.1.1 前端保存请求体结构
+
+当用户在 Dashboard 编辑器中编辑并保存时，前端发送的 PUT 请求体示例：
+
+```typescript
+// PUT /api/dashboards/:id
+{
+  "title": "用户活跃度分析",
+  "editLevel": "private",
+  "shareLevel": "private",
+  "enableAutoUpdates": true,
+  "updateSchedule": {
+    "type": "daily",
+    "hour": 2,
+    "minute": 0
+  },
+  "projects": ["proj_abc123"],
+  "blocks": [
+    {
+      "type": "sql-explorer",
+      "id": "dshblk_xyz789",
+      "uid": "uuid-1234-5678",
+      "title": "日活用户趋势",
+      "description": "",
+      "savedQueryId": "sq_abc123def456",
+      "blockConfig": ["results_table", "line-chart-1", "big-value-1"]
+    }
+  ]
+}
+```
+
+**代码位置**：`packages/front-end/enterprise/components/Dashboards/DashboardEditor/index.tsx:463-470`
+
+#### 8.1.2 后端保存处理流程
+
+```typescript
+// 路由层: dashboards.controller.ts:131-168
+async putDashboard(req, res) {
+  const dashboard = await req.context.models.dashboards.getById(id);
+  const updates = await dashboardModel.processApiUpdateBody(
+    req.context,
+    body,
+    dashboard,
+    req.params.id
+  );
+  await req.context.models.dashboards.update(dashboard, updates);
+  return res.status(200).json({ status: 200, dashboard });
+}
+
+// 模型层: DashboardModel.ts:442-460
+async processApiUpdateBody(context, body, existing, id) {
+  // 1. 处理 blocks
+  blocks: body.blocks?.map(block => 
+    fromBlockApiInterface(block, existing?.organization)
+  ),
+  // 2. 迁移旧版本 block
+  const migrateBlock = (block) => {
+    if (block.type === "sql-explorer" && !block.blockConfig) {
+      return { ...block, blockConfig: [] };
+    }
+    return block;
+  };
+  // 3. 为新 block 生成 ID
+  generateDashboardBlockIds(blocks, id);
+}
+```
+
+**代码位置**：
+- `packages/back-end/src/routers/dashboards/dashboards.controller.ts:131-168`
+- `packages/back-end/src/enterprise/models/DashboardModel.ts:442-460`
+
+### 8.2 blockConfig 与 dataVizConfigIndex 的映射机制
+
+#### 8.2.1 字段定义与版本演进
+
+```typescript
+// dashboard-block.ts:224-231
+const sqlExplorerBlockInterface = baseBlockInterface
+  .extend({
+    type: z.literal("sql-explorer"),
+    savedQueryId: z.string(),
+    // 已废弃：产品分析仪表板发布后，支持显示多个可视化
+    dataVizConfigIndex: z.number().optional(),
+    // 新版：字符串数组，支持多个配置项
+    blockConfig: z.array(z.string()),
+  })
+  .strict();
+```
+
+**代码位置**：`packages/shared/src/enterprise/validators/dashboard-block.ts:224-231`
+
+#### 8.2.2 blockConfig 支持的配置项类型
+
+```typescript
+// dashboards/utils.ts:35-39
+export const BLOCK_CONFIG_ITEM_TYPES = {
+  RESULTS_TABLE: "results_table",  // 显示结果表格
+  VISUALIZATION: "visualization",   // 显示图表（通过 ID/title 匹配）
+} as const;
+
+export function isResultsTableItem(item: string): boolean {
+  return item === BLOCK_CONFIG_ITEM_TYPES.RESULTS_TABLE;
+}
+```
+
+**代码位置**：`packages/shared/src/enterprise/dashboards/utils.ts:35-43`
+
+#### 8.2.3 前端渲染时的映射逻辑
+
+```typescript
+// SqlExplorerBlock.tsx:28-103
+export default function SqlExplorerBlock({ block, savedQuery }) {
+  // 向后兼容：旧版 dataVizConfigIndex 方式
+  if (block.dataVizConfigIndex !== undefined) {
+    const dataVizConfig = savedQuery.dataVizConfig?.[block.dataVizConfigIndex];
+    return <SqlExplorerDataVisualization dataVizConfig={dataVizConfig} ... />;
+  }
+
+  // 新版 blockConfig 方式
+  const blockConfig = block.blockConfig || [];
+  
+  const renderItems = blockConfig.map((configId, index) => {
+    if (isResultsTableItem(configId)) {
+      // 渲染结果表格
+      return <DisplayTestQueryResults 
+        results={savedQuery.results?.results} 
+        ... 
+      />;
+    } else {
+      // 渲染可视化：先按 ID 匹配，再按 title 匹配
+      const dataVizConfig = savedQuery.dataVizConfig?.find(
+        (config) => config.id === configId || config.title === configId
+      );
+      return <DataVisualizationDisplay dataVizConfig={dataVizConfig} ... />;
+    }
+  });
+
+  return <Flex direction="column" gap="4">{renderItems}</Flex>;
+}
+```
+
+**代码位置**：`packages/front-end/enterprise/components/Dashboards/DashboardEditor/DashboardBlock/SqlExplorerBlock.tsx:28-103`
+
+#### 8.2.4 编辑时的 blockConfig 切换逻辑
+
+```typescript
+// EditSingleBlock.tsx:173-208
+function toggleBlockConfigItem(block, setBlock, itemId, value) {
+  // 只处理 sql-explorer 类型
+  if (block.type !== "sql-explorer") return;
+  
+  // 从旧版迁移：移除 dataVizConfigIndex，使用新版 blockConfig
+  const { dataVizConfigIndex: _, ...blockToSet } = block;
+  
+  if (value) {
+    // 添加配置项
+    setBlock({
+      ...blockToSet,
+      blockConfig: [...block.blockConfig, itemId],
+    });
+  } else {
+    // 移除配置项
+    setBlock({
+      ...blockToSet,
+      blockConfig: block.blockConfig.filter(id => id !== itemId),
+    });
+  }
+}
+```
+
+**代码位置**：`packages/front-end/enterprise/components/Dashboards/DashboardEditor/DashboardEditorSidebar/EditSingleBlock.tsx:173-208`
+
+#### 8.2.5 配置缺失检测逻辑
+
+```typescript
+// DashboardBlock/index.tsx:346-366
+const blockNeedsConfiguration =
+  // ... 其他 block 类型检测 ...
+  (blockHasSavedQuery &&
+    block.type === "sql-explorer" &&
+    (isSqlExplorerWithDataVizIndex(block)
+      ? // 旧版：索引无效或对应配置不存在
+        block.dataVizConfigIndex === -1 ||
+        !blockSavedQuery?.dataVizConfig?.[block.dataVizConfigIndex]
+      : isSqlExplorerWithBlockConfig(block)
+        ? // 新版：blockConfig 为空
+          !block.blockConfig || block.blockConfig.length === 0
+        : true));
+```
+
+**代码位置**：`packages/front-end/enterprise/components/Dashboards/DashboardEditor/DashboardBlock/index.tsx:346-366`
+
+### 8.3 手动刷新 vs 定时刷新：分叉差异详解
+
+#### 8.3.1 触发入口对比
+
+| 维度 | 手动刷新 | 定时刷新 |
+|-----|---------|---------|
+| **触发方式** | 用户点击 "Update" 按钮 | Agenda 定时任务（每 10 分钟） |
+| **入口代码** | `DashboardUpdateDisplay.tsx:181-196` | `updateDashboards.ts:9-33` |
+| API 端点 | `POST /dashboards/:id/refresh` | 无 API，直接调用服务层 |
+| **权限检查** | 前端检查 `canRunSqlExplorerQueries` | 后端使用系统上下文 |
+| **UI 反馈** | 显示进度条、完成/失败状态 | 无 UI，更新 `nextUpdate` 和 `lastUpdated` |
+
+#### 8.3.2 手动刷新完整链路
+
+```
+前端: DashboardUpdateDisplay.tsx
+  ↓ 点击 Update 按钮
+  updateAllSnapshots() [DashboardSnapshotProvider.tsx:224-239]
+    ↓
+    POST /dashboards/${dashboard.id}/refresh
+      ↓
+后端: dashboards.router.ts
+  ↓
+  refreshDashboardData() [dashboards.controller.ts:180]
+    ├─ 实验 Dashboard: 走实验快照流程
+    └─ 通用 Dashboard: updateNonExperimentDashboard() [dashboards.ts:235]
+        └─ updateDashboardSavedQueries() [dashboards.ts:379-414]
+            └─ executeAndSaveQuery() [saved-queries.controller.ts:249-281]
+                └─ runFreeFormQuery() [datasource.ts:152-219]
+                    ├─ 权限检查: canRunSqlExplorerQueries()
+                    ├─ 安全检查: isReadOnlySQL()
+                    ├─ SQL 拼装: integration.getFreeFormQuery()
+                    └─ 查询执行: integration.runTestQuery()
+                      ↓
+前端: DashboardSnapshotProvider.tsx
+  ↓ 轮询状态 (每 2 秒)
+  mutateAllSnapshots()
+    ↓
+  GET /dashboards/${dashboard.id}/snapshots
+    ↓
+  更新 savedQueriesMap, allQueries, status
+    ↓
+  SqlExplorerBlock.tsx 读取最新 savedQuery.results 渲染
+```
+
+#### 8.3.3 定时刷新完整链路
+
+```
+Agenda 定时任务 (每 10 分钟触发)
+  ↓
+  QUEUE_DASHBOARD_UPDATES 任务 [updateDashboards.ts:9-33]
+    ↓
+    DashboardModel.getDashboardsToUpdate() [DashboardModel.ts:113-147]
+      ├─ 条件: isDeleted=false, isDefault=false
+      ├─ 条件: enableAutoUpdates=true, experimentId=null
+      └─ 条件: nextUpdate <= now 或 nextUpdate 不存在
+    ↓
+    为每个 Dashboard 创建 UPDATE_SINGLE_DASH 任务
+      ↓
+      updateSingleDashboard() [updateDashboards.ts:53-82]
+        ├─ getContextForAgendaJobByOrgId()  // 创建系统上下文
+        └─ updateNonExperimentDashboard() [dashboards.ts:235]
+            └─ (与手动刷新相同的查询执行流程)
+              ↓
+              更新 Dashboard.lastUpdated
+              重新计算 Dashboard.nextUpdate
+              保存 SavedQuery.results
+```
+
+#### 8.3.4 核心差异点
+
+| 差异点 | 手动刷新 | 定时刷新 |
+|-------|---------|---------|
+| **上下文** | 用户请求上下文（带权限） | Agenda 系统上下文 |
+| **错误处理** | 立即返回错误给前端 | 失败后关闭 `enableAutoUpdates` |
+| **更新时间** | `lastUpdated` 立即更新 | `lastUpdated` 和 `nextUpdate` 都更新 |
+| **并发性** | 用户触发，可能并发 | 串行处理，最多 100 个/次 |
+| **结果通知** | 前端轮询，实时显示状态 | 无通知，仅更新数据库 |
+| **Dashboard 类型** | 支持实验和通用 Dashboard | 仅支持通用 Dashboard（`experimentId=null`） |
+
+#### 8.3.5 失败处理差异
+
+**手动刷新失败**：
+```typescript
+// DashboardSnapshotProvider.tsx:224-239
+const updateAllSnapshots = async () => {
+  try {
+    await apiCall(`/dashboards/${dashboard.id}/refresh`, { method: "POST" });
+  } catch (e) {
+    setRefreshError(e.message);  // 显示给用户
+  } finally {
+    // 无论成功失败都刷新状态
+    mutateAllSnapshots();
+  }
+};
+```
+
+**定时刷新失败**：
+```typescript
+// updateDashboards.ts:53-82
+const updateSingleDashboard = async (job) => {
+  try {
+    await updateNonExperimentDashboard(context, dashboard);
+  } catch (e) {
+    // 更新失败，自动关闭自动更新
+    await context.models.dashboards.dangerousUpdateByIdBypassPermission(
+      dashboardId,
+      { enableAutoUpdates: false }
+    );
+    // 无用户反馈，静默处理
+  }
+};
+```
+
+### 8.4 SavedQuery 与 Dashboard 的关联维护
+
+#### 8.4.1 关联关系
+
+```typescript
+// Dashboard 侧
+blocks: [
+  {
+    type: "sql-explorer",
+    savedQueryId: "sq_abc123",  // 外键关联
+    blockConfig: ["results_table", "chart-1"]
+  }
+]
+
+// SavedQuery 侧
+{
+  id: "sq_abc123",
+  linkedDashboardIds: ["dash_xyz789"],  // 反向关联
+  dataVizConfig: [
+    { id: "chart-1", title: "日活趋势", chartType: "line", ... }
+  ],
+  results: {
+    results: [...],
+    sql: "SELECT date, dau FROM ...",
+    duration: 1234
+  }
+}
+```
+
+#### 8.4.2 前端可选项过滤
+
+```typescript
+// EditSingleBlock.tsx:611-625
+const savedQueryOptions = useMemo(
+  () =>
+    savedQueriesData?.savedQueries
+      ?.filter((savedQuery) => {
+        // 只显示关联到当前 Dashboard 的 SavedQuery
+        return (
+          savedQuery.linkedDashboardIds?.includes(dashboardId) ||
+          savedQueryId === savedQuery.id  // 或当前已选中的
+        );
+      })
+      .map(({ id, name }) => ({ value: id, label: name })) || [],
+  [savedQueriesData?.savedQueries, dashboardId, savedQueryId]
+);
+```
+
+**代码位置**：`packages/front-end/enterprise/components/Dashboards/DashboardEditor/DashboardEditorSidebar/EditSingleBlock.tsx:611-625`
+
+### 8.5 数据流向全景图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        前端编辑阶段                              │
+├─────────────────────────────────────────────────────────────────┤
+│  SqlExplorerModal 编辑 SQL → 保存 SavedQuery                    │
+│    ↓ (savedQueryId 返回到前端)                                   │
+│  DashboardEditor 选择 SavedQuery → 勾选 blockConfig 项          │
+│    ↓ (PUT /dashboards/:id)                                      │
+│  发送 blocks 数组到后端                                          │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                        后端存储阶段                              │
+├─────────────────────────────────────────────────────────────────┤
+│  DashboardModel.processApiUpdateBody()                          │
+│    ↓                                                             │
+│  验证 block 格式 → 迁移旧版本 → 生成 ID → 保存到 MongoDB        │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                        查询执行阶段                              │
+├─────────────────────────────────────────────────────────────────┤
+│  手动/定时触发刷新                                               │
+│    ↓                                                             │
+│  updateDashboardSavedQueries() 提取所有 savedQueryId            │
+│    ↓                                                             │
+│  并行 executeAndSaveQuery() → 执行 SQL → 保存 results           │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                        前端渲染阶段                              │
+├─────────────────────────────────────────────────────────────────┤
+│  GET /dashboards/:id/snapshots 获取关联的 SavedQueries          │
+│    ↓                                                             │
+│  SqlExplorerBlock 根据 blockConfig 遍历渲染:                     │
+│    - "results_table" → DisplayTestQueryResults                  │
+│    - "chart-1" → 匹配 dataVizConfig → DataVisualizationDisplay │
+└─────────────────────────────────────────────────────────────────┘
+```
