@@ -214,9 +214,146 @@ function getSegmentCTE(
 
 ---
 
-## 四、评估与回溯阶段的协作机制
+## 四、回溯链路深挖：从 QueryRunner 到 SQL 生成
 
-### 4.1 全流程时序图
+### 4.1 Segment 传递全链路
+
+```
+ExperimentResultsQueryRunner.startQueries()
+  ↓ (调用 startExperimentResultQueries)
+  ├─ 读取 snapshotSettings.segment
+  │   (ExperimentResultsQueryRunner.ts:115-120)
+  │
+  ├─ 构建 unitQueryParams.segment = segmentObj
+  │   (ExperimentResultsQueryRunner.ts:174-184)
+  │
+  ├─ [分支1] useUnitsTable = true
+  │   ├─ 调用 integration.getExperimentUnitsTableQuery(unitQueryParams)
+  │   │   → SqlIntegration.getExperimentUnitsTableQuery()
+  │   │   → 内部调用 this.getExperimentUnitsQuery(params)
+  │   │   → buildExperimentUnitsQuerySql()
+  │   │   → 生成 CREATE TABLE ... AS SELECT * FROM __experimentUnits
+  │   │
+  │   └─ 后续指标查询：unitsSource = "exposureTable"
+  │       → 直接读临时表，无需再次 JOIN segment
+  │
+  └─ [分支2] useUnitsTable = false
+      └─ 每个指标查询：unitsSource = "exposureQuery"
+          → getExperimentMetricQuery() 内嵌 getExperimentUnitsQuery()
+          → 每个指标查询都重新 JOIN segment
+```
+
+### 4.2 快照设置构建：saved group 缺席的证据
+
+`getSnapshotSettings()` 函数（`packages/back-end/src/services/experiments.ts:429-725`）展示了 snapshotSettings 的完整构建过程：
+
+```typescript
+export function getSnapshotSettings({
+  experiment,
+  phaseIndex,
+  // ...
+}): ExperimentSnapshotSettings {
+  const phase = experiment.phases[phaseIndex];
+  
+  return {
+    // ... 其他字段
+    segment: experiment.segment || "",           // ✓ segment 被读取
+    queryFilter: experiment.queryFilter || "",   // ✓ queryFilter 被读取
+    // ...
+    // ✗ 注意：这里没有任何 phase.savedGroups 的读取逻辑
+    // ✗ 没有任何 saved group 相关字段被写入 snapshotSettings
+  };
+}
+```
+
+**代码证据 1：类型定义层面**
+
+`ExperimentSnapshotSettings`（`packages/shared/types/experiment-snapshot.d.ts:191-217`）：
+
+```typescript
+export interface ExperimentSnapshotSettings {
+  // ...
+  segment: string;           // ✓ 有 segment 字段
+  queryFilter: string;       // ✓ 有 queryFilter 字段
+  // ✗ 没有 savedGroups、savedGroupTargeting 等相关字段
+}
+```
+
+**代码证据 2：查询构建层面**
+
+在所有分析查询构建代码中（`experiment-units-query.ts`、`experiment-metric-query.ts`、`SqlIntegration.ts`）：
+- 只有 `segment` 参数被传入和使用
+- 没有任何代码读取 `phase.savedGroups` 并在分析 SQL 中加入过滤条件
+
+**代码证据 3：分配逻辑与分析逻辑的隔离**
+
+- `phase.savedGroups` 仅在 `getFeatureDefinition()` → `getParsedCondition()` 中被使用（构建 SDK payload）
+- 分析查询链路完全不依赖 `phase.savedGroups`，只依赖曝光表中的数据
+
+### 4.3 Units Table 与 Exposure Query 两条路径
+
+#### 路径 A：Units Table（临时表模式）
+
+**触发条件**（`ExperimentResultsQueryRunner.ts:139-145`）：
+```typescript
+const useUnitsTable =
+  (integration.getSourceProperties().supportsWritingTables &&
+    settings.pipelineSettings?.allowWriting &&
+    settings.pipelineSettings?.mode === "ephemeral" &&
+    !!settings.pipelineSettings?.writeDataset &&
+    hasPipelineModeFeature) ??
+  false;
+```
+
+**执行流程**：
+1. 先执行 `getExperimentUnitsTableQuery()`：
+   ```sql
+   CREATE OR REPLACE TABLE growthbook_tmp_units_xxx AS (
+     WITH __experimentUnits AS (
+       -- 包含 segment JOIN 过滤
+       SELECT ... FROM __experimentExposures e
+       JOIN __segment s ON (s.user_id = e.user_id)
+       WHERE s.date <= e.timestamp
+     )
+     SELECT * FROM __experimentUnits
+   );
+   ```
+2. 所有后续指标查询通过 `unitsSource: "exposureTable"` 直接读取该临时表：
+   ```sql
+   SELECT ... FROM growthbook_tmp_units_xxx
+   -- 无需再次 JOIN segment
+   ```
+
+**优势**：多指标共享一次 segment 过滤，避免重复计算。
+
+#### 路径 B：Exposure Query（内嵌模式）
+
+**触发条件**：`useUnitsTable = false`（默认）
+
+**执行流程**：每个指标查询内嵌完整的 `__experimentUnits` CTE：
+```sql
+-- getExperimentMetricQuery() 生成的 SQL
+WITH
+  __experimentUnits AS (
+    -- 每个指标查询都重新做一次 segment JOIN
+    SELECT ... FROM __experimentExposures e
+    JOIN __segment s ON (s.user_id = e.user_id)
+    WHERE s.date <= e.timestamp
+  ),
+  __distinctUsers AS (
+    SELECT ... FROM __experimentUnits
+  ),
+  __metric AS (...)
+SELECT ...
+```
+
+**行为差异**：
+- `unitsSource: "exposureQuery"` 时，`idTypeObjects` 会额外包含 segment 的 `userIdType`（`experiment-metric-query.ts:208-213`）
+- `unitsSource: "exposureTable"` 时，segment 过滤已在临时表中完成，指标查询不再处理 segment
+
+### 4.4 评估与回溯阶段的协作机制
+
+#### 4.4.1 全流程时序图
 
 ```
 实验配置阶段
@@ -237,9 +374,15 @@ function getSegmentCTE(
       ├─ 命中 → 分配变体 + 产生曝光事件
       └─ 未命中 → 跳过实验（无曝光记录）
   │
+快照创建阶段（重跑历史快照入口）
+  │
+  ├─ getSnapshotSettings(experiment, phaseIndex)
+  │   ├─ 读取 experiment.segment ✓
+  │   └─ 不读取 phase.savedGroups ✗
+  │
 评估阶段（分析端）
   │
-  ├─ 读取实验配置：experiment.segment
+  ├─ 读取 snapshotSettings.segment
   ├─ 构建分析 SQL：
   │   ├─ 从数仓读取曝光表（已被 saved group 过滤）
   │   ├─ getSegmentCTE() → 构建 __segment
@@ -248,25 +391,27 @@ function getSegmentCTE(
   └─ 输出实验结果
 ```
 
-### 4.2 协作关键点
+#### 4.4.2 协作关键点
 
-#### 4.2.1 双重过滤的叠加效应
+**双重过滤的叠加效应**：
 
 ```
 全体用户
     │
     ├─ [saved group 过滤] → 曝光表仅含命中用户
     │     └─ 分配阶段完成，数据固化在曝光表中
+    │     └─ saved group 条件仅影响曝光生成，不进入分析 SQL
     │
     └─ [segment 过滤] → 分析用户集 = 曝光表 ∩ segment
           └─ 分析阶段完成，可修改 segment 重新计算
+          └─ segment 条件进入分析 SQL，每次重算都重新执行
 ```
 
 - **Saved Group** 是"前置过滤"：决定谁能看到实验
 - **Segment** 是"后置过滤"：在已曝光用户中筛选分析对象
 - 最终分析样本是两者的交集
 
-#### 4.2.2 时间一致性保障
+**时间一致性保障**：
 
 在 `experiment-units-query.ts:239` 中：
 
@@ -276,21 +421,65 @@ WHERE s.date <= e.timestamp
 
 确保用户在**曝光时刻**已经属于该 segment，避免"先曝光后入组"的时间错位问题。
 
-#### 4.2.3 回溯分析的灵活性
+---
 
-| 机制 | 分配后可修改？ | 对已产生曝光的影响 |
-|------|---------------|-------------------|
-| Saved Group | 不建议 | 修改后新用户按新规则匹配，但历史曝光数据不变 |
-| Segment | 支持 | 可更换 segment 重新分析相同的曝光数据，得到不同的分析结果 |
+## 五、"重跑历史快照"场景下的边界与常见误判
 
-#### 4.2.4 ID 类型对齐
+### 5.1 两套机制的行为边界
 
-- Saved Group 使用 `attributeKey` 指定匹配字段（如 `id`、`email`），SDK 直接匹配
-- Segment 使用 `userIdType`，分析端通过 `idJoinMap` 处理跨类型 join（如 `anonymous_id` → `user_id`）
+| 场景 | Saved Group 行为 | Segment 行为 |
+|------|-----------------|-------------|
+| **修改 saved group 后重跑快照** | 历史曝光数据不变，重跑结果不变 | 无影响（segment 未修改） |
+| **修改 segment 后重跑快照** | 无影响（saved group 未修改） | 重新 JOIN 过滤，结果可能变化 |
+| **实验运行中修改 saved group** | 新曝光按新规则过滤，历史曝光不变 | 无影响 |
+| **实验运行中修改 segment** | 无影响 | 不影响正在进行的分配，仅影响后续分析 |
+| **删除 saved group 后重跑** | 无影响（曝光已固化） | 无影响 |
+| **删除 segment 后重跑** | 无影响 | 分析时跳过 segment 过滤，样本量增加 |
+
+### 5.2 常见误判
+
+#### ❌ 误判 1："修改 saved group 后重跑快照，结果应该会变"
+
+**真相**：不会变。Saved group 的过滤发生在分配阶段，结果已经固化在曝光表中。回溯分析时不会重新执行 saved group 判定。
+
+**代码证据**：
+- `getSnapshotSettings()` 不读取 `phase.savedGroups`（`experiments.ts:429-725`）
+- `ExperimentSnapshotSettings` 类型没有 saved group 字段（`experiment-snapshot.d.ts:191-217`）
+- 分析 SQL 构建链路中没有任何 saved group 过滤逻辑
+
+#### ❌ 误判 2："saved group 和 segment 都是在分析阶段过滤的，可以互换使用"
+
+**真相**：Saved group 是分配时过滤，segment 是分析时过滤。Saved group 影响曝光样本量，segment 不影响曝光只影响分析样本。
+
+**关键区别**：
+- 如果用户被 saved group 排除：不会产生曝光，不计入任何分析
+- 如果用户被 segment 排除：仍产生曝光，只是不计入本次分析
+
+#### ❌ 误判 3："重跑快照会重新执行完整的实验分配逻辑"
+
+**真相**：重跑快照只重新执行**分析逻辑**，不重新执行**分配逻辑**。分配逻辑（包括 saved group 判定）只在 SDK 侧发生一次。
+
+#### ❌ 误判 4："使用 units table 模式时，segment 只被计算一次，所以更快"
+
+**真相**：是的，这是 units table 模式的设计目标之一。但需要注意：
+- 临时表在所有查询完成后会被删除（`ExperimentResultsQueryRunner.ts:337-354`）
+- 如果查询失败，临时表可能残留（取决于 `dropUnitsTable` 配置）
+
+### 5.3 调试建议
+
+**确认 saved group 是否生效**：
+- 查看曝光表中的用户数是否符合预期
+- 检查 SDK payload 中的 `savedGroups` 字典和 `rule.condition`
+- 注意：无法通过重跑快照验证 saved group 逻辑
+
+**确认 segment 是否生效**：
+- 直接查看生成的 SQL，搜索 `__segment` 和 `JOIN __segment`
+- 修改 segment 定义后重跑，观察样本量变化
+- 检查 `s.date <= e.timestamp` 条件是否正确处理时间维度
 
 ---
 
-## 五、代码溯源索引
+## 六、代码溯源索引
 
 ### Saved Group 相关
 | 功能 | 文件 | 行号 |
@@ -300,6 +489,7 @@ WHERE s.date <= e.timestamp
 | 条件评估（SDK） | `packages/sdk-js/src/mongrule.ts` | 238-241 |
 | 旧版 SDK 展开逻辑 | `packages/back-end/src/util/features.ts` | 565-568, 757-768 |
 | Payload 中的 savedGroups | `packages/sdk-js/src/core.ts` | 828, 1200 |
+| phase 保存 savedGroups | `packages/back-end/src/services/experiments.ts` | 2339-2342 |
 
 ### Segment 相关
 | 功能 | 文件 | 行号 |
@@ -307,12 +497,16 @@ WHERE s.date <= e.timestamp
 | 类型定义 | `packages/shared/types/segment.d.ts` | 1-4 |
 | Segment CTE 构建 | `packages/back-end/src/integrations/sql/ctes/segment-cte.ts` | 8-83 |
 | 实验单元查询中的 segment JOIN | `packages/back-end/src/integrations/sql/queries/experiment-units-query.ts` | 148-163, 220-239 |
-| 指标查询中的 segment | `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | 48, 211 |
+| 指标查询中的 segment | `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | 48, 208-213, 273-307 |
 | 快照分析时 segment 读取 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 115-120 |
+| 快照设置构建（不含 saved group） | `packages/back-end/src/services/experiments.ts` | 695-724 |
 
-### 协作相关
+### 回溯链路相关
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| 实验 phase 保存 savedGroups | `packages/back-end/src/services/experiments.ts` | 2339-2342 |
-| 实验保存 segment | `packages/back-end/src/services/experiments.ts` | 700, 2358 |
-| 快照设置包含 segment | `packages/shared/types/experiment-snapshot.d.ts` | 84, 204 |
+| QueryRunner 入口 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 87-357 |
+| Units Table 路径判断 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 139-145 |
+| Units Table 创建 | `packages/back-end/src/integrations/SqlIntegration.ts` | 789-818 |
+| 指标查询 unitsSource 分支 | `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | 208-213, 273-307 |
+| SnapshotSettings 类型定义 | `packages/shared/types/experiment-snapshot.d.ts` | 191-217 |
+| 临时表删除逻辑 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 337-354 |
