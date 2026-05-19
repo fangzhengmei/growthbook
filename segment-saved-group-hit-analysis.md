@@ -276,12 +276,12 @@ WITH
 **函数签名（源码精确）**：
 ```typescript
 export function getSegmentCTE(
-  dialect: SqlDialect,
-  segment: SegmentInterface,
-  baseIdType: string,
-  idJoinMap: Record<string, string>,
-  factTableMap: FactTableMap,
-  sqlVars?: SQLVars,  // 注意：第5个参数是 sqlVars，不是 cteContext
+  dialect: SqlDialect,        // #1 SQL 方言
+  segment: SegmentInterface,  // #2 segment 定义
+  baseIdType: string,         // #3 实验使用的 ID 类型
+  idJoinMap: Record<string, string>,  // #4 ID 类型映射表
+  factTableMap: FactTableMap,        // #5 事实表映射
+  sqlVars?: SQLVars,          // #6 可选：SQL 模板变量（startDate, endDate, experimentId, phase, customFields, templateVariables）
 ): string
 ```
 
@@ -338,10 +338,18 @@ if (dateCol !== "s.date") {
 return `-- Segment (${segment.name})\n${segmentSql}\n`;
 ```
 
-**关键点**：
-- 第 5 个参数是 `sqlVars?: SQLVars`，不是 `cteContext`
+**关键点（源码对账结果）**：
+- 共 6 个参数，第 6 个是可选的 `sqlVars?: SQLVars`（此前文档误写为第 5 个）
+- `sqlVars` 类型为 `{ startDate: Date; endDate?: Date; experimentId?: string; phase?: PhaseSQLVar; customFields?: Record<string, unknown>; templateVariables?: TemplateVariables }`（`packages/shared/types/sql.d.ts:29-36`）
 - `getSegmentCTE` 调用 `getFactSegmentCTE`，不调用 `getExperimentUnitsQuery`
-- FACT 类型在函数内部直接返回，不经过后续 ID 类型转换逻辑
+- FACT 类型在函数内部直接 return，不经过后续 ID 类型转换逻辑
+
+**调用点分布（全仓库搜索）**：
+| 文件 | 行号 | 传入的第 6 个参数 |
+|------|------|----------------|
+| `experiment-units-query.ts` | 149-162 | `{ startDate, endDate, experimentId, phase, customFields }` |
+| `metric-value-query.ts` | 49-56 | 未传第 6 个参数 |
+| `power-population-source-cte.ts` | 28-39 | `{ startDate, endDate, templateVariables }` |
 
 ---
 
@@ -732,53 +740,68 @@ WHERE s.date <= e.timestamp
 
 ---
 
-## 六、事实校验清单
+## 六、事实校验清单（最终对账结果）
 
-### 6.1 函数签名与参数校验
+### 6.1 函数签名与参数校验（逐行核对）
 
-| 函数 | 文件 | 行号 | 签名是否匹配源码 | 备注 |
-|------|------|------|----------------|------|
-| `getSegmentCTE()` | `segment-cte.ts` | 8-83 | ✓ 匹配 | 第5参数是 `sqlVars?: SQLVars`，不是 `cteContext` |
-| `getExperimentUnitsQuery()` | `experiment-units-query.ts` | 22-243 | ✓ 匹配 | params 类型 `ExperimentUnitsQueryParams` |
-| `getExperimentMetricQuery()` | `experiment-metric-query.ts` | 38-614 | ✓ 匹配 | params 类型 `ExperimentMetricQueryParams` |
-| `getParsedCondition()` | `features.ts` | 125-208 | ✓ 匹配 | 返回 `ConditionInterface \| undefined` |
-| `getSavedGroupCondition()` | `features.ts` | 102-123 | ✓ 匹配 | 返回 `null \| ConditionInterface` |
-| `getSnapshotSettings()` | `experiments.ts` | 429-725 | ✓ 匹配 | 无 savedGroups 参数 |
-| `getExperimentUnitsTableQuery()` | `SqlIntegration.ts` | 807-818 | ✓ 匹配 | 需要 `unitsTableFullName` |
+| 函数 | 文件 | 行号 | 校验结果 | 修正记录 |
+|------|------|------|---------|---------|
+| `getSegmentCTE()` | `segment-cte.ts` | 8-83 | ✓ 最终正确 | 🔴 此前误写：第 5 参数是 `sqlVars` → 修正：共 6 个参数，第 6 个是 `sqlVars?: SQLVars` |
+| `getExperimentUnitsQuery()` | `experiment-units-query.ts` | 22-243 | ✓ 最终正确 | 无修正 |
+| `getExperimentMetricQuery()` | `experiment-metric-query.ts` | 38-614 | ✓ 最终正确 | 无修正 |
+| `getParsedCondition()` | `features.ts` | 125-208 | ✓ 最终正确 | 无修正 |
+| `getSavedGroupCondition()` | `features.ts` | 102-123 | ✓ 最终正确 | 无修正 |
+| `getSnapshotSettings()` | `experiments.ts` | 429-725 | ✓ 最终正确 | 无修正 |
+| `getExperimentUnitsTableQuery()` | `SqlIntegration.ts` | 807-818 | ✓ 最终正确 | 无修正 |
 
-### 6.2 类型定义校验
+### 6.2 类型定义校验（逐字段核对）
 
-| 类型 | 文件 | 行号 | 结构是否匹配源码 | 备注 |
-|------|------|------|----------------|------|
-| `savedGroupValidator` | `validators/saved-group.ts` | 9-26 | ✓ 匹配 | 结构真源 |
-| `segmentValidator` | `validators/segment.ts` | 9-27 | ✓ 匹配 | 结构真源，`filters` 是 `string[]` |
-| `savedGroupTargeting` | `validators/shared.ts` | 38-44 | ✓ 匹配 | `{ match, ids }` 结构 |
-| `ExperimentUnitsQueryParams` | `types/integrations.d.ts` | 308-310 | ✓ 匹配 | `{ settings, segment, includeIdJoins, ... }` |
-| `ExperimentMetricQueryParams` | `types/integrations.d.ts` | 398-404 | ✓ 匹配 | `{ metric, unitsSource, segment, ... }` |
-| `ExperimentSnapshotSettings` | `types/experiment-snapshot.d.ts` | 191-217 | ✓ 匹配 | 有 `segment`，无 `savedGroups` |
+| 类型 | 文件 | 行号 | 校验结果 | 修正记录 |
+|------|------|------|---------|---------|
+| `savedGroupValidator` | `validators/saved-group.ts` | 9-26 | ✓ 最终正确 | 无修正 |
+| `segmentValidator` | `validators/segment.ts` | 9-27 | ✓ 最终正确 | 🔴 此前误写：`filters: Filter[]` → 修正：`filters: z.array(z.string())`（字符串数组） |
+| `savedGroupTargeting` | `validators/shared.ts` | 38-44 | ✓ 最终正确 | 无修正 |
+| `ExperimentUnitsQueryParams` | `types/integrations.d.ts` | 299-310 | ✓ 最终正确 | 无修正 |
+| `ExperimentMetricQueryParams` | `types/integrations.d.ts` | 397-404 | ✓ 最终正确 | 无修正 |
+| `ExperimentSnapshotSettings` | `types/experiment-snapshot.d.ts` | 191-217 | ✓ 最终正确 | 无修正 |
+| `SQLVars` | `types/sql.d.ts` | 29-36 | ✓ 最终正确 | 🔴 此前遗漏：补充 `templateVariables?: TemplateVariables` 字段 |
 
-### 6.3 关键链路校验
+### 6.3 关键链路校验（逐调用点核对）
 
-| 链路 | 校验结果 | 备注 |
-|------|---------|------|
-| segment 从 snapshotSettings → unitQueryParams.segment | ✓ 正确 | `ExperimentResultsQueryRunner.ts:115-184` |
-| segment 从 unitQueryParams → `getSegmentCTE()` | ✓ 正确 | `experiment-units-query.ts:148-163` |
-| segment JOIN 条件 `s.${baseIdType} = e.${baseIdType}` | ✓ 正确 | `experiment-units-query.ts:220-224` |
-| 时间一致性 `s.date <= e.timestamp` | ✓ 正确 | `experiment-units-query.ts:239` |
-| savedGroup 不进入 snapshotSettings | ✓ 正确 | `experiments.ts:695-724` 无相关字段 |
-| savedGroup 不进入分析 SQL | ✓ 正确 | 整条分析链路无相关代码 |
-| unitsSource = "exposureTable" 读临时表 | ✓ 正确 | `experiment-metric-query.ts:305-306` |
-| unitsSource = "exposureQuery" 内嵌 units query | ✓ 正确 | `experiment-metric-query.ts:273-277` |
+| 链路 | 调用文件 | 行号 | 校验结果 | 修正记录 |
+|------|---------|------|---------|---------|
+| segment 从 snapshotSettings → unitQueryParams.segment | `ExperimentResultsQueryRunner.ts` | 115-184 | ✓ 最终正确 | 无修正 |
+| segment 从 unitQueryParams → `getSegmentCTE()` 第 2 参数 | `experiment-units-query.ts` | 149-162 | ✓ 最终正确 | 无修正 |
+| `getSegmentCTE()` 第 6 参数 sqlVars 传入 | `experiment-units-query.ts` | 155-161 | ✓ 最终正确 | 🔴 此前遗漏：补充第 6 参数 `{ startDate, endDate, experimentId, phase, customFields }` |
+| `getSegmentCTE()` 无第 6 参数 | `metric-value-query.ts` | 49-56 | ✓ 最终正确 | 新增核对：该调用点不传第 6 参数 |
+| `getSegmentCTE()` 第 6 参数传 templateVariables | `power-population-source-cte.ts` | 28-39 | ✓ 最终正确 | 新增核对：该调用点传 `{ startDate, endDate, templateVariables }` |
+| segment JOIN 条件 `s.${baseIdType} = e.${baseIdType}` | `experiment-units-query.ts` | 220-224 | ✓ 最终正确 | 无修正 |
+| 时间一致性 `s.date <= e.timestamp` | `experiment-units-query.ts` | 239 | ✓ 最终正确 | 无修正 |
+| savedGroup 不进入 snapshotSettings | `experiments.ts` | 695-724 | ✓ 最终正确 | 无修正 |
+| savedGroup 不进入分析 SQL | 全链路 | - | ✓ 最终正确 | 无修正 |
+| unitsSource = "exposureTable" 读临时表 | `experiment-metric-query.ts` | 305-306 | ✓ 最终正确 | 无修正 |
+| unitsSource = "exposureQuery" 内嵌 units query | `experiment-metric-query.ts` | 273-277 | ✓ 最终正确 | 无修正 |
 
-### 6.4 结论校验
+### 6.4 结论校验（逐结论核对证据）
 
 | 结论 | 代码证据是否支持 | 备注 |
 |------|----------------|------|
-| Saved Group 在分配层过滤，不进入分析层 | ✓ 支持 | 三层代码证据 |
-| Segment 在分析层过滤，每次重跑重新计算 | ✓ 支持 | SQL 构建链路清晰 |
-| 修改 saved group 不影响历史快照结果 | ✓ 支持 | 曝光表已固化 |
-| 修改 segment 可改变历史快照结果 | ✓ 支持 | 每次重跑重新 JOIN |
-| units table 模式 segment 只计算一次 | ✓ 支持 | CREATE TABLE + 后续读临时表 |
+| Saved Group 在分配层过滤，不进入分析层 | ✓ 支持 | 三层代码证据：类型定义层、快照构建层、SQL 构建层 |
+| Segment 在分析层过滤，每次重跑重新计算 | ✓ 支持 | SQL 构建链路清晰，每次重跑都生成 `JOIN __segment` |
+| 修改 saved group 不影响历史快照结果 | ✓ 支持 | 曝光表已固化，分析链路不读取 saved group 配置 |
+| 修改 segment 可改变历史快照结果 | ✓ 支持 | 每次重跑重新 `JOIN __segment`，segment 定义实时读取 |
+| units table 模式 segment 只计算一次 | ✓ 支持 | CREATE TABLE 预计算 + 后续所有指标查询直接读临时表 |
+
+### 6.5 本次对账发现的全部不一致点
+
+| # | 位置 | 此前表述 | 源码事实 | 已修正 |
+|---|------|---------|---------|-------|
+| 1 | `getSegmentCTE()` 参数序号 | 第 5 参数是 `sqlVars` | 共 6 个参数，第 6 个是 `sqlVars?: SQLVars` | ✅ |
+| 2 | `SegmentValidator.filters` 类型 | `Filter[]` | `z.array(z.string())`（字符串数组） | ✅ |
+| 3 | `SQLVars` 完整字段 | 只列出 5 个字段 | 共 6 个字段，含 `templateVariables?: TemplateVariables` | ✅ |
+| 4 | `getSegmentCTE()` 全仓库调用点 | 只列 1 个调用点 | 共 3 个调用点，传参方式不同 | ✅ |
+
+> 🔴 标记表示此前文档中的错误表述，已全部修正为源码事实。
 
 ---
 
@@ -817,3 +840,7 @@ WHERE s.date <= e.timestamp
 | SnapshotSettings 类型定义 | `packages/shared/types/experiment-snapshot.d.ts` | 191-217 |
 | 临时表删除逻辑 | `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 337-354 |
 | 参数类型定义 | `packages/shared/types/integrations.d.ts` | 299-404 |
+| SQLVars 类型定义 | `packages/shared/types/sql.d.ts` | 29-36 |
+| getSegmentCTE 调用点1 | `packages/back-end/src/integrations/sql/queries/experiment-units-query.ts` | 149-162 |
+| getSegmentCTE 调用点2 | `packages/back-end/src/integrations/sql/queries/metric-value-query.ts` | 49-56 |
+| getSegmentCTE 调用点3 | `packages/back-end/src/integrations/sql/ctes/power-population-source-cte.ts` | 28-39 |
