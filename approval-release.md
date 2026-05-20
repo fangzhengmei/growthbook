@@ -5,21 +5,24 @@
 ```
 用户创建草稿(draft)
       ↓
-[审批申请触发] → POST /feature/:id/:version/request (旧路由)
-                      或
-                  POST /v1/features/:id/revisions/:version/request-review (新路由)
+[审批申请触发] → 三套入口之一
+                      ├─ 旧路由: POST /feature/:id/:version/request
+                      ├─ V1 API: POST /api/v1/features/:id/revisions/:version/request-review (Deprecated)
+                      └─ V2 API: POST /api/v2/features/:id/revisions/:version/request-review
       ↓
 状态变为 pending-review
       ↓
-[审阅状态机] → POST /feature/:id/:version/submit-review (旧路由)
-                      或
-                  POST /v1/features/:id/revisions/:version/submit-review (新路由)
+[审阅状态机] → 三套入口之一
+                      ├─ 旧路由: POST /feature/:id/:version/submit-review
+                      ├─ V1 API: POST /api/v1/features/:id/revisions/:version/submit-review (Deprecated)
+                      └─ V2 API: POST /api/v2/features/:id/revisions/:version/submit-review
       ↓
 状态变为 approved / changes-requested
       ↓
-[最终发布动作] → POST /feature/:id/:version/publish (旧路由)
-                      或
-                  POST /v1/features/:id/revisions/:version/publish (新路由)
+[最终发布动作] → 三套入口之一
+                      ├─ 旧路由: POST /feature/:id/:version/publish
+                      ├─ V1 API: POST /api/v1/features/:id/revisions/:version/publish (Deprecated)
+                      └─ V2 API: POST /api/v2/features/:id/revisions/:version/publish
       ↓
 状态变为 published
       ↓
@@ -30,49 +33,85 @@
 
 ---
 
-## 二、API 路由体系：旧路由 vs 新路由
+## 二、三套 API 入口体系完整说明
 
-### 2.1 路由架构说明
+### 2.1 路由挂载架构总览
 
-系统存在两套并行的 API 路由体系：
+系统存在**三套并行的 API 入口**，各自有独立的挂载链路和使用场景：
 
-| 维度 | 旧路由（Dashboard 专用） | 新路由（REST API 专用） |
-|------|-------------------------|-------------------------|
-| **路径格式** | `/feature/:id/:version/*` | `/v1/features/:id/revisions/:version/*` |
-| **注册位置** | `app.ts:847-858` 直接挂载 | `features.router.ts:76-80` → `api.router.ts` |
-| **处理入口** | `controllers/features.ts` 独立 controller | `api/features/*.ts` 通过 `createApiRequestHandler` 包装 |
-| **鉴权方式** | Session + CSRF | API Key / OAuth |
-| **使用方** | 前端 Dashboard | 外部 REST API 调用 |
+| 体系 | 路径前缀 | 挂载位置 | 版本前缀注入 | 完整路径格式 | 状态 | 使用方 |
+|------|---------|----------|-------------|-------------|------|--------|
+| **旧路由** | 无（根路径） | `app.ts:847-858` 直接挂载 | 无 | `/feature/:id/:version/*` | 活跃（Dashboard 专用） | 前端 Dashboard |
+| **V1 API** | `/api` | `app.ts:369-376` → `apiRouter` | `api.router.ts:203` → `/v1` | `/api/v1/features/:id/revisions/:version/*` | **Deprecated** | 外部 REST API（已不推荐） |
+| **V2 API** | `/api` | `app.ts:369-376` → `apiRouter` | `api.router.ts:203` → `/v2` | `/api/v2/features/:id/revisions/:version/*` | 推荐 | 外部 REST API（当前推荐） |
 
-### 2.2 路由注册与处理入口对照表
+### 2.2 挂载链路详细说明
 
-#### 申请审批
+#### 第一层：app.ts 根挂载
 
-| 路由类型 | 路径 | 处理入口 | 挂载位置 |
-|----------|------|----------|----------|
-| 旧路由 | `POST /feature/:id/:version/request` | `controllers/features.ts:985` → `postFeatureRequestReview()` | `app.ts:852-854` |
-| 新路由 | `POST /v1/features/:id/revisions/:version/request-review` | `api/features/postFeatureRevisionRequestReview.ts:81` → `postFeatureRevisionRequestReview` | `features.router.ts:76` |
-
-#### 提交审阅
-
-| 路由类型 | 路径 | 处理入口 | 挂载位置 |
-|----------|------|----------|----------|
-| 旧路由 | `POST /feature/:id/:version/submit-review` | `controllers/features.ts:1061` → `postFeatureReviewOrComment()` | `app.ts:855-858` |
-| 新路由 | `POST /v1/features/:id/revisions/:version/submit-review` | `api/features/postFeatureRevisionSubmitReview.ts` → `postFeatureRevisionSubmitReview` | `features.router.ts:77` |
-
-#### 发布
-
-| 路由类型 | 路径 | 处理入口 | 挂载位置 |
-|----------|------|----------|----------|
-| 旧路由 | `POST /feature/:id/:version/publish` | `controllers/features.ts:1230` → `postFeaturePublish()` | `app.ts:847-850` |
-| 新路由 | `POST /v1/features/:id/revisions/:version/publish` | `api/features/postFeatureRevisionPublish.ts:28` → `postFeatureRevisionPublish` | `features.router.ts:80` |
-
-### 2.3 旧路由注册（app.ts）
-
-**文件**：`packages/back-end/src/app.ts:847-858`
-
+**文件**：`packages/back-end/src/app.ts:367-376`
 ```typescript
-// Features - 旧路由，Dashboard 专用
+// Secret API routes (no JWT or CORS)
+// Routes register themselves with version prefixes (/v1/..., /v2/...) so we
+// mount the router at /api — yielding /api/v1/<route> and /api/v2/<route>.
+app.use(
+  "/api",
+  // TODO add authentication
+  cors({
+    origin: "*",
+  }),
+  apiRouter,
+);
+```
+
+#### 第二层：api.router.ts 版本前缀注入
+
+**文件**：`packages/back-end/src/api/api.router.ts:195-204`
+```typescript
+allRoutes.forEach((route) => {
+  if (!route.method) {
+    return;
+  }
+
+  // Prepend version prefix so v1 routes live at /v1/... and v2 at /v2/...
+  // The router is mounted at /api in app.ts, so the full path becomes
+  // /api/v1/<route> or /api/v2/<route> as appropriate.
+  const version = (route as { version?: string }).version ?? "v1";
+  const versionedPath = `/${version}${route.path}`;
+  // ...
+});
+```
+
+#### 第三层：各路由模块注册
+
+**V1 路由注册**：`packages/back-end/src/api/features/features.router.ts:76-80`
+```typescript
+export const featureRoutes: OpenApiRoute[] = [
+  // ...
+  postFeatureRevisionRequestReview,  // V1 - 默认 version = "v1"
+  postFeatureRevisionSubmitReview,   // V1 - 默认 version = "v1"
+  // ...
+  postFeatureRevisionPublish,        // V1 - 默认 version = "v1"
+  // ...
+];
+```
+
+**V2 路由注册**：`packages/back-end/src/api/features/features.v2.router.ts:76-82`
+```typescript
+export const featureV2Routes: OpenApiRoute[] = [
+  // ...
+  // Review & lifecycle
+  postFeatureRevisionRequestReviewV2,  // V2 - version = "v2"
+  postFeatureRevisionSubmitReviewV2,   // V2 - version = "v2"
+  // ...
+  postFeatureRevisionPublishV2,        // V2 - version = "v2"
+  // ...
+];
+```
+
+**旧路由注册**：`packages/back-end/src/app.ts:847-858`
+```typescript
+// Features - 旧路由，Dashboard 专用，无 /api 前缀
 app.post(
   "/feature/:id/:version/publish",
   featuresController.postFeaturePublish,           // L849
@@ -87,26 +126,48 @@ app.post(
 );
 ```
 
-### 2.4 新路由注册（features.router.ts）
+### 2.3 三个关键动作的完整路由对照表
 
-**文件**：`packages/back-end/src/api/features/features.router.ts:76-80`
+#### 申请审批
 
+| 体系 | 完整路径 | 处理入口 | 挂载链路 | 状态 |
+|------|---------|----------|----------|------|
+| 旧路由 | `POST /feature/:id/:version/request` | `controllers/features.ts:985` → `postFeatureRequestReview()` | `app.ts:852-854` 直接挂载 | 活跃（Dashboard） |
+| V1 API | `POST /api/v1/features/:id/revisions/:version/request-review` | `api/features/postFeatureRevisionRequestReview.ts:81` → `postFeatureRevisionRequestReview` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v1` + `features.router.ts:76` | **Deprecated** |
+| V2 API | `POST /api/v2/features/:id/revisions/:version/request-review` | `api/features/postFeatureRevisionRequestReviewV2.ts` → `postFeatureRevisionRequestReviewV2` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v2` + `features.v2.router.ts:76` | 推荐 |
+
+#### 提交审阅
+
+| 体系 | 完整路径 | 处理入口 | 挂载链路 | 状态 |
+|------|---------|----------|----------|------|
+| 旧路由 | `POST /feature/:id/:version/submit-review` | `controllers/features.ts:1061` → `postFeatureReviewOrComment()` | `app.ts:855-858` 直接挂载 | 活跃（Dashboard） |
+| V1 API | `POST /api/v1/features/:id/revisions/:version/submit-review` | `api/features/postFeatureRevisionSubmitReview.ts` → `postFeatureRevisionSubmitReview` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v1` + `features.router.ts:77` | **Deprecated** |
+| V2 API | `POST /api/v2/features/:id/revisions/:version/submit-review` | `api/features/postFeatureRevisionSubmitReviewV2.ts` → `postFeatureRevisionSubmitReviewV2` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v2` + `features.v2.router.ts:77` | 推荐 |
+
+#### 发布
+
+| 体系 | 完整路径 | 处理入口 | 挂载链路 | 状态 |
+|------|---------|----------|----------|------|
+| 旧路由 | `POST /feature/:id/:version/publish` | `controllers/features.ts:1230` → `postFeaturePublish()` | `app.ts:847-850` 直接挂载 | 活跃（Dashboard） |
+| V1 API | `POST /api/v1/features/:id/revisions/:version/publish` | `api/features/postFeatureRevisionPublish.ts:28` → `publishFeatureRevision` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v1` + `features.router.ts:80` | **Deprecated** |
+| V2 API | `POST /api/v2/features/:id/revisions/:version/publish` | `api/features/postFeatureRevisionPublishV2.ts` → `publishFeatureRevisionV2` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v2` + `features.v2.router.ts:80` | 推荐 |
+
+### 2.4 V1 API 弃用标记
+
+**文件**：`packages/shared/src/validators/feature-revisions.ts:194-196`
 ```typescript
-export const featureRoutes: OpenApiRoute[] = [
-  // ...
-  postFeatureRevisionRequestReview,  // L76 - /v1/features/:id/revisions/:version/request-review
-  postFeatureRevisionSubmitReview,   // L77 - /v1/features/:id/revisions/:version/submit-review
-  // ...
-  postFeatureRevisionPublish,        // L80 - /v1/features/:id/revisions/:version/publish
-  // ...
-];
+"**Deprecated.** Use [POST /v2/features/:id/revisions/:version/publish](#operation/postFeatureRevisionPublishV2) instead.
+Immediately publishes a draft revision, making it the live version of the feature.
+Blocked if the org requires approvals and `bypassApprovalChecks` is off.",
+deprecated: true,
+deprecationDate: FEATURE_V1_DEPRECATED,
 ```
 
 ---
 
 ## 三、审批申请触发机制
 
-### 3.1 前端触发入口
+### 3.1 前端触发入口（使用旧路由）
 
 **文件**：`packages/front-end/components/Features/RequestReviewModal.tsx:192-206`
 
@@ -157,38 +218,27 @@ export async function postFeatureRequestReview(
 }
 ```
 
-### 3.3 新路由处理入口（REST API 使用）
+### 3.3 V2 API 处理入口（REST API 推荐）
 
-**Validator 定义**：`packages/shared/src/validators/feature-revisions.ts:272-290`
+**Validator 定义**：`packages/shared/src/validators/feature-revisions-v2.ts:362-373`
 ```typescript
-export const postFeatureRevisionRequestReviewValidator = {
+export const postFeatureRevisionRequestReviewV2Validator = {
   method: "post" as const,
   path: "/features/:id/revisions/:version/request-review",
-  operationId: "postFeatureRevisionRequestReview",
+  operationId: "postFeatureRevisionRequestReviewV2",
+  version: "v2" as const,
   // ...
 };
 ```
 
-**Handler 包装**：`packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts:81-86`
+**Handler 包装**：`packages/back-end/src/api/features/postFeatureRevisionRequestReviewV2.ts`
 ```typescript
-export const postFeatureRevisionRequestReview = createApiRequestHandler(
-  postFeatureRevisionRequestReviewValidator,
+export const postFeatureRevisionRequestReviewV2 = createApiRequestHandler(
+  postFeatureRevisionRequestReviewV2Validator,
 )(async (req) => {
-  const { feature, revision } = await requestReview(req);
-  return { revision: toApiRevision(revision, req.context, feature) };
+  const { feature, revision } = await requestReviewV2(req);
+  return { revision: toApiRevisionV2(revision, req.context, feature) };
 });
-```
-
-**业务逻辑**：`packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts:14-79`
-```typescript
-export async function requestReview(req) {
-  // 与旧路由逻辑基本一致:
-  // 1. 权限检查 (L25-27)
-  // 2. 状态校验 (L38-42)
-  // 3. 状态更新 (L44-49)
-  // 4. 审计记录 (L60-68)
-  // 5. 事件分发 (L70-76)
-}
 ```
 
 ### 3.4 模型层状态变更
@@ -241,23 +291,27 @@ export const revisionStatusSchema = z.enum([
 ]);
 ```
 
-### 4.2 pending-parent 状态分析
+### 4.2 pending-parent 状态：注释语义与可达代码对账
 
-#### 状态语义
+#### 注释语义（代码声明的设计意图）
 
-**文件**：`packages/shared/src/validators/features.ts:274-276`
+**Schema 注释**：`packages/shared/src/validators/features.ts:274-276`
 ```typescript
 // Held child revision created by a ramp schedule; auto-published when the parent
 // controller revision is approved/published. Not user-actionable directly.
 "pending-parent",
 ```
 
-#### 状态写入函数定义
-
-**文件**：`packages/back-end/src/models/FeatureRevisionModel.ts:1353-1364`
+**函数注释**：`packages/back-end/src/models/FeatureRevisionModel.ts:1353-1354`
 ```typescript
 // Mark a revision as pending-parent so it waits for its sibling approval revision.
 // Used by the ramp service when creating multi-target approval-gated steps.
+```
+
+#### 可达代码路径（当前实际实现）
+
+**状态写入函数定义**：`packages/back-end/src/models/FeatureRevisionModel.ts:1355-1364`
+```typescript
 export async function markRevisionAsPendingParent(
   organization: string,
   featureId: string,
@@ -270,18 +324,27 @@ export async function markRevisionAsPendingParent(
 }
 ```
 
-#### 调用点检索结论
-
+**调用点检索结论**：
 > **重要事实**：在当前代码版本中，`markRevisionAsPendingParent` 函数**仅有定义，未检索到任何调用点**。
 >
-> 检索范围：
-> - 全仓库 `import` 语句：无结果
-> - 全仓库函数调用：无结果（排除文档引用）
+> 检索证据：
+> - 全仓库 `import` 语句搜索：无结果
+> - 全仓库函数调用搜索：无结果（排除文档引用）
 > - Ramp Schedule 相关服务：未调用此函数
->
-> 该函数为预留接口，用于 ramp schedule 多目标审批门控场景，但当前版本尚未实现实际调用逻辑。
+> - `postRampSchedule.ts` 创建 ramp schedule 流程：未调用此函数
 
-#### 状态排除机制
+#### 对账结论
+
+| 维度 | 内容 | 状态 |
+|------|------|------|
+| **已实现事实** | `markRevisionAsPendingParent()` 函数定义，可将状态改为 `pending-parent` | ✅ 已实现 |
+| **已实现事实** | `pending-parent` 在 `activeDraftStatusSchema` 中被排除，用户不可操作 | ✅ 已实现 |
+| **已实现事实** | 前端审批列表过滤 `pending-parent` 状态 | ✅ 已实现 |
+| **预留语义（未实现）** | Ramp Schedule 多目标审批门控场景下自动写入 `pending-parent` | ❌ 无调用点 |
+| **预留语义（未实现）** | 父修订发布后 `pending-parent` 子修订自动发布 | ❌ 无调用链路 |
+| **预留语义（未实现）** | `pending-parent` 子修订随 ramp schedule 自动发布 | ❌ 无调用链路 |
+
+#### 状态排除机制（已实现）
 
 **Schema 层面排除**：`packages/shared/src/validators/features.ts:281-285`
 ```typescript
@@ -302,7 +365,7 @@ if (revision.status === "pending-parent") return null;
 
 ### 4.3 审阅提交流程
 
-#### 前端调用
+#### 前端调用（使用旧路由）
 
 **文件**：`packages/front-end/components/Features/RequestReviewModal.tsx:662`
 ```typescript
@@ -330,22 +393,24 @@ export async function postFeatureReviewOrComment(
 }
 ```
 
-#### 新路由处理入口（REST API 使用）
+#### V2 API 处理入口（REST API 推荐）
 
-**Validator 定义**：`packages/shared/src/validators/feature-revisions.ts:292-311`
+**Validator 定义**：`packages/shared/src/validators/feature-revisions-v2.ts:375-388`
 ```typescript
-export const postFeatureRevisionSubmitReviewValidator = {
+export const postFeatureRevisionSubmitReviewV2Validator = {
   method: "post" as const,
   path: "/features/:id/revisions/:version/submit-review",
-  operationId: "postFeatureRevisionSubmitReview",
+  operationId: "postFeatureRevisionSubmitReviewV2",
+  version: "v2" as const,
   bodySchema: z.object({
     comment: z.string().optional(),
     action: z.enum(["approve", "request-changes", "comment"]).optional(),
-  }),
+  }).strict(),
+  // ...
 };
 ```
 
-**Action 映射**：`packages/back-end/src/api/features/postFeatureRevisionSubmitReview.ts:15-19`
+**Action 映射**：`packages/back-end/src/api/features/postFeatureRevisionSubmitReviewV2.ts:15-19`
 ```typescript
 export const actionToReviewType: Record<string, ReviewSubmittedType> = {
   approve: "Approved",
@@ -423,7 +488,7 @@ export async function updateRevision(
 
 ## 五、最终发布动作
 
-### 5.1 前端发布触发
+### 5.1 前端发布触发（使用旧路由）
 
 **文件**：`packages/front-end/components/Features/RequestReviewModal.tsx:207-224`
 
@@ -486,25 +551,21 @@ if (requiresReview && revision.status !== "approved" && !canBypass) {
 }
 ```
 
-### 5.3 新路由处理入口（REST API 使用）
+### 5.3 V2 API 处理入口（REST API 推荐）
 
-**Validator 定义**：`packages/shared/src/validators/feature-revisions.ts:188-206`
+**Validator 定义**：`packages/shared/src/validators/feature-revisions-v2.ts:290-303`
 ```typescript
-export const postFeatureRevisionPublishValidator = {
+export const postFeatureRevisionPublishV2Validator = {
   method: "post" as const,
   path: "/features/:id/revisions/:version/publish",
-  operationId: "postFeatureRevisionPublish",
+  operationId: "postFeatureRevisionPublishV2",
   summary: "Publish a draft revision",
+  description:
+    "Immediately publishes a draft revision, making it the live version of the feature.",
+  version: "v2" as const,
+  bodySchema: z.object({ comment: z.string().optional() }).strict(),
   // ...
 };
-```
-
-**Handler 包装**：`packages/back-end/src/api/features/postFeatureRevisionPublish.ts:28-179`
-```typescript
-export async function publishFeatureRevision(req) {
-  // 与旧路由逻辑基本一致
-  // ...
-}
 ```
 
 ### 5.4 审批需求判断逻辑
@@ -715,11 +776,11 @@ draft → [requestReview] → pending-review → [submitReview] → approved →
 
 ### 7.2 API 端点完整连接表
 
-| 动作 | 前端旧路由 | 新 REST API 路由 | 旧路由处理入口 | 新路由处理入口 | 模型方法 | 状态流转 |
-|------|-----------|----------------|---------------|---------------|----------|----------|
-| 申请审批 | `POST /feature/:id/:version/request` | `POST /v1/features/:id/revisions/:version/request-review` | `postFeatureRequestReview` (controllers/features.ts:985) | `requestReview` (api/features/postFeatureRevisionRequestReview.ts:14) | `markRevisionAsReviewRequested` | `draft` → `pending-review` |
-| 提交审阅 | `POST /feature/:id/:version/submit-review` | `POST /v1/features/:id/revisions/:version/submit-review` | `postFeatureReviewOrComment` (controllers/features.ts:1061) | `submitRevisionReview` (api/features/postFeatureRevisionSubmitReview.ts:21) | `submitReviewAndComments` | `pending-review` → `approved` / `changes-requested` |
-| 发布 | `POST /feature/:id/:version/publish` | `POST /v1/features/:id/revisions/:version/publish` | `postFeaturePublish` (controllers/features.ts:1230) | `publishFeatureRevision` (api/features/postFeatureRevisionPublish.ts:28) | `publishRevision` → `markRevisionAsPublished` | `approved` → `published` |
+| 动作 | 旧路由完整路径 | V1 API 完整路径（Deprecated） | V2 API 完整路径（推荐） | 模型方法 | 状态流转 |
+|------|---------------|-----------------------------|-----------------------|----------|----------|
+| 申请审批 | `POST /feature/:id/:version/request` | `POST /api/v1/features/:id/revisions/:version/request-review` | `POST /api/v2/features/:id/revisions/:version/request-review` | `markRevisionAsReviewRequested` | `draft` → `pending-review` |
+| 提交审阅 | `POST /feature/:id/:version/submit-review` | `POST /api/v1/features/:id/revisions/:version/submit-review` | `POST /api/v2/features/:id/revisions/:version/submit-review` | `submitReviewAndComments` | `pending-review` → `approved` / `changes-requested` |
+| 发布 | `POST /feature/:id/:version/publish` | `POST /api/v1/features/:id/revisions/:version/publish` | `POST /api/v2/features/:id/revisions/:version/publish` | `publishRevision` → `markRevisionAsPublished` | `approved` → `published` |
 
 ### 7.3 事件分发机制
 
@@ -749,7 +810,7 @@ draft → [requestReview] → pending-review → [submitReview] → approved →
 
 ### 7.5 旁路机制（Bypass）
 
-系统提供两种绕过审批的方式（旧路由 L1321-1327，新路由 L107-109）：
+系统提供两种绕过审批的方式（旧路由 L1328-1335，新路由 L107-109）：
 
 1. **REST API 旁路**：`restApiBypassesReviews` 组织设置开启时，API 调用可以绕过审批
 2. **权限旁路**：用户拥有 `canBypassApprovalChecks` 权限时可以绕过（通常是管理员）
@@ -773,15 +834,19 @@ FeatureRevisionModel.ts:1055-1092 → markRevisionAsReviewRequested()
 status: draft → pending-review
 ```
 
-### 8.2 审批申请完整路径（新路由）
+### 8.2 审批申请完整路径（V2 API）
 ```
-REST API Call → POST /v1/features/:id/revisions/:version/request-review
+REST API Call → POST /api/v2/features/:id/revisions/:version/request-review
   ↓
-features.router.ts:76 → 路由注册
+app.ts:369 → /api 前缀
   ↓
-postFeatureRevisionRequestReview.ts:81 → createApiRequestHandler 包装
+api.router.ts:203 → /v2 前缀
   ↓
-postFeatureRevisionRequestReview.ts:14-79 → requestReview()
+features.v2.router.ts:76 → 路由注册
+  ↓
+postFeatureRevisionRequestReviewV2.ts → createApiRequestHandler 包装
+  ↓
+requestReviewV2()
   ↓
 FeatureRevisionModel.ts:1055-1092 → markRevisionAsReviewRequested()
   ↓
@@ -827,12 +892,21 @@ status: approved → published
 关联的 ramp schedule 从 pending → running
 ```
 
-### 8.5 pending-parent 状态说明
+### 8.5 pending-parent 状态对账表
 ```
 状态定义: features.ts:276 → "pending-parent"
 函数定义: FeatureRevisionModel.ts:1355-1364 → markRevisionAsPendingParent()
 调用点: 当前版本未检索到调用点（全仓库搜索无 import 或调用记录）
-用途说明: 预留接口，用于 ramp schedule 多目标审批门控场景
+
+已实现事实:
+  ✅ Schema 排除: activeDraftStatusSchema 排除 (features.ts:284)
+  ✅ 前端过滤: approval-requests.tsx:199 过滤不显示
+
+预留语义（未实现）:
+  ❌ Ramp Schedule 多目标审批门控场景写入 pending-parent
+  ❌ 父修订发布后 pending-parent 子修订自动发布
+  ❌ pending-parent 子修订随 ramp schedule 自动发布
+
 排除机制:
   - Schema: activeDraftStatusSchema 排除 (features.ts:284)
   - 前端: approval-requests.tsx:199 过滤不显示
