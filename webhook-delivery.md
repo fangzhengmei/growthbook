@@ -1,12 +1,13 @@
 # Webhook 事件从触发到送达全流程解析
 
-GrowthBook 中存在三种独立的 Webhook 实现，每类都有各自的触发场景、签名机制和重试策略：
+GrowthBook 中存在四种独立的 Webhook 实现，每类都有各自的触发场景、签名机制和重试策略：
 
 | Webhook 类型 | 主文件 | 用途 |
 |------------|--------|------|
 | **事件 Webhook** | `EventWebHookNotifier.ts` | 通用事件通知（Slack、Discord、自定义 JSON 等） |
 | **旧版 SDK Webhook** | `jobs/webhooks.ts` | 旧版 SDK 特性变更通知（legacy） |
-| **新版 SDK Webhook** | `jobs/sdkWebhooks.ts` | 新一代 SDK Webhook，支持多种 payload 格式 |
+| **新版 SDK Webhook** | `jobs/sdkWebhooks.ts` | 新一代 SDK Webhook（数据库配置） |
+| **全局 SDK Webhook** | `sdkWebhooks.ts:fireGlobalSdkWebhooks` | 环境变量配置的全局通知 |
 
 ---
 
@@ -398,9 +399,90 @@ agenda.on("fail:" + SDK_WEBHOOKS_JOB_NAME, async (error: Error, job: SDKWebhookJ
 
 ---
 
-## 四、cancellableFetch 响应体超限中断的结果判定
+## 四、triggerWebhookJobs 与全局 Webhook 触发链路
 
-### 4.1 核心实现逻辑
+### 4.1 triggerWebhookJobs 统一入口
+
+**实现位置**：`jobs/updateAllJobs.ts:17-58`
+
+当特性配置变更时，所有类型的 webhook 通过 `triggerWebhookJobs` 统一触发：
+
+```typescript
+export const triggerWebhookJobs = async (
+  context: ReqContext | ApiReqContext,
+  payloadKeys: SDKPayloadKey[],
+  connections: SDKConnectionInterface[],
+  isProxyEnabled: boolean,
+  isFeature = true,
+) => {
+  // 1. 新版 SDK Webhook（数据库配置）- 异步队列
+  queueWebhooksByConnections(context, connections).catch(...);
+
+  // 2. 全局 SDK Webhook（环境变量配置）- 直接同步执行
+  fireGlobalSdkWebhooks(context, connections).catch(...);
+
+  // 3. 代理更新
+  if (isProxyEnabled) queueProxyUpdate(...);
+
+  // 4. 旧版 SDK Webhook（legacy）- 异步队列
+  queueLegacySdkWebhooks(context, payloadKeys, isFeature).catch(...);
+
+  // 5. CDN 缓存清除
+  await purgeCDNCache(...);
+};
+```
+
+> **关键调度语义**：4 个 webhook 触发函数都没有 `await`，**并发异步执行**，互不等待。只有 CDN 缓存清除是同步等待的。
+
+### 4.2 fireGlobalSdkWebhooks 执行链路
+
+**实现位置**：`sdkWebhooks.ts:356-421`
+
+**配置来源**：从环境变量 `WEBHOOKS` 解析（JSON 数组格式），不是从数据库读取。
+
+```
+特性变更 → triggerWebhookJobs()  [updateAllJobs.ts:17]
+  ↓
+fireGlobalSdkWebhooks(context, connections)  [sdkWebhooks.ts:356]
+  ↓
+for (const connection of connections) {
+  ├─ 获取 payload：getFeatureDefinitionsWithCache()
+  └─ WEBHOOKS.forEach((webhook) => {
+       ├─ 构造临时 WebhookInterface 对象（id: `global_${md5(url)}`）
+       ├─ 直接调用 runWebhookFetch()  —— 不经过 Agenda 队列！
+       └─ .catch(logger.error)  —— 失败仅记录日志，不重试！
+     });
+}
+```
+
+### 4.3 与 queueWebhooksByConnections 的核心差异
+
+| 对比项 | queueWebhooksByConnections | fireGlobalSdkWebhooks |
+|-------|---------------------------|----------------------|
+| **配置来源** | 数据库 `webhooks` 集合 | 环境变量 `WEBHOOKS` |
+| **调度方式** | Agenda 异步队列 | 直接同步调用 |
+| **执行时机** | 下一个事件循环 | 当前事件循环立即执行 |
+| **幂等保障** | `job.unique()` 去重 | 无，每次变更都执行 |
+| **失败处理** | 抛出异常 → Agenda `fail` 事件 | `.catch()` 仅记录日志 |
+| **重试机制** | 最多 2 次重试 | **无重试** |
+| **熔断机制** | 连续失败自动禁用 | **无熔断** |
+| **状态持久化** | 更新 webhook 错误状态、连续失败计数 | **无状态更新** |
+| **审计日志** | 创建 `SdkWebhookLog` 记录 | **无日志记录** |
+| **适用场景** | 用户在 UI 中配置的 webhook | 运维层面的全局通知 |
+
+### 4.4 fireGlobalSdkWebhooks 的关键设计特点
+
+1. **无队列**：`runWebhookFetch()` 被直接调用，不经过 Agenda 调度，请求在当前事件循环中发出
+2. **无重试**：失败后仅记录日志，不会触发任何重试逻辑
+3. **无状态**：不更新 webhook 的 `error`、`consecutiveFailures`、`lastSuccess` 等字段
+4. **无日志**：不创建 `SdkWebhookLog` 审计记录，问题排查依赖服务日志
+5. **配置驱动**：webhook 配置来自环境变量，适合部署时预设的全局通知目标
+
+---
+
+## 五、cancellableFetch 响应体超限中断的结果判定
+
+### 5.1 核心实现逻辑
 
 **实现位置**：`http.util.ts:57-128`
 
@@ -437,7 +519,7 @@ try {
 }
 ```
 
-### 4.2 对结果判定的影响
+### 5.2 对结果判定的影响
 
 **三种响应场景对比**：
 
@@ -449,7 +531,7 @@ try {
 | 网络超时 | - | 超时中断 | ❌ 失败，触发重试 |
 | 连接拒绝 | - | 连接失败 | ❌ 失败，触发重试 |
 
-### 4.3 关键设计隐忧
+### 5.3 关键设计隐忧
 
 **响应体超限被视为成功的风险**：
 1. **状态码优先**：只要 HTTP 状态码是 2xx，即使响应体被截断，也会被判定为成功
@@ -468,9 +550,9 @@ try {
 
 ---
 
-## 五、三类 Webhook 对比汇总
+## 六、四类 Webhook 对比汇总
 
-### 5.1 重试策略对比
+### 6.1 重试策略对比
 
 | 对比项 | 事件 Webhook | 旧版 SDK Webhook | 新版 SDK Webhook |
 |-------|------------|----------------|----------------|
@@ -481,7 +563,7 @@ try {
 | **熔断机制** | 无 | 连续失败过多自动禁用 | 连续失败过多自动禁用 |
 | **重试代码位置** | `EventWebHookNotifier.ts:371` | `webhooks.ts:110` | `sdkWebhooks.ts:75` |
 
-### 5.2 签名机制对比
+### 6.2 签名机制对比
 
 | 对比项 | 事件 Webhook | 旧版 SDK Webhook | 新版 SDK Webhook |
 |-------|------------|----------------|----------------|
@@ -492,22 +574,23 @@ try {
 | **请求唯一标识** | 无 | 无 | 有（`webhook-id`） |
 | **签名代码位置** | `event-webhooks-utils.ts:39` | `webhooks.ts:78` | `sdkWebhooks.ts:156` |
 
-### 5.3 事件匹配逻辑对比
+### 6.3 调度方式对比
 
-| 对比项 | 事件 Webhook（普通） | 事件 Webhook（test） | SDK Webhook |
-|-------|---------------------|---------------------|------------|
-| **匹配维度** | 事件名、标签、项目、环境 | 仅 webhookId | 项目、环境 |
-| **检查 enabled** | 是 | 否 | 是 |
-| **特殊路径** | 无 | webhook.test 绕过所有过滤 | 无 |
+| 对比项 | 事件 Webhook | 新版 SDK Webhook | 全局 SDK Webhook |
+|-------|------------|----------------|----------------|
+| **配置来源** | 数据库 | 数据库 | 环境变量 |
+| **调度方式** | Agenda 队列 | Agenda 队列 | 直接调用 |
+| **重试机制** | 3 次重试 | 2 次重试 | 无重试 |
+| **熔断机制** | 无 | 有 | 无 |
+| **状态持久化** | 有 | 有 | 无 |
+| **审计日志** | 有 | 有 | 无 |
 
-### 5.4 其他共性特性
+### 6.4 其他共性特性
 
 | 特性 | 说明 |
 |-----|------|
-| **队列框架** | 全部使用 Agenda |
-| **幂等保障** | `job.unique()` 防止重复入队 |
-| **HTTP 客户端** | 统一使用 `cancellableFetch()` |
+| **HTTP 客户端** | 全部统一使用 `cancellableFetch()` |
 | **超时配置** | 30 秒超时，1000 字节响应体限制 |
-| **审计日志** | 每次调用都记录详细日志 |
+| **签名算法** | 全部基于 HMAC-SHA256 |
 | **代理支持** | 支持通过代理发送请求 |
 | **响应体超限处理** | 都被视为成功（状态码优先） |
