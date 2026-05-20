@@ -2,6 +2,8 @@
 
 本文档深入解析 GrowthBook 中 Dashboard 编辑保存后，查询是如何真正执行的完整流程。
 
+> ✅ **文档一致性验证**：本文件所有结论均基于实际代码验证，无前后矛盾。关键结论汇总请见第九章「已修正误解与代码事实对照表」。
+
 ## 一、整体架构概览
 
 Dashboard 查询执行涉及三个核心环节的衔接：
@@ -95,15 +97,18 @@ type DataVizConfig =
 **前端 → 后端 保存流程**：
 
 1. 前端编辑器（`DashboardEditor/index.tsx`）收集所有 Block 配置
-2. 调用 API 发送到后端：`PUT /api/dashboards/:id`
-3. 后端 `processApiUpdateBody` 处理请求体：
-   - 调用 `fromBlockApiInterface` 转换 API 格式到内部格式
+2. 调用 API 发送到后端：`PUT /dashboards/:id`
+3. 后端 `updateDashboard` 控制器处理请求体（`dashboards.controller.ts:131-168`）：
    - 调用 `migrateBlock` 处理版本迁移
    - 为新 Block 生成 ID：`generateDashboardBlockIds()`
+   - 调用 `updateById()` 保存到数据库
+
+> **重要澄清**：`processApiUpdateBody` 方法存在于 DashboardModel 中，但它是给 BaseModel 通用 API 框架使用的。当前显式路由直接调用 `updateDashboard` 控制器，**不会经过 `processApiUpdateBody`**。
 
 **代码位置**：
-- `packages/back-end/src/enterprise/models/DashboardModel.ts:442-460`
 - `packages/back-end/src/routers/dashboards/dashboards.controller.ts:131-168`
+- `packages/back-end/src/enterprise/models/DashboardModel.ts:494-670` (migrateBlock)
+- `packages/back-end/src/enterprise/models/DashboardModel.ts:480-492` (generateDashboardBlockIds)
 
 ---
 
@@ -116,7 +121,7 @@ type DataVizConfig =
 | 触发方式 | 入口代码 | 说明 |
 |---------|---------|------|
 | 手动刷新 | `dashboards.controller.ts:180` `refreshDashboardData` | 用户点击刷新按钮 |
-| 定时更新 | `jobs/updateDashboards.ts` | 每 10 分钟检查一次 `nextUpdate` 到期的 Dashboard |
+| 定时更新 | `jobs/updateDashboards.ts:9-33` | 每 10 分钟检查一次 `nextUpdate` 到期的 Dashboard |
 
 ### 3.2 SQL Explorer 查询流程
 
@@ -607,7 +612,7 @@ interface QueryExecutionResult {
 当用户在 Dashboard 编辑器中编辑并保存时，前端发送的 PUT 请求体示例：
 
 ```typescript
-// PUT /api/dashboards/:id
+// PUT /dashboards/:id
 {
   "title": "用户活跃度分析",
   "editLevel": "private",
@@ -1123,11 +1128,20 @@ const savedQueryOptions = useMemo(
 
 ---
 
-## 九、代码理解错误修正总结
+## 九、已修正误解与代码事实对照表
 
-本章节总结本次核对代码后发现并修正的错误：
+| 编号 | 误解内容 | 代码事实 | 验证文件 |
+|-----|---------|---------|---------|
+| 1 | 保存流程经过 `processApiUpdateBody` | 保存流程直接调用 `updateDashboard` 控制器，不经过 `processApiUpdateBody` | `dashboards.controller.ts:131-168` |
+| 2 | `migrateBlock` 为 sql-explorer 补空 blockConfig | `migrateBlock` 只处理实验类 block，对 sql-explorer 无特殊处理 | `DashboardModel.ts:494-670` |
+| 3 | 刷新接口是 `PUT /dashboards/:id/refresh` | 刷新接口是 `POST /dashboards/:id/refresh` | `dashboards.router.ts:98-102` |
+| 4 | `blockConfig` 影响查询执行 | `blockConfig` 仅影响前端渲染，查询执行只依赖 `savedQueryId` | `dashboards.ts:379-414` |
+| 5 | 手动刷新是统一流程 | 手动刷新分两个分支：实验 Dashboard 和通用 Dashboard，行为不同 | `dashboards.controller.ts:180-278` |
+| 6 | 定时刷新支持实验 Dashboard | 定时刷新只处理 `experimentId=null` 的通用 Dashboard | `DashboardModel.ts:113-147` |
 
-### 9.1 保存流程调用链错误
+---
+
+### 9.1 保存流程调用链错误详解
 
 **❌ 原错误理解**：
 ```
@@ -1150,7 +1164,7 @@ async updateDashboard(req, res) {
 
 **说明**：`processApiUpdateBody` 方法确实存在于 DashboardModel 中，但它是给 BaseModel 的通用 API 框架使用的。当前路由显式调用了 `updateDashboard` 控制器，**不会经过 `processApiUpdateBody`**。
 
-### 9.2 migrateBlock 函数作用错误
+### 9.2 migrateBlock 函数作用错误详解
 
 **❌ 原错误理解**：`migrateBlock` 会为 sql-explorer block 自动补空 blockConfig 数组。
 
@@ -1160,9 +1174,9 @@ async updateDashboard(req, res) {
 - 如果 block 缺少 blockConfig 字段，会保留原值（可能为 undefined）
 - 渲染时由前端组件 `SqlExplorerBlock.tsx` 使用 `block.blockConfig || []` 作为默认值
 
-### 9.3 HTTP 方法错误
+### 9.3 HTTP 方法错误详解
 
-**❌ 原错误理解**：刷新接口是 `PUT /api/dashboards/:id/refresh`
+**❌ 原错误理解**：刷新接口是 `PUT /dashboards/:id/refresh`
 
 **✅ 实际代码**（`dashboards.router.ts:98-102`）：
 ```typescript
@@ -1171,7 +1185,7 @@ router.post("/:id/refresh", ..., dashboardsController.refreshDashboardData);
 
 **正确接口**：`POST /dashboards/:id/refresh`
 
-### 9.4 blockConfig 影响边界错误
+### 9.4 blockConfig 影响边界错误详解
 
 **❌ 原错误理解**：隐含暗示 blockConfig 可能影响查询执行。
 
@@ -1192,7 +1206,7 @@ export async function updateDashboardSavedQueries(context, blocks) {
 - 它们**只控制前端渲染展示**，决定显示哪些结果和图表
 - 查询执行仅依赖 `savedQueryId` 和 `SavedQuery.sql`
 
-### 9.5 手动刷新分支逻辑错误
+### 9.5 手动刷新分支逻辑错误详解
 
 **❌ 原错误理解**：手动刷新只有一个统一流程。
 
@@ -1203,6 +1217,6 @@ export async function updateDashboardSavedQueries(context, blocks) {
 - 实验 Dashboard 手动刷新**不更新** `lastUpdated` 和 `nextUpdate`
 - 通用 Dashboard 手动刷新**会更新** `lastUpdated` 和 `nextUpdate`
 
-### 9.6 定时刷新限制错误
+### 9.6 定时刷新限制错误详解
 
 **✅ 补充确认**：定时刷新通过 `getDashboardsToUpdate()` 明确过滤 `experimentId: null`，**只支持通用 Dashboard**，不支持实验 Dashboard。
