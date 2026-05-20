@@ -5,26 +5,35 @@
 ```
 用户创建草稿(draft)
       ↓
-[审批申请触发] → 三套入口之一
+[审批申请触发] → 三套入口之一（路由层分叉，业务层复用）
                       ├─ 旧路由: POST /feature/:id/:version/request
                       ├─ V1 API: POST /api/v1/features/:id/revisions/:version/request-review (Deprecated)
                       └─ V2 API: POST /api/v2/features/:id/revisions/:version/request-review
+                      └───────────────────┐
+                                          ↓
+                                  [复用同一业务逻辑]
+                                          ↓
+                                          状态变为 pending-review
       ↓
-状态变为 pending-review
-      ↓
-[审阅状态机] → 三套入口之一
+[审阅状态机] → 三套入口之一（路由层分叉，业务层复用）
                       ├─ 旧路由: POST /feature/:id/:version/submit-review
                       ├─ V1 API: POST /api/v1/features/:id/revisions/:version/submit-review (Deprecated)
                       └─ V2 API: POST /api/v2/features/:id/revisions/:version/submit-review
+                      └───────────────────┐
+                                          ↓
+                                  [复用同一业务逻辑]
+                                          ↓
+                                          状态变为 approved / changes-requested
       ↓
-状态变为 approved / changes-requested
-      ↓
-[最终发布动作] → 三套入口之一
+[最终发布动作] → 三套入口之一（路由层分叉，业务层复用）
                       ├─ 旧路由: POST /feature/:id/:version/publish
                       ├─ V1 API: POST /api/v1/features/:id/revisions/:version/publish (Deprecated)
                       └─ V2 API: POST /api/v2/features/:id/revisions/:version/publish
-      ↓
-状态变为 published
+                      └───────────────────┐
+                                          ↓
+                                  [复用同一业务逻辑]
+                                          ↓
+                                          状态变为 published
       ↓
 [Ramp Schedule 钩子] → dispatchRevisionPublishedHook
       ↓
@@ -35,15 +44,17 @@
 
 ## 二、三套 API 入口体系完整说明
 
-### 2.1 路由挂载架构总览
+### 2.1 路由挂载架构总览：路由层分叉，业务层复用
 
-系统存在**三套并行的 API 入口**，各自有独立的挂载链路和使用场景：
+系统存在**三套并行的 API 入口**，但**核心业务逻辑完全复用**，差异仅在于路由路径、鉴权方式和响应序列化格式。
 
-| 体系 | 路径前缀 | 挂载位置 | 版本前缀注入 | 完整路径格式 | 状态 | 使用方 |
-|------|---------|----------|-------------|-------------|------|--------|
-| **旧路由** | 无（根路径） | `app.ts:847-858` 直接挂载 | 无 | `/feature/:id/:version/*` | 活跃（Dashboard 专用） | 前端 Dashboard |
-| **V1 API** | `/api` | `app.ts:369-376` → `apiRouter` | `api.router.ts:203` → `/v1` | `/api/v1/features/:id/revisions/:version/*` | **Deprecated** | 外部 REST API（已不推荐） |
-| **V2 API** | `/api` | `app.ts:369-376` → `apiRouter` | `api.router.ts:203` → `/v2` | `/api/v2/features/:id/revisions/:version/*` | 推荐 | 外部 REST API（当前推荐） |
+| 体系 | 路径前缀 | 挂载位置 | 版本前缀注入 | 完整路径格式 | 状态 | 使用方 | 业务逻辑来源 | 响应序列化 |
+|------|---------|----------|-------------|-------------|------|--------|-------------|-----------|
+| **旧路由** | 无（根路径） | `app.ts:847-858` 直接挂载 | 无 | `/feature/:id/:version/*` | 活跃（Dashboard 专用） | 前端 Dashboard | `controllers/features.ts` 独立实现 | 自定义格式 |
+| **V1 API** | `/api` | `app.ts:369-376` → `apiRouter` | `api.router.ts:203` → `/v1` | `/api/v1/features/:id/revisions/:version/*` | **Deprecated** | 外部 REST API（已不推荐） | `api/features/postFeatureRevision*.ts` 导出的业务函数 | `toApiRevision` |
+| **V2 API** | `/api` | `app.ts:369-376` → `apiRouter` | `api.router.ts:203` → `/v2` | `/api/v2/features/:id/revisions/:version/*` | 推荐 | 外部 REST API（当前推荐） | **直接复用 V1 业务函数** | `toApiRevisionV2` |
+
+> **核心架构原则**：V1 和 V2 在**路由层分叉**（不同路径、不同 validator、不同序列化），但在**业务层完全复用**（调用同一个业务函数）。V2 没有独立的业务实现，所有核心逻辑都来自 V1。
 
 ### 2.2 挂载链路详细说明
 
@@ -126,31 +137,67 @@ app.post(
 );
 ```
 
-### 2.3 三个关键动作的完整路由对照表
+### 2.3 三个关键动作的完整路由对照表（含业务复用关系）
 
-#### 申请审批
+#### 申请审批：路由层分叉，业务层复用同一 `requestReview` 函数
 
-| 体系 | 完整路径 | 处理入口 | 挂载链路 | 状态 |
-|------|---------|----------|----------|------|
-| 旧路由 | `POST /feature/:id/:version/request` | `controllers/features.ts:985` → `postFeatureRequestReview()` | `app.ts:852-854` 直接挂载 | 活跃（Dashboard） |
-| V1 API | `POST /api/v1/features/:id/revisions/:version/request-review` | `api/features/postFeatureRevisionRequestReview.ts:81` → `postFeatureRevisionRequestReview` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v1` + `features.router.ts:76` | **Deprecated** |
-| V2 API | `POST /api/v2/features/:id/revisions/:version/request-review` | `api/features/postFeatureRevisionRequestReviewV2.ts` → `postFeatureRevisionRequestReviewV2` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v2` + `features.v2.router.ts:76` | 推荐 |
+| 体系 | 完整路径 | 路由层 Handler | 复用的业务函数 | 业务函数定义位置 | 响应序列化 | 状态 |
+|------|---------|---------------|---------------|-----------------|-----------|------|
+| 旧路由 | `POST /feature/:id/:version/request` | `controllers/features.ts:985` → `postFeatureRequestReview()` | **独立实现**（等价逻辑） | `controllers/features.ts:985-1059` | 自定义 `{ status: 200 }` | 活跃（Dashboard） |
+| V1 API | `POST /api/v1/features/:id/revisions/:version/request-review` | `api/features/postFeatureRevisionRequestReview.ts:81` → `postFeatureRevisionRequestReview` | `requestReview(req)` | `api/features/postFeatureRevisionRequestReview.ts:14-78` | `toApiRevision(revision, context, feature)` | **Deprecated** |
+| V2 API | `POST /api/v2/features/:id/revisions/:version/request-review` | `api/features/postFeatureRevisionRequestReviewV2.ts:6` → `postFeatureRevisionRequestReviewV2` | **直接复用 V1 的 `requestReview(req)`** | `api/features/postFeatureRevisionRequestReview.ts:14-78` | `toApiRevisionV2(revision)` | 推荐 |
 
-#### 提交审阅
+**V2 代码证据**（完全复用 V1）：`postFeatureRevisionRequestReviewV2.ts:1-11`
+```typescript
+import { requestReview } from "./postFeatureRevisionRequestReview";  // 从 V1 导入
 
-| 体系 | 完整路径 | 处理入口 | 挂载链路 | 状态 |
-|------|---------|----------|----------|------|
-| 旧路由 | `POST /feature/:id/:version/submit-review` | `controllers/features.ts:1061` → `postFeatureReviewOrComment()` | `app.ts:855-858` 直接挂载 | 活跃（Dashboard） |
-| V1 API | `POST /api/v1/features/:id/revisions/:version/submit-review` | `api/features/postFeatureRevisionSubmitReview.ts` → `postFeatureRevisionSubmitReview` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v1` + `features.router.ts:77` | **Deprecated** |
-| V2 API | `POST /api/v2/features/:id/revisions/:version/submit-review` | `api/features/postFeatureRevisionSubmitReviewV2.ts` → `postFeatureRevisionSubmitReviewV2` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v2` + `features.v2.router.ts:77` | 推荐 |
+export const postFeatureRevisionRequestReviewV2 = createApiRequestHandler(
+  postFeatureRevisionRequestReviewV2Validator,
+)(async (req) => {
+  const { revision } = await requestReview(req);  // 直接调用 V1 业务函数
+  return { revision: toApiRevisionV2(revision) }; // 仅序列化不同
+});
+```
 
-#### 发布
+#### 提交审阅：路由层分叉，业务层复用同一 `submitRevisionReview` 函数
 
-| 体系 | 完整路径 | 处理入口 | 挂载链路 | 状态 |
-|------|---------|----------|----------|------|
-| 旧路由 | `POST /feature/:id/:version/publish` | `controllers/features.ts:1230` → `postFeaturePublish()` | `app.ts:847-850` 直接挂载 | 活跃（Dashboard） |
-| V1 API | `POST /api/v1/features/:id/revisions/:version/publish` | `api/features/postFeatureRevisionPublish.ts:28` → `publishFeatureRevision` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v1` + `features.router.ts:80` | **Deprecated** |
-| V2 API | `POST /api/v2/features/:id/revisions/:version/publish` | `api/features/postFeatureRevisionPublishV2.ts` → `publishFeatureRevisionV2` | `app.ts:369` → `/api` + `api.router.ts:203` → `/v2` + `features.v2.router.ts:80` | 推荐 |
+| 体系 | 完整路径 | 路由层 Handler | 复用的业务函数 | 业务函数定义位置 | 响应序列化 | 状态 |
+|------|---------|---------------|---------------|-----------------|-----------|------|
+| 旧路由 | `POST /feature/:id/:version/submit-review` | `controllers/features.ts:1061` → `postFeatureReviewOrComment()` | **独立实现**（等价逻辑） | `controllers/features.ts:1061-1228` | 自定义 `{ status: 200 }` | 活跃（Dashboard） |
+| V1 API | `POST /api/v1/features/:id/revisions/:version/submit-review` | `api/features/postFeatureRevisionSubmitReview.ts` → `postFeatureRevisionSubmitReview` | `submitRevisionReview(req)` | `api/features/postFeatureRevisionSubmitReview.ts:21-122` | `toApiRevision(revision, context, feature)` | **Deprecated** |
+| V2 API | `POST /api/v2/features/:id/revisions/:version/submit-review` | `api/features/postFeatureRevisionSubmitReviewV2.ts:6` → `postFeatureRevisionSubmitReviewV2` | **直接复用 V1 的 `submitRevisionReview(req)`** | `api/features/postFeatureRevisionSubmitReview.ts:21-122` | `toApiRevisionV2(revision)` | 推荐 |
+
+**V2 代码证据**（完全复用 V1）：`postFeatureRevisionSubmitReviewV2.ts:1-11`
+```typescript
+import { submitRevisionReview } from "./postFeatureRevisionSubmitReview";  // 从 V1 导入
+
+export const postFeatureRevisionSubmitReviewV2 = createApiRequestHandler(
+  postFeatureRevisionSubmitReviewV2Validator,
+)(async (req) => {
+  const { revision } = await submitRevisionReview(req);  // 直接调用 V1 业务函数
+  return { revision: toApiRevisionV2(revision) };        // 仅序列化不同
+});
+```
+
+#### 发布：路由层分叉，业务层复用同一 `publishFeatureRevision` 函数
+
+| 体系 | 完整路径 | 路由层 Handler | 复用的业务函数 | 业务函数定义位置 | 响应序列化 | 状态 |
+|------|---------|---------------|---------------|-----------------|-----------|------|
+| 旧路由 | `POST /feature/:id/:version/publish` | `controllers/features.ts:1230` → `postFeaturePublish()` | **独立实现**（等价逻辑） | `controllers/features.ts:1230-1370` | 自定义 `{ status: 200 }` | 活跃（Dashboard） |
+| V1 API | `POST /api/v1/features/:id/revisions/:version/publish` | `api/features/postFeatureRevisionPublish.ts:28` → `publishFeatureRevision` | `publishFeatureRevision(req)` | `api/features/postFeatureRevisionPublish.ts:28-178` | `toApiRevision(revision, context, feature)` | **Deprecated** |
+| V2 API | `POST /api/v2/features/:id/revisions/:version/publish` | `api/features/postFeatureRevisionPublishV2.ts:6` → `postFeatureRevisionPublishV2` | **直接复用 V1 的 `publishFeatureRevision(req)`** | `api/features/postFeatureRevisionPublish.ts:28-178` | `toApiRevisionV2(revision)` | 推荐 |
+
+**V2 代码证据**（完全复用 V1）：`postFeatureRevisionPublishV2.ts:1-11`
+```typescript
+import { publishFeatureRevision } from "./postFeatureRevisionPublish";  // 从 V1 导入
+
+export const postFeatureRevisionPublishV2 = createApiRequestHandler(
+  postFeatureRevisionPublishV2Validator,
+)(async (req) => {
+  const { revision } = await publishFeatureRevision(req);  // 直接调用 V1 业务函数
+  return { revision: toApiRevisionV2(revision) };          // 仅序列化不同
+});
+```
 
 ### 2.4 V1 API 弃用标记
 
@@ -162,6 +209,22 @@ Blocked if the org requires approvals and `bypassApprovalChecks` is off.",
 deprecated: true,
 deprecationDate: FEATURE_V1_DEPRECATED,
 ```
+
+### 2.5 V1 与 V2 架构关系总结
+
+```
+V1 API (/api/v1/...):
+  postFeatureRevisionRequestReview
+    └─ 导出业务函数 requestReview(req) → { feature, revision }
+    └─ 路由包装: toApiRevision(revision, context, feature)
+
+V2 API (/api/v2/...):
+  postFeatureRevisionRequestReviewV2
+    └─ import { requestReview } from "./postFeatureRevisionRequestReview"  ← 直接复用 V1
+    └─ 路由包装: toApiRevisionV2(revision)  ← 仅序列化格式不同
+```
+
+> **关键结论**：V2 没有独立的业务逻辑实现。所有审批、审阅、发布的核心判断逻辑（权限检查、状态校验、状态更新、审计记录、事件分发）都在 V1 的业务函数中实现，V2 只是**换了个路由壳子**，用不同的序列化格式返回结果。
 
 ---
 
@@ -218,7 +281,7 @@ export async function postFeatureRequestReview(
 }
 ```
 
-### 3.3 V2 API 处理入口（REST API 推荐）
+### 3.3 V2 API 处理入口（REST API 推荐）—— 完全复用 V1 业务逻辑
 
 **Validator 定义**：`packages/shared/src/validators/feature-revisions-v2.ts:362-373`
 ```typescript
@@ -231,14 +294,33 @@ export const postFeatureRevisionRequestReviewV2Validator = {
 };
 ```
 
-**Handler 包装**：`packages/back-end/src/api/features/postFeatureRevisionRequestReviewV2.ts`
+**Handler 实现**：`packages/back-end/src/api/features/postFeatureRevisionRequestReviewV2.ts`
 ```typescript
+import { postFeatureRevisionRequestReviewV2Validator } from "shared/validators";
+import { toApiRevisionV2 } from "back-end/src/services/features";
+import { createApiRequestHandler } from "back-end/src/util/handler";
+import { requestReview } from "./postFeatureRevisionRequestReview";  // 从 V1 导入
+
 export const postFeatureRevisionRequestReviewV2 = createApiRequestHandler(
   postFeatureRevisionRequestReviewV2Validator,
 )(async (req) => {
-  const { feature, revision } = await requestReviewV2(req);
-  return { revision: toApiRevisionV2(revision, req.context, feature) };
+  // 直接复用 V1 的 requestReview 业务函数，无独立业务实现
+  const { revision } = await requestReview(req);
+  return { revision: toApiRevisionV2(revision) };
 });
+```
+
+**V1 业务函数定义**（被 V2 复用）：`packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts:14-78`
+```typescript
+export async function requestReview(req) {
+  // 1. 权限检查 (L25-27)
+  // 2. 状态校验 (L38-42)
+  // 3. 状态更新: markRevisionAsReviewRequested (L44-49)
+  // 4. 审计记录 (L60-68)
+  // 5. 事件分发 (L70-76)
+  
+  return { feature, revision: finalRevision };
+}
 ```
 
 ### 3.4 模型层状态变更
@@ -393,7 +475,7 @@ export async function postFeatureReviewOrComment(
 }
 ```
 
-#### V2 API 处理入口（REST API 推荐）
+#### V2 API 处理入口（REST API 推荐）—— 完全复用 V1 业务逻辑
 
 **Validator 定义**：`packages/shared/src/validators/feature-revisions-v2.ts:375-388`
 ```typescript
@@ -410,7 +492,23 @@ export const postFeatureRevisionSubmitReviewV2Validator = {
 };
 ```
 
-**Action 映射**：`packages/back-end/src/api/features/postFeatureRevisionSubmitReviewV2.ts:15-19`
+**Handler 实现**：`packages/back-end/src/api/features/postFeatureRevisionSubmitReviewV2.ts`
+```typescript
+import { postFeatureRevisionSubmitReviewV2Validator } from "shared/validators";
+import { toApiRevisionV2 } from "back-end/src/services/features";
+import { createApiRequestHandler } from "back-end/src/util/handler";
+import { submitRevisionReview } from "./postFeatureRevisionSubmitReview";  // 从 V1 导入
+
+export const postFeatureRevisionSubmitReviewV2 = createApiRequestHandler(
+  postFeatureRevisionSubmitReviewV2Validator,
+)(async (req) => {
+  // 直接复用 V1 的 submitRevisionReview 业务函数，无独立业务实现
+  const { revision } = await submitRevisionReview(req);
+  return { revision: toApiRevisionV2(revision) };
+});
+```
+
+**Action 映射**（V1 中定义，V2 复用）：`packages/back-end/src/api/features/postFeatureRevisionSubmitReview.ts:15-19`
 ```typescript
 export const actionToReviewType: Record<string, ReviewSubmittedType> = {
   approve: "Approved",
@@ -551,7 +649,7 @@ if (requiresReview && revision.status !== "approved" && !canBypass) {
 }
 ```
 
-### 5.3 V2 API 处理入口（REST API 推荐）
+### 5.3 V2 API 处理入口（REST API 推荐）—— 完全复用 V1 业务逻辑
 
 **Validator 定义**：`packages/shared/src/validators/feature-revisions-v2.ts:290-303`
 ```typescript
@@ -566,6 +664,22 @@ export const postFeatureRevisionPublishV2Validator = {
   bodySchema: z.object({ comment: z.string().optional() }).strict(),
   // ...
 };
+```
+
+**Handler 实现**：`packages/back-end/src/api/features/postFeatureRevisionPublishV2.ts`
+```typescript
+import { postFeatureRevisionPublishV2Validator } from "shared/validators";
+import { createApiRequestHandler } from "back-end/src/util/handler";
+import { toApiRevisionV2 } from "back-end/src/services/features";
+import { publishFeatureRevision } from "./postFeatureRevisionPublish";  // 从 V1 导入
+
+export const postFeatureRevisionPublishV2 = createApiRequestHandler(
+  postFeatureRevisionPublishV2Validator,
+)(async (req) => {
+  // 直接复用 V1 的 publishFeatureRevision 业务函数，无独立业务实现
+  const { revision } = await publishFeatureRevision(req);
+  return { revision: toApiRevisionV2(revision) };
+});
 ```
 
 ### 5.4 审批需求判断逻辑
@@ -774,13 +888,19 @@ draft → [requestReview] → pending-review → [submitReview] → approved →
                                     pending-parent → (预留状态，当前无调用)
 ```
 
-### 7.2 API 端点完整连接表
+### 7.2 API 端点完整连接表（含业务复用关系）
 
-| 动作 | 旧路由完整路径 | V1 API 完整路径（Deprecated） | V2 API 完整路径（推荐） | 模型方法 | 状态流转 |
-|------|---------------|-----------------------------|-----------------------|----------|----------|
-| 申请审批 | `POST /feature/:id/:version/request` | `POST /api/v1/features/:id/revisions/:version/request-review` | `POST /api/v2/features/:id/revisions/:version/request-review` | `markRevisionAsReviewRequested` | `draft` → `pending-review` |
-| 提交审阅 | `POST /feature/:id/:version/submit-review` | `POST /api/v1/features/:id/revisions/:version/submit-review` | `POST /api/v2/features/:id/revisions/:version/submit-review` | `submitReviewAndComments` | `pending-review` → `approved` / `changes-requested` |
-| 发布 | `POST /feature/:id/:version/publish` | `POST /api/v1/features/:id/revisions/:version/publish` | `POST /api/v2/features/:id/revisions/:version/publish` | `publishRevision` → `markRevisionAsPublished` | `approved` → `published` |
+| 动作 | 路由层 | 完整路径 | 业务层复用函数 | 模型方法 | 状态流转 |
+|------|--------|---------|---------------|----------|----------|
+| **申请审批** | 旧路由 | `POST /feature/:id/:version/request` | 独立实现（等价逻辑） | `markRevisionAsReviewRequested` | `draft` → `pending-review` |
+| | V1 API | `POST /api/v1/features/:id/revisions/:version/request-review` | `requestReview(req)` | `markRevisionAsReviewRequested` | `draft` → `pending-review` |
+| | V2 API | `POST /api/v2/features/:id/revisions/:version/request-review` | **复用 V1 的 `requestReview(req)`** | `markRevisionAsReviewRequested` | `draft` → `pending-review` |
+| **提交审阅** | 旧路由 | `POST /feature/:id/:version/submit-review` | 独立实现（等价逻辑） | `submitReviewAndComments` | `pending-review` → `approved` / `changes-requested` |
+| | V1 API | `POST /api/v1/features/:id/revisions/:version/submit-review` | `submitRevisionReview(req)` | `submitReviewAndComments` | `pending-review` → `approved` / `changes-requested` |
+| | V2 API | `POST /api/v2/features/:id/revisions/:version/submit-review` | **复用 V1 的 `submitRevisionReview(req)`** | `submitReviewAndComments` | `pending-review` → `approved` / `changes-requested` |
+| **发布** | 旧路由 | `POST /feature/:id/:version/publish` | 独立实现（等价逻辑） | `publishRevision` → `markRevisionAsPublished` | `approved` → `published` |
+| | V1 API | `POST /api/v1/features/:id/revisions/:version/publish` | `publishFeatureRevision(req)` | `publishRevision` → `markRevisionAsPublished` | `approved` → `published` |
+| | V2 API | `POST /api/v2/features/:id/revisions/:version/publish` | **复用 V1 的 `publishFeatureRevision(req)`** | `publishRevision` → `markRevisionAsPublished` | `approved` → `published` |
 
 ### 7.3 事件分发机制
 
@@ -834,7 +954,7 @@ FeatureRevisionModel.ts:1055-1092 → markRevisionAsReviewRequested()
 status: draft → pending-review
 ```
 
-### 8.2 审批申请完整路径（V2 API）
+### 8.2 审批申请完整路径（V2 API —— 复用 V1 业务逻辑）
 ```
 REST API Call → POST /api/v2/features/:id/revisions/:version/request-review
   ↓
@@ -844,9 +964,9 @@ api.router.ts:203 → /v2 前缀
   ↓
 features.v2.router.ts:76 → 路由注册
   ↓
-postFeatureRevisionRequestReviewV2.ts → createApiRequestHandler 包装
+postFeatureRevisionRequestReviewV2.ts:6 → createApiRequestHandler 包装
   ↓
-requestReviewV2()
+requestReview(req)  ← 从 V1 的 postFeatureRevisionRequestReview.ts:14 导入并复用
   ↓
 FeatureRevisionModel.ts:1055-1092 → markRevisionAsReviewRequested()
   ↓
@@ -892,7 +1012,48 @@ status: approved → published
 关联的 ramp schedule 从 pending → running
 ```
 
-### 8.5 pending-parent 状态对账表
+### 8.5 发布完整路径（V2 API —— 复用 V1 业务逻辑）
+```
+REST API Call → POST /api/v2/features/:id/revisions/:version/publish
+  ↓
+app.ts:369 → /api 前缀
+  ↓
+api.router.ts:203 → /v2 前缀
+  ↓
+features.v2.router.ts:80 → 路由注册
+  ↓
+postFeatureRevisionPublishV2.ts:6 → createApiRequestHandler 包装
+  ↓
+publishFeatureRevision(req)  ← 从 V1 的 postFeatureRevisionPublish.ts:28 导入并复用
+  ↓
+FeatureModel.ts:1888-1967 → publishRevision()
+  ├─ applyRevisionChanges()
+  └─ markRevisionAsPublished()
+     └─ dispatchRevisionPublishedHook()
+        ↓
+rampSchedule.ts:608-620 → onRevisionPublished()
+  ↓
+status: approved → published
+```
+
+### 8.6 V1 与 V2 复用关系总览
+```
+V1 业务层 (api/features/):
+  requestReview(req)                → postFeatureRevisionRequestReview.ts:14
+  submitRevisionReview(req)         → postFeatureRevisionSubmitReview.ts:21
+  publishFeatureRevision(req)       → postFeatureRevisionPublish.ts:28
+         ↑
+         │  import & 复用
+         │
+V2 路由层 (api/features/):
+  postFeatureRevisionRequestReviewV2.ts   → 调用 requestReview(req)
+  postFeatureRevisionSubmitReviewV2.ts    → 调用 submitRevisionReview(req)
+  postFeatureRevisionPublishV2.ts         → 调用 publishFeatureRevision(req)
+
+结论: V2 没有独立业务实现，仅路由和序列化不同，核心逻辑完全复用 V1
+```
+
+### 8.7 pending-parent 状态对账表
 ```
 状态定义: features.ts:276 → "pending-parent"
 函数定义: FeatureRevisionModel.ts:1355-1364 → markRevisionAsPendingParent()
