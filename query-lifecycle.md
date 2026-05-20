@@ -8,7 +8,10 @@
 
 ### 1.1 核心架构设计
 
-GrowthBook 采用 **"按需连接、按查询隔离"** 的连接管理策略，而非传统的长连接池复用模式。每个查询独立创建连接，执行完毕后立即销毁，避免连接泄漏问题。
+GrowthBook 的连接管理策略（代码可验证行为）：
+- `runSnowflakeQuery` 每次调用独立创建连接，执行完毕后在 `finally` 块中销毁
+- `BigQuery.getClient()` 每次调用返回新的 `bq.BigQuery()` 实例
+- 代码库中不存在连接池复用逻辑（无 `pool`、`reuse`、`cache` 等连接复用代码）
 
 **类继承关系**：
 ```
@@ -179,31 +182,35 @@ async runQuery(sql: string, setExternalId?: ExternalIdCallback) {
 | `@google-cloud/bigquery` v8.1.1 | 内部使用 `gaxios` + HTTP keep-alive | ✅ 底层连接池 |
 | `cancelQuery()` | 独立调用 `getClient()` | ❌ 与 `runQuery` 不共享客户端 |
 
-### 1.5 取消路径中 externalId 回溯关联机制
+### 1.5 取消路径中 externalId 回溯关联与状态收敛
 
 **代码位置**：`packages/back-end/src/queryRunners/QueryRunner.ts:558-635`
 
-> **⚠️ 关键修正**：externalId 不是简单的映射关系，需要处理 **缓存查询副本** 的特殊情况。缓存查询本身没有 `externalId`，必须通过 `cachedQueryUsed` 字段回溯到原始查询文档。
+> **⚠️ 关键修正**：取消流程对 `running` 和 `queued` 两种状态的处理有本质差异。`running` 查询需要真正终止数据仓库侧的 Job，而 `queued` 查询尚未提交，只需清理本地定时器即可。
 
 ```typescript
 public async cancelQueries(): Promise<void> {
+  // 只要有 running 或 queued 就进入取消流程
   if (
     this.model.queries.some(
       (q) => q.status === "running" || q.status === "queued",
     )
   ) {
+    // ========== 第一步：仅处理 running 查询 ==========
+    // ⚠️ queued 查询被过滤掉，因为它们没有 externalId，也没有提交到数据仓库
     const runningIds = this.model.queries
       .filter((q) => q.status === "running")
       .map((q) => q.query);
 
     if (runningIds.length) {
+      // includeChunkedResults=false：只加载元数据，不加载分块结果
       const queryDocs = await getQueriesByIds(
         this.context,
         runningIds,
         false,
       );
 
-      // ⚠️ 核心回溯逻辑：
+      // externalId 回溯逻辑（仅适用于 running 查询）
       // Some "running" docs are pointers to a previously-started in-flight
       // query (see `createNewQueryFromCached`). Those copies share the
       // upstream datasource job with the original via `cachedQueryUsed`
@@ -212,8 +219,6 @@ public async cancelQueries(): Promise<void> {
       // Chase one hop to find the real id so we can actually cancel the
       // upstream job. `cachedQueryUsed` always points at the original
       // (not a copy of a copy), so a single lookup is sufficient.
-
-      // 第一步：收集所有缓存来源ID（去重）
       const cachedSourceIds = Array.from(
         new Set(
           queryDocs
@@ -221,8 +226,6 @@ public async cancelQueries(): Promise<void> {
             .filter((id): id is string => Boolean(id)),
         ),
       );
-
-      // 第二步：批量加载原始查询文档
       const cachedSourceDocs = cachedSourceIds.length
         ? await getQueriesByIds(this.context, cachedSourceIds, false)
         : [];
@@ -230,19 +233,18 @@ public async cancelQueries(): Promise<void> {
         cachedSourceDocs.map((q) => [q.id, q]),
       );
 
-      // 第三步：逐跳获取真实 externalId
+      // 收集所有需要取消的 externalId（去重后）
       const externalIds = queryDocs
         .map((q) => {
-          if (q.externalId) return q.externalId;  // 非缓存查询，直接有
+          if (q.externalId) return q.externalId;
           if (q.cachedQueryUsed) {
-            // 缓存查询，回溯到原始文档取
             return cachedSourceById.get(q.cachedQueryUsed)?.externalId;
           }
           return undefined;
         })
         .filter((id): id is string => Boolean(id));
 
-      // 第四步：并发调用取消（最多5并发）
+      // 真正调用数据仓库的取消接口（最多5并发）
       if (externalIds.length) {
         await promiseAllChunks(
           externalIds.map((id) => {
@@ -259,7 +261,30 @@ public async cancelQueries(): Promise<void> {
         );
       }
     }
-    // ... 清理定时器，标记为失败
+
+    // ========== 第二步：统一状态收敛（running + queued 一起处理）==========
+    // ⚠️ 关键差异：
+    // - running 查询：上面已调用 cancelQuery() 终止数据仓库侧 Job
+    // - queued 查询：没有调用 cancelQuery()，因为它们尚未提交
+    // - 两者的共同处理：清理本地定时器 + 清空 queries 数组 + 标记 failed
+
+    // 清理所有本地定时器（包括 queued 查询的指数退避重试定时器）
+    // pendingTimers 中保存了两类定时器：
+    //   1. 缓存查询的 3 秒轮询定时器
+    //   2. queued 查询的指数退避重试定时器
+    this.clearAllTimers();
+
+    // 统一标记：清空 queries 数组，整体状态设为 failed
+    // ⚠️ 注意：这里没有逐个更新 queued 查询的状态，也没有逐个标记 running 查询为 failed
+    // 而是直接清空 queries 数组，依赖上层模型状态机完成收敛
+    const newModel = await this.updateModel({
+      queries: [],
+      status: "failed",
+      error: "",
+    });
+    this.model = newModel;
+
+    this.setStatus("finished", "Queries cancelled by user");
   }
 }
 ```
@@ -275,16 +300,33 @@ public async cancelQueries(): Promise<void> {
 
 **回溯保证**：代码注释明确 `cachedQueryUsed` 永远指向原始查询，不会出现"副本的副本"（A→B→C）的多级链式引用，因此一次查找即可。
 
-### 1.6 连接层设计要点
+**running 与 queued 查询的状态收敛差异表**：
+
+| 处理步骤 | running 查询 | queued 查询 | 代码证据 |
+|---------|------------|------------|---------|
+| 过滤出 runningIds | ✅ 包含 | ❌ 排除 | `QueryRunner.ts:565-567` |
+| 回溯 externalId | ✅ 需要 | ❌ 不需要 | `QueryRunner.ts:569-606` |
+| 调用 `integration.cancelQuery()` | ✅ 调用 | ❌ 不调用 | `QueryRunner.ts:608-622` |
+| 清理本地定时器 | ✅ 清理 | ✅ 清理 | `QueryRunner.ts:625` |
+| 单独更新查询文档状态 | ❌ 不更新 | ❌ 不更新 | 代码中无对应逻辑 |
+| 整体模型 `queries` 置空 | ✅ 置空 | ✅ 置空 | `QueryRunner.ts:627` |
+| 整体模型 `status` 设为 failed | ✅ 标记 | ✅ 标记 | `QueryRunner.ts:628` |
+
+**代码可验证的状态收敛行为**：
+1. `integration.cancelQuery()` 异常被独立 try-catch 包裹，仅打 `logger.debug` 日志，不抛出异常（`QueryRunner.ts:612-617`）
+2. `updateQueryIfRunning()` 的更新条件包含 `status: "running"`，非 running 状态的文档不会被更新（`models/QueryModel.ts:197-204`）
+3. `cancelQueries()` 最终将 `model.queries` 设为 `[]`，`model.status` 设为 `"failed"`（`QueryRunner.ts:626-630`）
+
+### 1.6 连接层设计要点（仅保留代码可验证事实）
 
 | 设计决策 | 实现方式 | 代码位置 |
 |---------|---------|---------|
-| **参数加密** | `decryptDataSourceParams` 解密敏感参数 | `services/datasource.ts` |
-| **查询审计** | `queryTag` 注入用户ID、查询类型等元数据 | `util/integration.ts` |
-| **超时控制** | 分场景设置超时（30s 测试 / 10min 常规） | `services/snowflake.ts:136` |
-| **资源清理** | `try/finally` 确保连接销毁 | `services/snowflake.ts:224-226` |
-| **取消支持** | 持久化 `externalId`，通过 `cachedQueryUsed` 回溯 | `QueryRunner.ts:558-622` |
-| **BigQuery客户端** | 每次 `new BigQuery()`，依赖底层 keep-alive | `integrations/BigQuery.ts:47-60` |
+| **参数解密** | `setParams()` 中调用 `decryptDataSourceParams` | `integrations/Snowflake.ts:17-19` |
+| **查询审计** | `wrapRunQuery()` 向 `metadata` 注入 `userId`、`userName`、`additionalMetadata` | `integrations/SqlIntegration.ts:214-232` |
+| **超时控制** | `connectionTimeout = sql === TEST_QUERY_SQL ? 30000 : 600000` | `services/snowflake.ts:95-96` |
+| **资源清理** | `try/finally` 包裹 `destroySnowflakeConnection()` | `services/snowflake.ts:121-123` |
+| **取消支持** | `setExternalId` 回调持久化 `externalId`，取消时通过 `cachedQueryUsed` 回溯 | `QueryRunner.ts:713-715`, `QueryRunner.ts:584-606` |
+| **BigQuery客户端** | `getClient()` 每次 `return new bq.BigQuery()` | `integrations/BigQuery.ts:47-60` |
 
 ---
 
@@ -437,11 +479,12 @@ async onQueryFinish() {
 }
 ```
 
-**1秒延迟的双重作用**：
-| 作用 | 说明 |
-|-----|------|
-| **防抖** | 短时间内多个查询连续完成时，合并为一次刷新（减少 DB 压力） |
-| **竞态防护** | 给 `updateModel` 留出持久化窗口，避免读到不完整的 DAG |
+**1秒延迟的代码可验证行为**：
+| 行为 | 代码证据 |
+|-----|---------|
+| 固定 1000ms 延迟 | `setTimeout(..., 1000)`（`QueryRunner.ts:198`, `QueryRunner.ts:248`） |
+| 定时器去重 | `if (!this.timer)` 检查（`QueryRunner.ts:192`） |
+| 竞态防护注释 | 代码注释明确说明 `startAnalysis()` 末尾的调用是为了防止 DAG 持久化竞态（`QueryRunner.ts:314-331` 注释） |
 
 ### 2.3 单查询注册：`startQuery`
 
@@ -904,7 +947,9 @@ export async function updateQueryIfRunning(...) {
 | 无（默认） | ✅ 引用相等 | ✅ 分块 | `sqlresultchunks` 集合 |
 | 有（自定义转换） | ❌ 引用不等 | ❌ 不分块 | 主文档内嵌（16MB 限制风险） |
 
-**潜在风险**：当 `process` 函数只是浅拷贝或简单包装，且结果集很大时，可能导致主文档超出 MongoDB 16MB 限制而写入失败。
+**代码可验证约束**：
+- MongoDB 单文档大小限制为 16MB（MongoDB 固有约束）
+- 当 `result !== rawResult` 时，结果直接写入主文档 `result` 字段，无大小检查逻辑
 
 ### 3.4 列式编码与分块算法
 
@@ -960,7 +1005,7 @@ export function encodeSQLResults(
 
 ### 3.5 分块写入与读取
 
-**代码位置**：`packages/back-end/src/models/SqlResultChunkModel.ts:31-88`
+**代码位置**：`packages/back-end/src/models/SqlResultChunkModel.ts:31-95`
 
 ```typescript
 export class SqlResultChunkModel extends BaseClass {
@@ -986,15 +1031,20 @@ export class SqlResultChunkModel extends BaseClass {
   // ========== 读取并合并 ==========
   public async addResultsToQueries(queries: QueryInterface[]) {
     const idsToFetch = queries
-      .filter(q => q.hasChunkedResults)
-      .map(q => q.cachedQueryUsed ? q.cachedQueryUsed : q.id);
+      .filter((q) => q.hasChunkedResults)
+      .map((q) => (q.cachedQueryUsed ? q.cachedQueryUsed : q.id));
 
     if (!idsToFetch.length) return;
 
-    // 按查询ID + 分块号排序读取
+    // ⚠️ 重要：这里一次性加载所有 chunk，没有按列懒加载，没有分页
+    // 查询条件只有 queryId，没有字段投影，没有 chunk 过滤
     const allChunks = await this._find(
-      { queryId: { $in: idsToFetch } },
-      { sort: { queryId: 1, chunkNumber: 1 } },
+      {
+        queryId: { $in: idsToFetch },
+      },
+      {
+        sort: { queryId: 1, chunkNumber: 1 },
+      },
     );
 
     // 按查询ID分组
@@ -1006,7 +1056,8 @@ export class SqlResultChunkModel extends BaseClass {
       chunksByQueryId[chunk.queryId].push(chunk);
     }
 
-    // 列存转行存
+    // ⚠️ 列存转行存：decodeSQLResults 会把所有 chunk 的所有列全部展开成行数组
+    // 没有按需加载列的能力，也没有按行分页的 API
     for (const query of queries) {
       const queryId = query.cachedQueryUsed ? query.cachedQueryUsed : query.id;
       if (chunksByQueryId[queryId]) {
@@ -1016,10 +1067,23 @@ export class SqlResultChunkModel extends BaseClass {
       }
     }
   }
+
+  // 单查询全量读取接口，同样加载所有 chunk
+  public async getResultsByQueryId(queryId: string) {
+    const all = await this._find(
+      { queryId },
+      {
+        sort: { chunkNumber: 1 },
+      },
+    );
+    return decodeSQLResults(all);
+  }
 }
 ```
 
 **列式解码** (`decodeSQLResults`)：
+**代码位置**：`packages/shared/src/sql.ts:345-365`
+
 ```typescript
 export function decodeSQLResults(
   chunks: SqlResultChunkData[],
@@ -1030,6 +1094,7 @@ export function decodeSQLResults(
     const { data, numRows } = chunk;
     if (!numRows) continue;
 
+    // 遍历所有列，没有按列选择的参数
     const columns = Object.keys(data);
     for (let i = 0; i < numRows; i++) {
       const row: Record<string, unknown> = {};
@@ -1042,6 +1107,34 @@ export function decodeSQLResults(
 
   return results;
 }
+```
+
+**⚠️ 列式存储与按列懒加载的能力边界**：
+
+| 特性 | 代码证据 | 是否支持 |
+|-----|---------|---------|
+| 列式物理存储 | `encodeSQLResults` 按列组织数组 | ✅ 是 |
+| 按列懒加载（按需加载部分列） | `addResultsToQueries` 查询条件无字段投影，`decodeSQLResults` 无列选择参数 | ❌ 否 |
+| 按行分页读取 | `getResultsByQueryId` 返回全部结果，无 limit/offset 参数 | ❌ 否 |
+| 单字段投影查询 | 无对应 API，读取总是加载所有列的所有 chunk | ❌ 否 |
+
+**代码可验证事实**：
+1. 分块大小硬编码为 `chunkSizeBytes: number = 4_000_000`（`shared/src/sql.ts:206`）
+2. `sqlresultchunks` 集合使用独立复合索引 `{ organization: 1, queryId: 1, chunkNumber: 1 }`（`models/SqlResultChunkModel.ts:13`）
+3. `queries` 集合使用复合索引 `{ organization: 1, datasource: 1, status: 1, createdAt: -1 }`（`models/QueryModel.ts` Schema 定义）
+
+**读取路径全链路**：
+```
+getQueriesByIds(ids, includeChunkedResults=true)
+    ↓ (QueryModel.ts:76-78)
+context.models.sqlResultChunks.addResultsToQueries(queries)
+    ↓ (SqlResultChunkModel.ts:55-62)
+this._find({ queryId: { $in: idsToFetch } })
+    ↓ 全量加载所有 chunk
+decodeSQLResults(allChunks)
+    ↓ 全量展开所有列的所有行
+query.rawResult = result  ← 完整行数组
+query.result = result     ← 完整行数组（同一个引用）
 ```
 
 ### 3.6 缓存复用机制
@@ -1179,43 +1272,63 @@ executeQuery().catch()
 
 ---
 
-## 五、关键设计权衡
+## 五、关键设计权衡（仅保留代码可验证事实）
 
-### 5.1 连接模式：按需创建 vs 连接池
+### 5.1 连接模式：按需创建
 
-**选择**：每次查询独立创建连接，执行完毕立即销毁
-- ✅ 优点：避免连接泄漏，简化并发控制，天然隔离
-- ❌ 缺点：连接握手开销（Snowflake 约 200-500ms），高并发下对 Warehouse 压力大
+**代码可验证事实**：
+- `runSnowflakeQuery` 每次调用都会 `buildSnowflakeConnection()` + `destroySnowflakeConnection()`（`services/snowflake.ts:92-123`）
+- `BigQuery.getClient()` 每次调用都会 `new bq.BigQuery()`（`integrations/BigQuery.ts:47-60`）
+- `try/finally` 确保 `destroySnowflakeConnection()` 一定执行（`services/snowflake.ts:121-123`）
 
 ### 5.2 结果存储：行存转列存分块
 
-**选择**：当 `result === rawResult`（无 `process` 转换时）触发列式存储 + 4MB 分块
-- ✅ 优点：相同类型数据连续存储，压缩率更高；单字段访问无需加载全量
-- ⚠️ 关键缺陷：触发条件是 **引用相等** 而非 **结果大小**，当提供 `process` 函数时即使 100MB 结果也会内嵌，存在 MongoDB 16MB 溢出风险
-- ❌ 缺点：编码/解码有CPU开销，单行随机访问困难
+**代码可验证事实**：
+- 分块触发条件是 `changes.result === changes.rawResult`（引用相等），与结果大小无关（`models/QueryModel.ts:143-156`）
+- 当提供 `process` 函数时，`result = process(rows)`，`rawResult = rows`，引用不等，不会触发分块（`queryRunners/QueryRunner.ts:731-737`）
+- 分块大小硬编码为 `chunkSizeBytes: number = 4_000_000`（`shared/src/sql.ts:206`）
+- 分块存储使用独立复合索引 `{ organization: 1, queryId: 1, chunkNumber: 1 }`（`models/SqlResultChunkModel.ts:13`）
 
 ### 5.3 调度模式：事件驱动 + 1秒延迟刷新
 
-**选择**：查询完成后设置 1 秒延迟定时器（带去重），而非主动轮询
-- ✅ 核心设计意图：**规避 DAG 持久化竞态**——防止第一个查询完成太快，导致 `updateModel` 还没写入完整 DAG 就触发了状态刷新
-- ✅ 附带效果：天然防抖，短时间内多查询完成时合并刷新，降低 DB 压力
-- ❌ 代价：存在 1 秒延迟窗口，整体流水线多了固定的 1 秒调度延迟
-- ⚠️ 防御措施：`startAnalysis` 末尾再兜底调用一次 `onQueryFinish()`，确保即使竞态发生也能恢复
+**代码可验证事实**：
+- `onQueryFinish()` 使用固定 `setTimeout(..., 1000)`，无动态调整逻辑（`queryRunners/QueryRunner.ts:191-248`）
+- `onQueryFinish()` 通过 `if (!this.timer)` 实现去重，避免重复设置（`queryRunners/QueryRunner.ts:192`）
+- `startAnalysis()` 末尾兜底调用 `onQueryFinish()`，注释明确说明是为了解决 DAG 持久化竞态（`queryRunners/QueryRunner.ts:314-331` 注释）
+- 竞态场景的完整时间线描述在注释中明确写出（`queryRunners/QueryRunner.ts:317-330` 注释）
 
 ### 5.4 缓存粒度：完整SQL精确匹配
 
-**选择**：按 SQL 文本精确匹配 + TTL，命中时创建查询副本（`createNewQueryFromCached`）
-- ✅ 优点：实现简单，无一致性问题
-- ✅ 通过 `cachedQueryUsed` 字段实现结果的"软共享"，分块数据跨文档引用
-- ✅ 副本永远指向原始查询（不会出现 A→B→C 链式引用），取消时只需回溯一跳
-- ❌ 缺点：SQL 微小差异（如空格、参数顺序）导致缓存失效
+**代码可验证事实**：
+- `getRecentQuery()` 使用 `query: query` 精确匹配 SQL 文本（`models/QueryModel.ts:239`）
+- `createNewQueryFromCached()` 时 `cachedQueryUsed: existing.cachedQueryUsed || existing.id`，确保永远指向原始（`models/QueryModel.ts` 中创建副本逻辑）
+- `addResultsToQueries()` 支持 `cachedQueryUsed` 跨文档引用分块（`models/SqlResultChunkModel.ts:49-51`）
 
 ### 5.5 取消路径：一跳回溯设计
 
-**选择**：取消时通过 `cachedQueryUsed` 回溯原始查询获取 `externalId`，最多一跳
-- ✅ 设计约束：`createNewQueryFromCached` 时 `cachedQueryUsed: existing.cachedQueryUsed || existing.id`，确保永远指向原始
-- ✅ 优点：一次批量查询即可拿到所有原始文档，O(n) 时间复杂度
-- ⚠️ 并发场景：取消时可能遇到原始查询已完成，此时 `cancelQuery` 会抛出"查询已完成"异常，通过独立 try-catch 隔离不影响其他取消
+**代码可验证事实**：
+- `cancelQueries()` 仅处理 `status === "running"` 的查询，`queued` 查询不参与 externalId 回溯（`queryRunners/QueryRunner.ts:565-567`）
+- `getQueriesByIds(..., false)` 传入 `includeChunkedResults=false`，避免加载分块数据（`queryRunners/QueryRunner.ts:570-574`）
+- `cachedSourceIds` 使用 `Array.from(new Set(...))` 去重（`queryRunners/QueryRunner.ts:584-590`）
+- 取消失败时仅打 `logger.debug`，不抛出异常中断流程（`queryRunners/QueryRunner.ts:616`）
+- 状态收敛时直接 `queries: []` 清空数组，不逐个更新查询文档（`queryRunners/QueryRunner.ts:626-630`）
+- `clearAllTimers()` 遍历 `pendingTimers` 清理所有定时器（`queryRunners/QueryRunner.ts:180-185`）
+
+### 5.6 结果读取：全量加载模式
+
+**代码可验证事实**：
+- `addResultsToQueries()` 使用 `queryId: { $in: idsToFetch }` 查询条件，无字段投影，无分页参数（`models/SqlResultChunkModel.ts:55-62`）
+- `decodeSQLResults()` 无列选择参数，遍历所有列展开成完整行数组（`shared/src/sql.ts:345-365`）
+- `getResultsByQueryId()` 同样返回全部结果，无 limit/offset 参数（`models/SqlResultChunkModel.ts:80-88`）
+- 全代码库 grep 未发现按列懒加载、按行分页、字段投影等查询优化 API（`lazy.*load|load.*lazy|select.*column|column.*select|projection` 等关键词无匹配）
+
+### 5.7 分块编码算法
+
+**代码可验证事实**：
+- `encodeSQLResults()` 按列组织数据，相同列的值存入同一数组（`shared/src/sql.ts:239-245`）
+- `getSize()` 估算字段大小：`null/undefined/boolean` 计 1 字节，`number` 计 8 字节，`string` 计 `length + 5` 字节，嵌套对象计 `1 + JSON.stringify 长度 * 2`（`shared/src/sql.ts:226-234`）
+- 分块阈值为 `>= 4_000_000` 字节（`shared/src/sql.ts:247`）
+- 并发写入分块的并发数硬编码为 3（`models/SqlResultChunkModel.ts:36-44`）
 
 ---
 
@@ -1234,17 +1347,21 @@ executeQuery().catch()
 | **DAG生成示例** | `queryRunners/ExperimentResultsQueryRunner.ts` | `startExperimentResultQueries` |
 | **查询主模型** | `models/QueryModel.ts` | `createNewQuery`, `updateQuery`(分块判断:143-156), `getRecentQuery`, `getStaleQueries`, `countRunningQueries`, `updateQueryIfRunning` |
 | **缓存副本** | `models/QueryModel.ts` | `createNewQueryFromCached`(cachedQueryUsed一跳保证) |
-| **结果分块** | `models/SqlResultChunkModel.ts` | `createFromResults`, `addResultsToQueries` |
-| **编解码算法** | `shared/src/sql.ts` | `encodeSQLResults`(4MB分块:202-260), `decodeSQLResults` |
+| **结果分块** | `models/SqlResultChunkModel.ts` | `createFromResults`, `addResultsToQueries`(全量加载:48-78), `getResultsByQueryId` |
+| **编解码算法** | `shared/src/sql.ts` | `encodeSQLResults`(4MB分块:202-260), `decodeSQLResults`(全量展开:345-365) |
 
 ---
 
 ## 七、关键偏差修正总结
 
-| 先前理解 | 实际实现 | 代码位置 |
+| 先前理解 | 实际实现（代码可验证） | 代码位置 |
 |---------|---------|---------|
-| BigQuery 有应用层客户端池 | 每次 `getClient()` 都 `new BigQuery()`，连接复用在底层 | `BigQuery.ts:47-60` |
-| 结果分块按大小触发 | 按 `result === rawResult` 引用相等触发，有 `process` 函数时永不分块 | `QueryModel.ts:143-156` |
-| 取消时直接用 externalId | 需要通过 `cachedQueryUsed` 回溯到原始查询文档获取，最多一跳 | `QueryRunner.ts:576-606` |
-| 1秒刷新只是防抖 | 核心目的是规避 DAG 持久化竞态，防止查询永久卡在 queued | `QueryRunner.ts:314-331` 注释 |
-| onQueryFinish 只是启动定时器 | `startAnalysis` 末尾的调用是兜底机制，确保竞态发生后能恢复 | `QueryRunner.ts:376` |
+| BigQuery 有应用层客户端池 | 每次 `getClient()` 都 `return new bq.BigQuery()`，无应用层复用 | `BigQuery.ts:47-60` |
+| 结果分块按大小触发 | 按 `result === rawResult` 引用相等触发；有 `process` 函数时引用不等，永不分块 | `QueryModel.ts:143-156` |
+| 列式存储支持按列懒加载 | `addResultsToQueries()` 全量加载所有 chunk，`decodeSQLResults()` 无列选择参数 | `SqlResultChunkModel.ts:55-78`, `sql.ts:345-365` |
+| 取消时直接用 externalId | 需要通过 `cachedQueryUsed` 回溯到原始查询文档；仅处理 `running` 查询，`queued` 查询不回溯 | `QueryRunner.ts:565-606` |
+| `queued` 查询取消时也调用 `cancelQuery()` | `queued` 查询未提交到数据仓库，仅清理本地定时器，不调用 `cancelQuery()` | `QueryRunner.ts:565-567`, `QueryRunner.ts:625` |
+| 取消时逐个更新查询文档状态 | 直接 `queries: []` 清空数组，不逐个更新，依赖模型状态机收敛 | `QueryRunner.ts:626-630` |
+| 1秒刷新主要用于防抖 | 核心目的是规避 DAG 持久化竞态，代码注释明确写出完整竞态时间线 | `QueryRunner.ts:314-331` 注释 |
+| 分块目的是压缩和查询优化 | 分块目的是绕过 MongoDB 16MB 限制和使用独立索引；无压缩代码，无懒加载代码 | `SqlResultChunkModel.ts:13`, `sql.ts:202-260` |
+| 所有结论可包含推测性描述 | 仅保留代码可直接验证的事实，删除"优点/缺点/潜在风险"等主观判断 | 全文 |
