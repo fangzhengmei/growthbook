@@ -4,6 +4,16 @@
 
 ---
 
+## 文档说明与验证标准
+
+本文所有结论分为两类：
+1. **仓内代码可直接验证**：所有行为均有明确代码位置引用，可通过阅读仓库代码直接证实
+2. **【仓外假设】**：涉及第三方库内部机制、数据库固有特性等，无法由当前仓库代码直接验证，均明确标记
+
+仓内可验证结论的表述格式统一为：**"代码可验证事实：[行为描述]（代码位置：[文件:行号]）"**
+
+---
+
 ## 一、连接池建立阶段
 
 ### 1.1 核心架构设计
@@ -84,7 +94,7 @@ function buildSnowflakeConnection(
     schema: conn.schema,
     warehouse: conn.warehouse,
     role: conn.role,
-    queryTag: getQueryTagString(queryMetadata ?? {}, 2000),  // 查询标签用于审计
+    queryTag: getQueryTagString(queryMetadata ?? {}, 2000),  // 设置查询标签
   });
 }
 ```
@@ -131,7 +141,9 @@ export async function runSnowflakeQuery<T>(...): Promise<QueryResponse<T[]>> {
 
 **代码位置**：`packages/back-end/src/integrations/BigQuery.ts:47-140`
 
-> **⚠️ 关键修正**：之前的"客户端池"描述存在偏差。`getClient()` **每次调用都会新建 `bq.BigQuery()` 实例**，并未在应用层实现客户端复用。真正的连接复用发生在 `@google-cloud/bigquery` 客户端内部（通过 HTTP keep-alive）。
+> **⚠️ 关键修正**：之前的"客户端池"描述存在偏差。`getClient()` **每次调用都会新建 `bq.BigQuery()` 实例**，并未在应用层实现客户端复用。
+> 
+> 【仓外假设】`@google-cloud/bigquery` 官方客户端文档声明其内部使用 `gaxios` + HTTP keep-alive 实现底层连接复用，但此机制无法由当前仓库代码直接验证。
 
 ```typescript
 private getClient() {
@@ -175,12 +187,14 @@ async runQuery(sql: string, setExternalId?: ExternalIdCallback) {
 }
 ```
 
-**客户端生命周期真实模型**：
-| 调用点 | 行为 | 连接复用层次 |
-|-------|-----|------------|
-| `getClient()` | 每次 `new bq.BigQuery()` | ❌ 应用层不复用 |
-| `@google-cloud/bigquery` v8.1.1 | 内部使用 `gaxios` + HTTP keep-alive | ✅ 底层连接池 |
-| `cancelQuery()` | 独立调用 `getClient()` | ❌ 与 `runQuery` 不共享客户端 |
+**客户端生命周期真实模型（仓内代码可验证部分）**：
+| 调用点 | 行为 | 代码证据 |
+|-------|-----|---------|
+| `getClient()` | 每次 `return new bq.BigQuery()` | `BigQuery.ts:47-60` |
+| `runQuery()` | 调用 `getClient()` 获取客户端 | `BigQuery.ts:118` |
+| `cancelQuery()` | 独立调用 `getClient()` 获取客户端 | `BigQuery.ts:133-140` |
+
+> 【仓外假设】`@google-cloud/bigquery` v8.1.1 官方客户端文档声明内部使用 `gaxios` + HTTP keep-alive，但此机制无法由当前仓库代码直接验证。
 
 ### 1.5 取消路径中 externalId 回溯关联与状态收敛
 
@@ -322,7 +336,7 @@ public async cancelQueries(): Promise<void> {
 | 设计决策 | 实现方式 | 代码位置 |
 |---------|---------|---------|
 | **参数解密** | `setParams()` 中调用 `decryptDataSourceParams` | `integrations/Snowflake.ts:17-19` |
-| **查询审计** | `wrapRunQuery()` 向 `metadata` 注入 `userId`、`userName`、`additionalMetadata` | `integrations/SqlIntegration.ts:214-232` |
+| **元数据注入** | `wrapRunQuery()` 向 `metadata` 注入 `userId`、`userName`、`additionalMetadata` | `integrations/SqlIntegration.ts:214-232` |
 | **超时控制** | `connectionTimeout = sql === TEST_QUERY_SQL ? 30000 : 600000` | `services/snowflake.ts:95-96` |
 | **资源清理** | `try/finally` 包裹 `destroySnowflakeConnection()` | `services/snowflake.ts:121-123` |
 | **取消支持** | `setExternalId` 回调持久化 `externalId`，取消时通过 `cachedQueryUsed` 回溯 | `QueryRunner.ts:713-715`, `QueryRunner.ts:584-606` |
@@ -442,10 +456,9 @@ T12  updateModel() 持久化完整 DAG
 T13  (没有其他 onQueryFinish 调用，DAG 中的 B、C、D 永远卡在 queued)
 ```
 
-**保护措施**：
-1. `onQueryFinish()` 内部有 `if (!this.timer)` 去重判断，防止重复设置
-2. `refreshQueryStatuses()` 中如果发现非终端状态但无活跃查询，会记录 `warn` 级别日志（原来是 debug）
-3. `startAnalysis` 末尾的 `onQueryFinish()` 兜底，确保至少有一次刷新看到完整 DAG
+**保护措施（仓内代码可验证）**：
+1. `onQueryFinish()` 内部有 `if (!this.timer)` 去重判断，防止重复设置（`QueryRunner.ts:192`）
+2. `startAnalysis` 末尾的 `onQueryFinish()` 兜底，确保至少有一次刷新发生在 DAG 持久化之后（`QueryRunner.ts:418`）
 
 #### `onQueryFinish` 实现细节
 
@@ -833,7 +846,9 @@ export async function getStaleQueries() {
 
 ### 3.1 数据存储分层设计
 
-采用 **主文档 + 分块扩展** 的两级存储方案，解决 MongoDB 单文档 16MB 限制问题。
+采用 **主文档 + 分块扩展** 的两级存储方案。
+
+> 【仓外假设】MongoDB 文档大小限制为 16MB，分块方案可绕过此限制，但此限制为 MongoDB 固有特性，无法由当前仓库代码直接验证。
 
 ```
 Query 主文档 (queries 集合)
@@ -887,7 +902,9 @@ querySchema.index({
 
 **代码位置**：`packages/back-end/src/models/QueryModel.ts:134-166`
 
-> **⚠️ 关键修正**：分块触发条件与结果大小无关，而是 **`result === rawResult` 的引用相等判断**。当查询提供了 `process` 转换函数时，`result` 和 `rawResult` 是不同对象，**即使结果再大也不会分块**，直接内嵌到主文档中（可能触发 MongoDB 16MB 限制）。
+> **⚠️ 关键修正**：分块触发条件与结果大小无关，而是 **`result === rawResult` 的引用相等判断**。当查询提供了 `process` 转换函数时，`result` 和 `rawResult` 是不同对象，**即使结果再大也不会分块**，直接内嵌到主文档中。
+> 
+> 【仓外假设】若内嵌结果超过 16MB 会触发 MongoDB 写入失败，但此限制为 MongoDB 固有特性，无法由当前仓库代码直接验证。
 
 ```typescript
 // 调用方设置结果时：
@@ -945,11 +962,14 @@ export async function updateQueryIfRunning(...) {
 | `process` 函数 | `result === rawResult` | 是否分块 | 结果存储位置 |
 |---------------|------------------------|---------|------------|
 | 无（默认） | ✅ 引用相等 | ✅ 分块 | `sqlresultchunks` 集合 |
-| 有（自定义转换） | ❌ 引用不等 | ❌ 不分块 | 主文档内嵌（16MB 限制风险） |
+| 有（自定义转换） | ❌ 引用不等 | ❌ 不分块 | 主文档内嵌 |
+
+> 【仓外假设】不分块时结果直接内嵌主文档，若超过 16MB 会触发 MongoDB 写入失败，但此限制为 MongoDB 固有特性，无法由当前仓库代码直接验证。
 
 **代码可验证约束**：
-- MongoDB 单文档大小限制为 16MB（MongoDB 固有约束）
-- 当 `result !== rawResult` 时，结果直接写入主文档 `result` 字段，无大小检查逻辑
+- 当 `result !== rawResult` 时，结果直接写入主文档 `result` 字段，无大小检查逻辑（`models/QueryModel.ts:143-156`）
+
+> 【仓外假设】MongoDB 单文档大小限制为 16MB，为 MongoDB 固有特性，无法由当前仓库代码直接验证。
 
 ### 3.4 列式编码与分块算法
 
@@ -1148,7 +1168,7 @@ export async function getRecentQuery(
   query: string,
   cacheTTLMins?: number,
 ) {
-  const ttl = cacheTTLMins ?? QUERY_CACHE_TTL_MINS;  // 默认？
+  const ttl = cacheTTLMins ?? QUERY_CACHE_TTL_MINS;  // 参数为 null/undefined 时使用默认值
   const earliestDate = new Date();
   earliestDate.setMinutes(earliestDate.getMinutes() - ttl);
 
@@ -1227,8 +1247,8 @@ SqlIntegration.runQuery()
     ↓
 executeQuery().then()
     ├→ updateQuery() 【结果落库】
-    │   ├→ 大结果 → createFromResults() 分块存储
-    │   └→ 小结果 → 内嵌到主文档
+    │   ├→ result === rawResult → createFromResults() 分块存储
+    │   └→ result !== rawResult → 内嵌到主文档
     └→ onQueryFinish()
         └→ setTimeout(1s) 刷新状态
             ├→ refreshQueryStatuses()
@@ -1246,11 +1266,11 @@ executeQuery().then()
 
 | 协同点 | 连接层 | 编排层 | 落库层 |
 |-------|-------|-------|-------|
-| **查询取消** | 提供 `cancelQuery()` 接口，通过 `externalId` 终止 | 维护 `externalId` 映射，处理级联取消 | - |
+| **查询取消** | 提供 `cancelQuery()` 接口，通过 `externalId` 终止数据仓库侧 Job | 维护 `externalId` 映射（含 `cachedQueryUsed` 回溯），最终将 `queries` 设为 `[]` | - |
 | **并发控制** | - | `concurrencyLimitReached()` 统计运行数，指数退避排队 | `countRunningQueries()` 统计查询数 |
-| **缓存复用** | - | `getRecentQuery()` 检查SQL+TTL，`createNewQueryFromCached()` 创建副本 | 支持 `cachedQueryUsed` 跨文档引用分块 |
-| **状态流转** | 成功/异常回调 | 状态机、依赖检查、级联失败 | `status` 字段持久化 |
-| **心跳检测** | - | 30秒定时器更新 `heartbeat` | 后台任务 `getStaleQueries()` 清理失联查询 |
+| **缓存复用** | - | `getRecentQuery()` 精确匹配SQL+TTL，`createNewQueryFromCached()` 创建副本 | 支持 `cachedQueryUsed` 跨文档引用分块 |
+| **状态流转** | 成功/异常回调 | 状态机、依赖检查、级联失败标记 | `status` 字段持久化 |
+| **心跳检测** | - | 30秒定时器更新 `heartbeat` 字段 | 后台任务 `getStaleQueries()` 清理失联查询 |
 
 ### 4.3 错误处理链路
 
@@ -1363,5 +1383,6 @@ executeQuery().catch()
 | `queued` 查询取消时也调用 `cancelQuery()` | `queued` 查询未提交到数据仓库，仅清理本地定时器，不调用 `cancelQuery()` | `QueryRunner.ts:565-567`, `QueryRunner.ts:625` |
 | 取消时逐个更新查询文档状态 | 直接 `queries: []` 清空数组，不逐个更新，依赖模型状态机收敛 | `QueryRunner.ts:626-630` |
 | 1秒刷新主要用于防抖 | 核心目的是规避 DAG 持久化竞态，代码注释明确写出完整竞态时间线 | `QueryRunner.ts:314-331` 注释 |
-| 分块目的是压缩和查询优化 | 分块目的是绕过 MongoDB 16MB 限制和使用独立索引；无压缩代码，无懒加载代码 | `SqlResultChunkModel.ts:13`, `sql.ts:202-260` |
+| 分块目的是压缩和查询优化 | 分块按 4MB 大小切割，存储到独立集合，使用独立复合索引；无压缩代码，无懒加载代码 | `SqlResultChunkModel.ts:13`, `sql.ts:202-260` |
+| | 【仓外假设】分块可绕过 MongoDB 16MB 文档大小限制，但此限制为 MongoDB 固有特性，无法由当前仓库代码直接验证 | — |
 | 所有结论可包含推测性描述 | 仅保留代码可直接验证的事实，删除"优点/缺点/潜在风险"等主观判断 | 全文 |
