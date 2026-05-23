@@ -369,14 +369,17 @@ function unsetAntiFlicker() {
 ```
 用户在GrowthBook后台创建实验
         ↓  ✅ 仓内已证据
-1. 创建 VisualChangeset
-   POST /experiments/:id/visual-changesets
-   ├─ 路径证据: packages/shared/src/validators/visual-changesets.ts:136
-   ├─ 挂载证据: packages/back-end/src/api/experiments/experiments.router.ts:41
+1. 创建 VisualChangeset（前端主用路径）
+   POST /experiments/:id/visual-changeset（单数，JWT认证）
+   ├─ 路径证据: packages/back-end/src/app.ts:756-758
+   ├─ 调用证据: packages/front-end/components/Experiment/VisualChangesetModal.tsx:80
+   ├─ 控制器: experimentsController.postVisualChangeset
    ├─ id: vcs_xxx
    ├─ experiment: exp_xxx
    ├─ editorUrl: https://target.com/page
    └─ urlPatterns: [{type: "simple", pattern: "/page"}]
+
+   （API 兼容路径：POST /api/v1/experiments/:id/visual-changesets，复数，API Key认证）
         ↓  ✅ 仓内已证据
 2. 用户点击 "Open Visual Editor"
    ├─ 检测浏览器扩展是否安装 (fetch 扩展资源)
@@ -403,8 +406,9 @@ function unsetAntiFlicker() {
    ├─ [推测] 实时预览变更效果
    └─ 生成 DOMMutation 对象
         ↓  ✅ 仓内已证据
-7. 保存变更到后端
-   PUT /visual-changesets/:id
+7. 保存变更到后端（路径随调用方不同）
+   前端 UI 调用：PUT /visual-changesets/:id（JWT认证）
+   浏览器扩展调用：PUT /api/v1/visual-changesets/:id（API Key认证）
    {
      visualChanges: [{
        id: vc_xxx,
@@ -461,19 +465,55 @@ export const createVisualChangeset = async ({ experiment, ... }) => {
 };
 ```
 
-#### 6.2.2 API 路径汇总
+#### 6.2.2 API 路径边界：两套接口并存
 
-| 操作 | 方法 | 路径 | 证据位置 |
-|------|------|------|----------|
-| 创建变更集 | POST | `/experiments/:id/visual-changesets` | `visual-changesets.ts:136` |
-| 列出变更集 | GET | `/experiments/:id/visual-changesets` | `visual-changesets.ts:119` |
-| 获取变更集 | GET | `/visual-changesets/:id` | `visual-changesets.ts:168` |
-| 更新变更集 | PUT | `/visual-changesets/:id` | `visual-changesets.ts:238` |
-| 添加单条变更 | POST | `/visual-changesets/:id/visual-change` | `visual-changesets.ts:285` |
-| 更新单条变更 | PUT | `/visual-changesets/:id/visual-change/:visualChangeId` | `visual-changesets.ts:313` |
-| 获取编辑器Key | GET | `/visual-editor/key` | `app.ts:774` |
+代码库中存在**两套独立的路由系统**，分别用于不同的调用方：
 
-> **⚠️ 事实修正**：创建接口路径是 `/experiments/:id/visual-changesets`（挂载在 experiments 路由下），不是独立的 `/visual-changesets` 根路径。
+| 路由系统 | 认证方式 | 路径前缀 | 前端实际调用 | 外部 API 调用 |
+|----------|----------|----------|-------------|--------------|
+| **旧路由（主用）** | JWT（会话Cookie） | 无前缀 | ✅ 是 | ❌ 否 |
+| **新路由（兼容）** | API Key | `/api/v1/` | ❌ 否 | ✅ 是 |
+
+##### 表 1：前端主用路径（JWT 认证，app.ts 直接挂载）
+
+**关键证据**：前端 `apiCall` 调用路径无 `/api/v1` 前缀（`auth.tsx:342`）→ `fetch(getApiHost() + url)`
+
+| 操作 | 方法 | 实际路径（单数/复数混用） | 调用方 | 控制器入口 | 证据位置 |
+|------|------|--------------------------|--------|------------|----------|
+| 创建变更集 | POST | `/experiments/:id/visual-changeset`（**单数**） | 前端 UI | `experimentsController.postVisualChangeset` | `app.ts:756-758`, `VisualChangesetModal.tsx:80` |
+| 更新变更集 | PUT | `/visual-changesets/:id`（复数） | 前端 UI / 扩展 | `experimentsController.putVisualChangeset` | `app.ts:760`, `VisualChangesetModal.tsx:89` |
+| 删除变更集 | DELETE | `/visual-changesets/:id`（复数） | 前端 UI | `experimentsController.deleteVisualChangeset` | `app.ts:761-764`, `VisualChangesetTable.tsx:152` |
+| 获取编辑器Key | GET | `/visual-editor/key` | 前端 UI | `experimentsController.findOrCreateVisualEditorToken` | `app.ts:772-776`, `OpenVisualEditorLink.tsx` |
+
+> **⚠️ 关键发现**：创建接口使用**单数** `/visual-changeset`，更新/删除使用**复数** `/visual-changesets`，存在单复数不一致。
+
+##### 表 2：API 兼容路径（API Key 认证，/api/v1 前缀）
+
+**关键证据**：挂载在 `apiRouter` 下（`app.ts:369-376`）→ 路径自动带 `/api/v1/` 前缀
+
+| 操作 | 方法 | 规范路径（全复数） | 调用方 | Handler 入口 | 证据位置 |
+|------|------|-------------------|--------|-------------|----------|
+| 列出变更集 | GET | `/api/v1/experiments/:id/visual-changesets` | 外部 API | `listVisualChangesets` | `visual-changesets.ts:119` |
+| 创建变更集 | POST | `/api/v1/experiments/:id/visual-changesets`（**复数**） | 外部 API | `postVisualChangesets` | `visual-changesets.ts:136` |
+| 获取变更集 | GET | `/api/v1/visual-changesets/:id` | 外部 API / 扩展 | `getVisualChangeset` | `visual-changesets.ts:168` |
+| 更新变更集 | PUT | `/api/v1/visual-changesets/:id` | 外部 API / 扩展 | `putVisualChangeset` | `visual-changesets.ts:238` |
+| 添加单条变更 | POST | `/api/v1/visual-changesets/:id/visual-change` | 外部 API | `postVisualChange` | `visual-changesets.ts:285` |
+| 更新单条变更 | PUT | `/api/v1/visual-changesets/:id/visual-change/:visualChangeId` | 外部 API | `putVisualChange` | `visual-changesets.ts:313` |
+
+##### 表 3：控制器与 Handler 对应关系
+
+| 功能 | 旧控制器（app.ts 路由） | 新 Handler（apiRouter 路由） | 共用底层模型 |
+|------|------------------------|-----------------------------|-------------|
+| 创建 | `experimentsController.postVisualChangeset` | `postVisualChangesets` | `createVisualChangeset()` |
+| 更新 | `experimentsController.putVisualChangeset` | `putVisualChangeset` | `updateVisualChangeset()` |
+| 删除 | `experimentsController.deleteVisualChangeset` | 无（旧路由独占） | `deleteVisualChangesetById()` |
+| 获取单个 | 无（新路由独占） | `getVisualChangeset` | `findVisualChangesetById()` |
+| 列表 | 无（新路由独占） | `listVisualChangesets` | `findVisualChangesetsByExperiment()` |
+
+> **⚠️ 事实修正**：
+> 1. 前端实际调用的创建路径是 **单数** `/experiments/:id/visual-changeset`，不是复数 `/visual-changesets`
+> 2. 存在两套接口：旧路由（JWT，前端用）和新路由（API Key，外部用）
+> 3. 单复数不一致是历史遗留问题：创建是单数，更新/删除是复数
 
 #### 6.2.3 URL 匹配逻辑
 
@@ -617,6 +657,8 @@ const gb = new GrowthBook({
 | 防闪烁 | 先隐藏页面，变更应用后显示 | `auto-wrapper.ts:60-97` | ✅ 仓内已证据 |
 | 变体绑定 | `VisualChange.variation` 关联 | `VisualChangesetModel.ts:252-258` | ✅ 仓内已证据 |
 | SDK 分发 | 变更集更新触发 payload 刷新 | `VisualChangesetModel.ts:439-473` | ✅ 仓内已证据 |
+| 旧路由（前端用） | JWT 认证，单复数混用 | `app.ts:756-764` | ✅ 仓内已证据 |
+| 新路由（API用） | API Key 认证，全复数，`/api/v1/` 前缀 | `api.router.ts:36`, `visual-changesets.router.ts` | ✅ 仓内已证据 |
 | DOM 选择器生成 | 从元素向上遍历 DOM 树 | 扩展代码（外部） | ❓ 未知待验证 |
 | 元素高亮交互 | hover 时高亮样式 | 扩展代码（外部） | ❓ 未知待验证 |
 | 编辑器 UI 覆盖层 | iframe 或 fixed 侧边栏 | 扩展代码（外部） | ❓ 未知待验证 |
@@ -662,6 +704,10 @@ const gb = new GrowthBook({
 | 安全控制 | `packages/sdk-js/src/GrowthBook.ts:1006-1055` | `_isAutoExperimentBlockedByContext` 各种开关 |
 | 测试用例 | `packages/sdk-js/test/visual-changes.test.ts` | 11 个完整的端到端测试场景 |
 | 环境检测 | `packages/sdk-js/src/GrowthBook.ts:61` | `isBrowser = typeof window !== "undefined"` |
+| 旧路由系统 | `packages/back-end/src/app.ts:756-764` | JWT 认证，单复数混用路径（前端用） |
+| 新路由系统 | `packages/back-end/src/api/api.router.ts:36` | API Key 认证，`/api/v1/` 前缀（外部用） |
+| 前端调用 | `packages/front-end/services/auth.tsx:342` | `apiCall` 调用无 `/api/v1` 前缀 |
+| 前端路由调用 | `packages/front-end/components/Experiment/VisualChangesetModal.tsx:80` | 调用单数 `/visual-changeset` 创建路径 |
 
 ### 10.2 ⚠️ 仓外推测（基于接口约定反推）
 
@@ -892,4 +938,26 @@ console.log('Current URL:', gb.getURL());
 | 错误表述 | 修正后内容 | 证据位置 |
 |----------|------------|----------|
 | "获取临时API密钥" | "获取持久化 API Key（visualEditor 角色，每个用户一个，无过期时间）" | `experiments.ts:3690-3702`, `ApiKeyModel.ts:197-261` |
-| "POST /experiments/:id/visual-changesets"（路径描述模糊） | 明确为"挂载在 experiments 路由下，路径为 `/experiments/:id/visual-changesets`"，并补充完整 API 路径表 | `visual-changesets.ts:136`, `experiments.router.ts:41` |
+| "创建接口路径 `/experiments/:id/visual-changesets`" | 前端主用路径是**单数** `/experiments/:id/visual-changeset`（JWT认证），复数 `/api/v1/experiments/:id/visual-changesets` 是 API 兼容路径（API Key认证） | `app.ts:756-758`, `VisualChangesetModal.tsx:80`, `visual-changesets.ts:136` |
+| "API 路径描述不完整" | 存在**两套独立路由系统**：旧路由（JWT，无前缀，前端用）和新路由（API Key，`/api/v1/` 前缀，外部用） | `app.ts:756-764`, `app.ts:369-376` |
+| "单复数一致性" | 创建接口是单数 `/visual-changeset`，更新/删除接口是复数 `/visual-changesets`，为历史遗留不一致 | `app.ts:756-764` |
+
+---
+
+## 新增：路由边界排障清单
+
+| 问题场景 | 排查要点 | 验证命令/方式 |
+|----------|----------|--------------|
+| **前端创建变更集 404** | 检查是否调用了复数路径（应调用单数 `/experiments/:id/visual-changeset`） | 查看 Network 面板请求 URL |
+| **扩展保存变更 401** | 检查是否缺少 API Key，或调用了无前缀的旧路由（扩展应调用 `/api/v1/visual-changesets/:id`） | 检查请求头 `Authorization: Bearer <apiKey>` |
+| **外部 API 调用 404** | 检查是否遗漏了 `/api/v1/` 前缀 | 正确路径应为 `/api/v1/visual-changesets/:id` |
+| **PUT 更新返回空 data** | 检查是否调用了旧控制器（返回 `data` 字段）还是新 Handler（返回 `visualChangeset` 字段） | 旧控制器: `{status:200, data:{...}}` <br> 新 Handler: `{visualChangeset:{...}}` |
+| **POST 创建返回格式不一致** | 旧控制器返回 `{status:200, visualChangeset:{...}}`，新 Handler 返回 `{visualChangeset:{...}}` | 根据调用路径判断响应格式 |
+
+### 调用方路径选择速查表
+
+| 调用方 | 认证方式 | 创建路径 | 更新/删除路径 |
+|--------|----------|----------|--------------|
+| **前端 UI** | JWT (Cookie) | `/experiments/:id/visual-changeset`（单数） | `/visual-changesets/:id`（复数） |
+| **浏览器扩展** | API Key (Bearer) | `/api/v1/experiments/:id/visual-changesets`（复数） | `/api/v1/visual-changesets/:id`（复数） |
+| **外部集成** | API Key (Bearer) | `/api/v1/experiments/:id/visual-changesets`（复数） | `/api/v1/visual-changesets/:id`（复数） |
