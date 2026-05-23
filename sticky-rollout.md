@@ -514,3 +514,796 @@ stickyBucketService.saveAssignments(doc)
 | `packages/shared/src/sdk-versioning/CAPABILITIES.md` | 跨 SDK 能力矩阵 |
 | `docs/docs/sticky-bucketing.mdx` | 粘性分桶文档 |
 | `docs/docs/features/safe-rollouts.mdx` | 安全放量文档 |
+
+---
+
+## 附录 A：JavaScript/Node、Python、Go 三个 SDK 逐段对照
+
+> 本附录基于以下信息源进行分析：
+> 1. **JavaScript/Node SDK** - 本仓库中完整的源代码实现（`packages/sdk-js/`）
+> 2. **Python SDK** - 官方文档（`docs/docs/lib/python.mdx`）+ SDK 构建规范（`docs/docs/lib/build-your-own.mdx`）
+> 3. **Go SDK** - 官方文档（`docs/docs/lib/go.mdx`）+ SDK 构建规范 + 跨 SDK 测试用例（`packages/sdk-js/test/cases.json`）
+
+### A.1 版本支持与能力矩阵
+
+| 能力 | JavaScript/Node | Python | Go |
+|------|----------------|--------|----|
+| **stickyBucketing 最低版本** | 0.32.0 | 1.1.0 | 0.2.3 |
+| **bucketingV2（Hash v2）** | 0.23.0 | 1.0.0 | 0.1.4 |
+| **prerequisites** | 0.34.0 | 1.1.0 | 0.2.0 |
+| **savedGroupReferences** | 1.1.0 | 1.2.1 | 0.2.0 |
+| **SDK 最新版本** | 1.6.5 | 2.1.1 | 0.2.6 |
+| **异步客户端支持** | ✅ Node.js 异步 | ✅ GrowthBookClient（v1.2.0+） | ✅ 原生 goroutine 支持 |
+| **内置存储实现** | LocalStorage、Cookie（Browser/Express）、Redis | InMemory、SQLite（示例） | InMemory（内置） |
+
+### A.2 粘性分桶服务接口定义对照
+
+#### A.2.1 JavaScript/Node SDK 接口
+
+```typescript
+// packages/sdk-js/src/sticky-bucket-service.ts:50-95
+abstract class StickyBucketService {
+  abstract getAssignments(
+    attributeName: string,
+    attributeValue: string
+  ): StickyAssignmentsDocument | null | undefined;
+
+  abstract saveAssignments(doc: StickyAssignmentsDocument): void;
+
+  async getAllAssignments(
+    attributes: Record<string, string>
+  ): Promise<Record<string, StickyAssignmentsDocument>> {
+    // 批量获取实现
+  }
+
+  getKey(attributeName: string, attributeValue: string): string {
+    return `${attributeName}||${attributeValue}`;
+  }
+}
+
+// 数据结构
+interface StickyAssignmentsDocument {
+  attributeName: string;
+  attributeValue: string;
+  assignments: Record<string, string>; // `${experimentKey}__${bucketVersion}` → `${variationKey}`
+}
+```
+
+#### A.2.2 Python SDK 接口
+
+```python
+# docs/docs/lib/python.mdx:974-981
+class AbstractStickyBucketService:
+    def get_assignments(
+        self,
+        attribute_name: str,
+        attribute_value: str
+    ) -> Optional[Dict]:
+        """Lookup a sticky bucket document"""
+        return None
+
+    def save_assignments(self, doc: Dict) -> None:
+        """Save sticky bucket assignments"""
+        pass
+
+# 数据结构（文档示例）
+{
+  "attributeName": "id",
+  "attributeValue": "123",
+  "assignments": {"exp1__0": "control"}
+}
+```
+
+#### A.2.3 Go SDK 接口
+
+```go
+// docs/docs/lib/go.mdx:619-623
+type StickyBucketService interface {
+    GetAssignments(
+        attributeName string,
+        attributeValue string
+    ) (*StickyBucketAssignmentDoc, error)
+
+    SaveAssignments(doc *StickyBucketAssignmentDoc) error
+
+    GetAllAssignments(
+        attributes map[string]string
+    ) (StickyBucketAssignments, error)
+}
+
+// 数据结构
+type StickyBucketAssignmentDoc struct {
+    AttributeName  string            `json:"attributeName"`
+    AttributeValue string            `json:"attributeValue"`
+    Assignments    map[string]string `json:"assignments"`
+}
+```
+
+#### A.2.4 接口对照分析
+
+| 特性 | JavaScript/Node | Python | Go |
+|------|----------------|--------|----|
+| **抽象基类** | `abstract class` | `AbstractStickyBucketService` | `interface` |
+| **getAssignments 返回类型** | `Document \| null \| undefined` | `Optional[Dict]` | `(*Document, error)` |
+| **saveAssignments 返回类型** | `void` | `None` | `error` |
+| **getAllAssignments** | ✅ `async` 实现 | ❌ 无（接口未定义） | ✅ 接口定义 |
+| **getKey 工具方法** | ✅ 基类实现 | ❌ 无 | ❌ 无 |
+| **异常处理** | 依赖语言 try/catch | 依赖 try/except | Go 多返回值 error |
+
+### A.3 粘性分桶命中逻辑对照
+
+#### A.3.1 命中执行流程（共性）
+
+所有 SDK 必须遵循以下执行顺序（来自 `build-your-own.mdx:924-967` 规范）：
+
+```
+1. 获取 hashAttribute 值
+   ├─ 若为空，尝试 fallbackAttribute
+   └─ 两者都为空 → 不命中，返回默认值
+2. 检查是否允许粘性分桶
+   ├─ experiment.disableStickyBucketing !== true
+   └─ StickyBucketService 已配置
+3. 查询粘性分配（getStickyBucketVariation）
+   ├─ 优先查询 hashAttribute 的分配
+   ├─ 其次查询 fallbackAttribute 的分配
+   ├─ 检查 minBucketVersion 版本阻挡
+   └─ 找到 → 跳过后续过滤，直接使用
+4. 未命中粘性分配 → 执行标准流程
+   ├─ 检查 filters/namespace
+   ├─ 检查 condition
+   ├─ 检查 coverage → getBucketRanges
+   └─ chooseVariation() 选择变体
+5. 命中变体 → 保存粘性分配（若允许）
+```
+
+#### A.3.2 粘性分桶查询实现（JavaScript/Node）
+
+```typescript
+// packages/sdk-js/src/core.ts:983-1036
+function getStickyBucketVariation({
+  ctx, expKey, expBucketVersion, expHashAttribute,
+  expFallbackAttribute, expMinBucketVersion, expMeta
+}): { variation: number; versionIsBlocked?: boolean } {
+  // 1. 构建当前版本的 bucket key
+  const key = getStickyBucketExperimentKey(expKey, expBucketVersion || 0);
+
+  // 2. 获取合并后的分配（fallbackAttribute 优先，hashAttribute 覆盖）
+  const assignments = getStickyBucketAssignments(
+    ctx, expHashAttribute, expFallbackAttribute
+  );
+
+  // 3. 检查 minBucketVersion 阻挡
+  if (expMinBucketVersion > 0) {
+    for (let i = 0; i < expMinBucketVersion; i++) {
+      const blockedKey = getStickyBucketExperimentKey(expKey, i);
+      if (assignments[blockedKey] !== undefined) {
+        return { variation: -1, versionIsBlocked: true };
+      }
+    }
+  }
+
+  // 4. 查找当前版本的分配
+  const assigned = assignments[key];
+  if (assigned !== undefined) {
+    // 通过 meta.key 匹配找到变体索引
+    const idx = expMeta?.findIndex(m => m.key === assigned) ?? -1;
+    if (idx >= 0) return { variation: idx };
+  }
+
+  return { variation: -1 };
+}
+```
+
+#### A.3.3 版本键生成规范（共性）
+
+```typescript
+// 所有 SDK 必须遵循的键格式
+experimentKey = `${experimentKey}__${bucketVersion}`  // 如 "feature-exp__3"
+attributeKey = `${attributeName}||${attributeValue}`   // 如 "id||i123"
+```
+
+**测试用例验证**（`cases.json:6541-6624`）：
+```
+场景：hashAttribute 和 fallbackAttribute 同时有分配
+- fallback(anonymousId): "feature-exp__0" → "2"
+- hashAttribute(id): "feature-exp__0" → "1"
+- 预期结果：使用 hashAttribute 的分配 "1"
+- stickyBucketUsed: true
+```
+
+#### A.3.4 命中逻辑差异分析
+
+| 逻辑环节 | JavaScript/Node | Python | Go |
+|----------|----------------|--------|----|
+| **fallbackAttribute 取值时机** | hashAttribute 为空时，第 6 步（run 函数） | 同规范 | 同规范 |
+| **分配合并顺序** | fallback → hashAttribute（hash 覆盖 fallback） | 同规范 | 同规范 |
+| **minBucketVersion 检查范围** | 0 到 minBucketVersion-1 的所有版本 | 同规范 | 同规范 |
+| **变体键匹配** | 通过 experiment.meta[i].key 匹配 | 同规范 | 同规范 |
+| **meta 缺失时的键** | `String(variationIndex)` 如 "0"、"1" | 同规范 | 同规范 |
+| **StickyBucketUsed 设置时机** | 使用了粘性分配时设为 true | 同规范 | 同规范 |
+
+### A.4 分阶段放量（Rollout）命中规则对照
+
+#### A.4.1 isIncludedInRollout 实现（共性规范）
+
+```typescript
+// build-your-own.mdx:719-746
+function isIncludedInRollout(
+  seed: string,
+  hashAttribute: string | null,
+  range: BucketRange | null,
+  coverage: float | null,
+  hashVersion: integer | null
+): boolean {
+  // 1. 无 coverage 无 range → 全部命中
+  if (range === null && coverage === null) return true;
+
+  // 2. coverage 为 0 → 全部不命中（edge case）
+  if (range === null && coverage === 0) return false;
+
+  // 3. 获取 hash 值
+  const hashAttr = hashAttribute || "id";
+  const hashValue = context.attributes[hashAttr] || "";
+  if (hashValue === "") return false;
+
+  // 4. 计算 hash
+  const n = hash(seed, hashValue, hashVersion || 1);
+
+  // 5. 判断是否在范围内
+  if (range) return inRange(n, range);
+  if (coverage !== null) return n <= coverage;
+  return true;
+}
+```
+
+#### A.4.2 Hash 算法规范（绝对共性）
+
+```
+所有 SDK 必须实现完全相同的 FNV-32a 哈希算法：
+
+v2（无偏）: hashFnv32a(hashFnv32a(seed + value) + "") % 10000 / 10000
+v1（有偏）: hashFnv32a(value + seed) % 1000 / 1000
+```
+
+**测试用例验证**（`cases.json` 中 hash 测试用例共 12 个，所有 SDK 必须 100% 通过）：
+```
+[seed, value, version, expected]
+["", "", 1, 0.361]
+["test", "abc", 1, 0.619]
+["test", "abc", 2, 0.5069]
+["foo", "bar", 2, 0.6281]
+...
+```
+
+#### A.4.3 放量规则与粘性分桶的交互
+
+**关键交互点**（所有 SDK 必须一致）：
+
+| 场景 | 行为 | 测试用例位置 |
+|------|------|-------------|
+| **粘性命中时跳过 coverage 检查** | 找到粘性分配 → 跳过 filters、condition、coverage 检查 | `cases.json:6366-6424` |
+| **粘性分配升级（fallback → hash）** | 有 fallback 分配 + hashAttribute 有值 → 同时写入两个文档 | `cases.json:6488-6552` |
+| **bucketVersion 变更重置** | 新版本无粘性分配 → 重新计算 coverage | `cases.json:6627-6686` |
+| **minBucketVersion 阻挡** | 低版本存在 → 排除用户，不保存新分配 | `cases.json:6688-6736` |
+
+### A.5 变更回退机制对照
+
+#### A.5.1 版本控制参数（共性）
+
+| 参数 | JavaScript/Node 类型 | Python 类型 | Go 类型 |
+|------|---------------------|-------------|---------|
+| `bucketVersion` | `number`（可选，默认 0） | `int`（可选） | `int`（可选） |
+| `minBucketVersion` | `number`（可选，默认 0） | `int`（可选） | `int`（可选） |
+| `disableStickyBucketing` | `boolean`（可选） | `bool`（可选） | `bool`（可选） |
+
+#### A.5.2 回退场景处理（共性）
+
+**场景 1：仅调整 coverage（50% → 10%），保留老用户**
+- 操作：仅修改 `coverage` 参数
+- 行为：
+  - 老用户因粘性分桶保持原分配（跳过 coverage 检查）
+  - 新用户按新 coverage 计算
+- 跨 SDK 一致性：✅ 所有 SDK 行为一致
+
+**场景 2：Bug 修复后重新放量，排除老用户**
+- 操作：
+  - `bucketVersion`: 0 → 1
+  - `minBucketVersion`: 1
+- 行为：
+  - 老用户因版本 0 存在，被 minBucketVersion=1 阻挡
+  - 返回 `variation: -1`，使用默认值
+  - 不保存新的粘性分配
+- 跨 SDK 一致性：✅ 所有 SDK 行为一致
+- 测试用例：`cases.json:6688-6736`
+
+**场景 3：完全重置实验**
+- 操作：
+  - `bucketVersion`: 0 → 1
+  - `minBucketVersion`: 0（或不设置）
+- 行为：
+  - 老用户无版本 1 的粘性分配
+  - 重新计算 coverage，可能分配到不同变体
+  - 保存新的版本 1 分配（保留旧版本 0 分配）
+- 跨 SDK 一致性：✅ 所有 SDK 行为一致
+- 测试用例：`cases.json:6627-6686`
+
+#### A.5.3 回退逻辑差异分析
+
+| 回退环节 | JavaScript/Node | Python | Go |
+|----------|----------------|--------|----|
+| **版本阻挡返回值** | `{ variation: -1, versionIsBlocked: true }` | 同规范（返回 -1） | 同规范（返回 -1） |
+| **阻挡后是否保存分配** | ❌ 不保存 | ❌ 不保存 | ❌ 不保存 |
+| **阻挡后 inExperiment** | false | false | false |
+| **旧版本分配保留** | ✅ 保留（不删除） | ✅ 保留 | ✅ 保留 |
+| **多版本分配共存** | ✅ 允许（如同时有 `__0` 和 `__3`） | ✅ 允许 | ✅ 允许 |
+
+### A.6 存储实现对照
+
+#### A.6.1 JavaScript/Node SDK 存储实现
+
+```typescript
+// packages/sdk-js/src/sticky-bucket-service.ts
+// 1. LocalStorage 实现
+class LocalStorageStickyBucketService extends StickyBucketService {
+  constructor(private prefix = "gbStickyBuckets__") {}
+
+  getAssignments(attributeName, attributeValue) {
+    const key = this.getKey(attributeName, attributeValue);
+    const json = localStorage.getItem(this.prefix + key);
+    return json ? JSON.parse(json) : null;
+  }
+
+  saveAssignments(doc) {
+    const key = this.getKey(doc.attributeName, doc.attributeValue);
+    localStorage.setItem(this.prefix + key, JSON.stringify(doc));
+  }
+}
+
+// 2. Browser Cookie 实现
+class BrowserCookieStickyBucketService extends StickyBucketService {
+  constructor(private prefix = "gbStickyBuckets__", private days?: number) {}
+
+  // Cookie 读写逻辑
+}
+
+// 3. Express Cookie 实现
+class ExpressCookieStickyBucketService extends StickyBucketService {
+  constructor(private req: Request, private res: Response, ...) {}
+}
+```
+
+#### A.6.2 Python SDK 存储实现
+
+```python
+# docs/docs/lib/python.mdx:1082-1128
+# SQLite 示例实现
+class SQLiteStickyBucketService(AbstractStickyBucketService):
+    def __init__(self, db_path="sticky_buckets.db"):
+        self.conn = sqlite3.connect(db_path)
+        # 创建表：attribute_name, attribute_value, assignments (JSON)
+
+    def get_assignments(self, attribute_name, attribute_value):
+        cursor = self.conn.execute(
+            "SELECT assignments FROM sticky_buckets WHERE attribute_name=? AND attribute_value=?",
+            (attribute_name, attribute_value)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "attributeName": attribute_name,
+                "attributeValue": attribute_value,
+                "assignments": json.loads(row[0])
+            }
+        return None
+
+    def save_assignments(self, doc):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sticky_buckets VALUES (?, ?, ?)",
+            (doc["attributeName"], doc["attributeValue"], json.dumps(doc["assignments"]))
+        )
+        self.conn.commit()
+```
+
+#### A.6.3 Go SDK 存储实现
+
+```go
+// docs/docs/lib/go.mdx:581-593
+// 内置 InMemory 实现
+service := gb.NewInMemoryStickyBucketService()
+
+// 接口定义
+type StickyBucketService interface {
+    GetAssignments(attributeName, attributeValue string) (*StickyBucketAssignmentDoc, error)
+    SaveAssignments(doc *StickyBucketAssignmentDoc) error
+    GetAllAssignments(attributes map[string]string) (StickyBucketAssignments, error)
+}
+
+// 内置实现使用 sync.RWMutex 保证线程安全
+type InMemoryStickyBucketService struct {
+    mu    sync.RWMutex
+    docs  map[string]*StickyBucketAssignmentDoc
+}
+```
+
+#### A.6.4 存储特性对照
+
+| 特性 | JavaScript/Node | Python | Go |
+|------|----------------|--------|----|
+| **内置 InMemory 实现** | ✅ `InMemoryStickyBucketService` | ✅ `InMemoryStickyBucketService` | ✅ `NewInMemoryStickyBucketService` |
+| **内置持久化实现** | ✅ LocalStorage、Browser Cookie、Express Cookie | ❌ 仅提供 SQLite 示例 | ❌ 无（需自行实现） |
+| **线程安全** | ❌ 依赖 JS 单线程模型（浏览器） | ❌ 需自行实现 | ✅ 内置 sync.RWMutex |
+| **异步接口** | ✅ getAllAssignments async | ❌ 全同步 | ❌ 全同步（Go 并发由 goroutine 处理） |
+| **prefix 配置** | ✅ 构造函数参数 | ❌ 无（接口未定义） | ❌ 无（接口未定义） |
+
+### A.7 客户端架构模式对照
+
+#### A.7.1 JavaScript/Node SDK 架构
+
+```typescript
+// 两种使用模式
+// 1. 传统模式（每个请求创建实例）
+const gb = new GrowthBook({
+  attributes: { id: "user123" },
+  stickyBucketService: new RedisStickyBucketService()
+});
+gb.load_features();
+const result = gb.evalFeature("my-feature");
+gb.destroy();
+
+// 2. Node.js 异步客户端（v1.2.0+，类似 Python）
+// 参考 Python GrowthBookClient 模式
+```
+
+#### A.7.2 Python SDK 架构
+
+```python
+# docs/docs/lib/python.mdx:64-125
+# 1. 传统同步模式（每个请求创建实例）
+gb = GrowthBook(
+    attributes={"id": "user123"},
+    sticky_bucket_service=MyStickyService()
+)
+gb.load_features()
+result = gb.eval_feature("my-feature")
+gb.destroy()
+
+# 2. 异步客户端模式（v1.2.0+，推荐）
+client = GrowthBookClient(
+    Options(
+        api_host="https://cdn.growthbook.io",
+        client_key="sdk-abc123",
+        sticky_bucket_service=MyStickyService()
+    )
+)
+await client.initialize()
+
+# 每个请求创建 UserContext
+user = UserContext(attributes={"id": "user123"})
+result = await client.eval_feature("my-feature", user)
+```
+
+#### A.7.3 Go SDK 架构
+
+```go
+// docs/docs/lib/go.mdx:30-95
+// 单例客户端 + 子客户端模式（推荐）
+client, err := gb.NewClient(
+    context.Background(),
+    gb.WithClientKey("sdk-XXXX"),
+    gb.WithStickyBucketService(NewInMemoryStickyBucketService()),
+    gb.WithSseDataSource(),
+)
+defer client.Close()
+
+// 每个请求创建子客户端（共享数据，隔离 attributes）
+attrs := gb.Attributes{"id": "user123"}
+child, err := client.WithAttributes(attrs)
+result := child.EvalFeature(context.Background(), "my-feature")
+```
+
+#### A.7.4 架构模式差异
+
+| 特性 | JavaScript/Node | Python | Go |
+|------|----------------|--------|----|
+| **单例客户端模式** | ❌ 传统模式无（Node.js v1.2.0+ 支持） | ✅ GrowthBookClient（v1.2.0+） | ✅ NewClient + WithAttributes |
+| **属性隔离方式** | 实例级 attributes | UserContext 参数传递 | WithAttributes 创建子客户端 |
+| **数据共享方式** | 全局缓存（feature_repo） | 客户端实例共享 | 子客户端共享父客户端数据 |
+| **生命周期管理** | 每个请求 create/destroy | 全局初始化，请求级 UserContext | 全局初始化，请求级 WithAttributes |
+| **多用户并发安全** | ❌ 需每个请求独立实例 | ✅ UserContext 隔离 | ✅ 子客户端隔离 |
+
+### A.8 测试用例覆盖对照
+
+所有 SDK 必须通过 `cases.json` 中的 12 个 stickyBucket 测试用例：
+
+| 测试用例名称 | 验证点 |
+|-------------|--------|
+| use fallbackAttribute when missing hashAttribute | fallback 属性缺失时使用 hashAttribute |
+| performs evaluation without sticky bucket | 无粘性分配时的正常计算 |
+| evaluates based on stored sticky bucket | 粘性分配命中时跳过过滤 |
+| does not consume a sticky bucket not belonging to the user | 不属于用户的粘性分配不被使用 |
+| upgrades a sticky bucket doc from a fallbackAttribute to a hashAttribute | fallback → hash 的升级逻辑 |
+| favors a sticky bucket doc based on hashAttribute over fallbackAttribute | hashAttribute 优先级高于 fallback |
+| resets sticky bucketing when the bucketVersion changes | bucketVersion 变更时重置 |
+| stops test enrollment when and existing sticky bucket is blocked by version | minBucketVersion 阻挡逻辑 |
+| uses a sticky bucket when sticky bucket version == minBucketVersion == bucketVersion | 版本号匹配时使用粘性分配 |
+| skips assignment when sticky bucket version < experiment.minBucketVersion | 版本低于 minBucketVersion 时跳过 |
+| resets sticky bucketing when bucket version > experiment.bucketVersion | 版本过高时重置 |
+| resets sticky bucketing when bucket version < experiment.bucketVersion | 版本过低时重置 |
+| disables sticky bucketing when disabled by experiment | disableStickyBucketing=true 时禁用 |
+
+---
+
+## 附录 B：共性、差异与潜在不一致风险分析
+
+### B.1 共性分析（所有 SDK 必须保持一致）
+
+#### B.1.1 算法层共性（100% 一致性要求）
+
+1. **Hash 算法**：FNV-32a 实现完全一致
+   - v1: `hashFnv32a(value + seed) % 1000 / 1000`
+   - v2: `hashFnv32a(hashFnv32a(seed + value) + "") % 10000 / 10000`
+   - 所有 SDK 必须通过 12 个 hash 测试用例
+
+2. **分桶范围计算**：`getBucketRanges` 算法完全一致
+   - coverage 规范化到 [0, 1]
+   - weights 校验（长度匹配 + 总和 ≈ 1）
+   - 范围计算：`[start, start + coverage * weight]`
+
+3. **粘性分桶键格式**：完全一致
+   - 实验键：`${experimentKey}__${bucketVersion}`
+   - 属性键：`${attributeName}||${attributeValue}`
+
+4. **命中优先级**：完全一致
+   ```
+   粘性分配命中 → 跳过 filters/condition/coverage → 直接使用
+   未命中 → 按顺序检查 filters → namespace → condition → coverage
+   ```
+
+#### B.1.2 数据结构共性（100% 一致性要求）
+
+```typescript
+// 跨 SDK 统一的数据结构
+interface StickyAssignmentsDocument {
+  attributeName: string;           // 如 "id", "deviceId"
+  attributeValue: string;          // 如 "user123"
+  assignments: Record<string, string>;  // 实验键 → 变体键
+}
+
+interface Experiment {
+  key: string;
+  bucketVersion?: number;          // 默认 0
+  minBucketVersion?: number;       // 默认 0
+  disableStickyBucketing?: boolean; // 默认 false
+  hashAttribute?: string;          // 默认 "id"
+  fallbackAttribute?: string;      // 可选
+  meta?: Array<{key: string}>;     // 变体键定义
+}
+```
+
+#### B.1.3 执行流程共性（100% 一致性要求）
+
+```
+runExperiment() 执行顺序：
+1. 检查 variations 数量（<2 直接返回）
+2. 检查 URL querystring 强制
+3. 检查 context.forcedVariations
+4. 检查 experiment.active
+5. 获取 hashValue（hashAttribute → fallbackAttribute）
+6. 检查粘性分桶（若启用）→ 命中则跳过后续过滤
+7. 检查 filters → namespace → condition → groups
+8. 计算 hash 和 bucketRanges → chooseVariation
+9. 检查 experiment.force
+10. 检查 qaMode
+11. 构建 ExperimentResult
+12. 保存粘性分配（若启用且命中）
+13. 触发 trackingCallback
+14. 返回结果
+```
+
+### B.2 差异分析（语言/生态特性导致的合理差异）
+
+#### B.2.1 接口设计差异
+
+| 差异点 | 原因分析 | 风险等级 |
+|--------|---------|---------|
+| **JavaScript/Node 缺少 GetAllAssignments 抽象** | JavaScript 版本较旧（0.32.0 支持），早期设计 | ⚠️ 中 |
+| **Python 接口缺少 GetAllAssignments** | Python 接口设计简化 | ⚠️ 中 |
+| **Go 接口返回 error** | Go 语言惯用法 | ✅ 低 |
+| **JavaScript/Node 有 getKey 工具方法** | 基类提供便利实现 | ✅ 低 |
+| **Python/Go 无 prefix 配置** | 接口设计未包含，需用户自行实现 | ⚠️ 中 |
+
+#### B.2.2 存储实现差异
+
+| 差异点 | 原因分析 | 风险等级 |
+|--------|---------|---------|
+| **JavaScript/Node 内置多种存储实现** | 浏览器/Node.js 生态成熟 | ✅ 低 |
+| **Python 仅提供 SQLite 示例** | Python 生态数据库选择多样 | ✅ 低 |
+| **Go 仅提供 InMemory 实现** | Go 强调组合优于继承 | ✅ 低 |
+| **Go 内置线程安全** | Go goroutine 并发模型需要 | ✅ 低 |
+| **Python/JavaScript 无内置线程安全** | 依赖使用模式（每个请求实例） | ⚠️ 中 |
+
+#### B.2.3 客户端架构差异
+
+| 差异点 | 原因分析 | 风险等级 |
+|--------|---------|---------|
+| **Go 使用子客户端模式** | Go 并发模型 + 性能优化 | ✅ 低 |
+| **Python 使用 UserContext 参数** | Python 异步编程模型 | ✅ 低 |
+| **JavaScript/Node 传统模式无单例** | 早期设计，Node.js v1.2.0 已支持 | ⚠️ 中 |
+| **属性传递方式不同** | 语言/框架习惯差异 | ✅ 低 |
+
+### B.3 潜在不一致风险
+
+#### B.3.1 高风险（必须避免）
+
+**风险 1：Hash 算法实现不一致**
+- **场景**：某 SDK 的 FNV-32a 实现有偏差
+- **影响**：同一用户在不同端得到不同变体分配
+- **验证**：所有 SDK 必须通过 `cases.json` 中的 12 个 hash 测试用例
+- **发生概率**：低（有测试用例强制约束）
+
+**风险 2：粘性分桶键格式不一致**
+- **场景**：Python SDK 使用 `__` 作为属性键分隔符而非 `||`
+- **影响**：跨端粘性分桶失效，用户体验不一致
+- **验证**：`cases.json:6541-6624` 升级测试用例
+- **发生概率**：低（有测试用例强制约束）
+
+**风险 3：minBucketVersion 阻挡逻辑不一致**
+- **场景**：某 SDK 检查 `<= minBucketVersion` 而非 `< minBucketVersion`
+- **影响**：该排除的用户未排除，或不该排除的被排除
+- **验证**：`cases.json:6688-6849` 多个版本阻挡测试用例
+- **发生概率**：低（有测试用例强制约束）
+
+#### B.3.2 中风险（需要关注）
+
+**风险 4：存储 prefix 不一致**
+- **场景**：JavaScript SDK 使用 `gbStickyBuckets__` prefix，Python/Go 无 prefix
+- **影响**：使用同一 Redis 存储时，键冲突或无法读取
+- **解决方案**：
+  - 所有 SDK 配置相同的 prefix
+  - 或在存储层统一处理
+- **发生概率**：中（接口未强制要求）
+
+**风险 5：StickyBucketService 异步/同步差异**
+- **场景**：JavaScript `getAllAssignments` 是 async，Python/Go 是 sync
+- **影响**：高并发场景下性能表现差异
+- **注意**：功能一致性不受影响，仅性能差异
+- **发生概率**：中（语言特性导致）
+
+**风险 6：线程安全问题**
+- **场景**：Python/JavaScript SDK 在多线程环境下共享实例
+- **影响**：粘性分配读写冲突，数据不一致
+- **解决方案**：
+  - JavaScript：浏览器单线程无问题，Node.js 使用 async 客户端
+  - Python：每个请求创建新实例或使用 async 客户端
+  - Go：内置线程安全，无需担心
+- **发生概率**：中（使用模式不当导致）
+
+**风险 7：fallbackAttribute 升级逻辑差异**
+- **场景**：某 SDK 在升级时未同时写入 hashAttribute 和 fallbackAttribute
+- **影响**：用户登出后无法保持原变体分配
+- **验证**：`cases.json:6488-6552` 升级测试用例
+- **发生概率**：低（有测试用例强制约束）
+
+#### B.3.3 低风险（可接受差异）
+
+**风险 8：异常处理方式差异**
+- **场景**：Go 返回 error，Python/JavaScript 抛出异常
+- **影响**：错误处理代码不同，但功能一致
+- **发生概率**：高（语言特性，可接受）
+
+**风险 9：属性传递方式差异**
+- **场景**：Go 用 WithAttributes，Python 用 UserContext，JS 用实例属性
+- **影响**：调用方式不同，但评估逻辑一致
+- **发生概率**：高（设计差异，可接受）
+
+**风险 10：存储实现差异**
+- **场景**：各 SDK 存储后端不同
+- **影响**：跨端一致需要集中存储（如 Redis）
+- **解决方案**：使用相同的存储后端和数据格式
+- **发生概率**：中（部署架构选择，可控制）
+
+### B.4 跨 SDK 一致性保障最佳实践
+
+#### B.4.1 开发阶段保障
+
+1. **严格遵循测试用例**：
+   - 所有 SDK 必须 100% 通过 `cases.json` 测试用例
+   - 重点关注 stickyBucket 部分的 12 个用例
+   - 新增特性必须先添加测试用例再实现
+
+2. **使用规范文档作为唯一真理来源**：
+   - `docs/docs/lib/build-your-own.mdx` 是所有 SDK 实现的规范
+   - 任何与规范不一致的实现都是 bug
+
+3. **代码审查清单**：
+   ```
+   ▢ Hash 算法是否与规范完全一致？
+   ▢ 粘性分桶键格式是否正确？
+   ▢ minBucketVersion 检查范围是否正确（0 到 minBucketVersion-1）？
+   ▢ 分配合并顺序是否正确（fallback → hashAttribute 覆盖）？
+   ▢ 粘性命中时是否跳过了所有过滤？
+   ▢ 版本阻挡时是否保存了新分配？
+   ```
+
+#### B.4.2 部署阶段保障
+
+1. **统一存储配置**：
+   - 所有 SDK 使用相同的 prefix 配置
+   - 跨端一致场景使用集中存储（Redis）
+   - Cookie 场景使用相同的 cookie name 和 domain
+
+2. **版本兼容性检查**：
+   - 确保所有使用的 SDK 版本支持所需特性
+   - 参考 `CAPABILITIES.md` 矩阵进行版本选择
+   - 避免使用低版本 SDK 不支持的特性
+
+3. **监控告警**：
+   - 监控各端变体分配比例一致性
+   - 设置异常波动告警（如某端分配比例偏差 > 5%）
+   - 监控 `stickyBucketUsed` 指标（应接近 100% 对已有用户）
+
+#### B.4.3 跨端一致场景配置指南
+
+**场景 1：前后端一致（浏览器 + Node.js）**
+```
+配置要点：
+- 前端：BrowserCookieStickyBucketService(prefix="gb_")
+- 后端：ExpressCookieStickyBucketService(prefix="gb_")
+- Cookie：domain=.yourdomain.com，path=/
+- 一致性：✅ 100%（同一浏览器请求）
+```
+
+**场景 2：微服务一致（Python + Go + Node.js）**
+```
+配置要点：
+- 所有服务：RedisStickyBucketService（同一 Redis 实例）
+- 所有服务：相同的 prefix 配置
+- 一致性：✅ 100%（集中存储）
+- 注意：序列化/反序列化格式一致（JSON）
+```
+
+**场景 3：跨设备一致（Web + App）**
+```
+配置要点：
+- hashAttribute: "userId"
+- fallbackAttribute: "deviceId" / "cookieId"
+- 存储：集中式 Redis
+- 一致性：✅ 登录后一致，未登录按设备
+- 注意：登录后触发"升级"逻辑
+```
+
+---
+
+## 附录 C：核心一致性验证测试用例速查
+
+### C.1 Hash 算法验证（12 个用例）
+
+| seed | value | version | expected |
+|------|-------|---------|----------|
+| "" | "" | 1 | 0.361 |
+| "test" | "abc" | 1 | 0.619 |
+| "test" | "abc" | 2 | 0.5069 |
+| "foo" | "bar" | 2 | 0.6281 |
+| ... | ... | ... | ... |
+
+### C.2 粘性分桶关键验证点
+
+| 测试场景 | 预期结果 | 用例位置 |
+|---------|---------|---------|
+| 无 hashAttribute，使用 fallback | fallback 生效，stickyBucketUsed=false | cases.json:6273-6309 |
+| 有粘性分配，跳过过滤 | 使用粘性分配，stickyBucketUsed=true | cases.json:6366-6424 |
+| fallback → hashAttribute 升级 | 同时写入两个文档 | cases.json:6488-6552 |
+| hashAttribute 优先级高于 fallback | 使用 hashAttribute 的分配 | cases.json:6554-6624 |
+| bucketVersion 变更重置 | 重新计算，stickyBucketUsed=false | cases.json:6627-6686 |
+| minBucketVersion 阻挡 | 返回 null，不保存新分配 | cases.json:6688-6736 |
+| disableStickyBucketing=true | 忽略粘性分配 | cases.json:6980-7037 |
+
+### C.3 跨 SDK 版本兼容性检查
+
+| 特性 | JavaScript 最低 | Python 最低 | Go 最低 |
+|------|---------------|------------|---------|
+| Sticky Bucketing | 0.32.0 | 1.1.0 | 0.2.3 |
+| Hash v2 | 0.23.0 | 1.0.0 | 0.1.4 |
+| Prerequisites | 0.34.0 | 1.1.0 | 0.2.0 |
+| Saved Groups | 1.1.0 | 1.2.1 | 0.2.0 |
+| Async Client | -（Node.js 1.2.0+） | 1.2.0 | -（原生支持） |
