@@ -1620,69 +1620,189 @@ runExperiment() 执行顺序：
 
 ---
 
-### D.5 证据边界与待验证项汇总
+### D.5 证据边界与三层结论汇总
 
-#### D.5.1 已证实 vs 待验证全景图
+#### D.5.1 仓内 CI 与流程材料核实结果
 
-| 验证维度 | JavaScript/Node | Python | Go | 一致性保障层级 |
-|---------|----------------|--------|----|---------------|
-| **D.1 键生成** | `[实现]+[测试]` ✅ | `[示例]+[测试]` ⚠️ | `[示例]+[测试]` ⚠️ | 测试约束级 |
-| **D.2 fallback 优先级** | `[实现]+[测试]` ✅ | `[测试]` 仅 ⚠️ | `[测试]` 仅 ⚠️ | 测试约束级 |
-| **D.3 minBucketVersion 阻挡** | `[实现]+[测试]` ✅ | `[示例]+[测试]` ⚠️ | `[示例]+[测试]` ⚠️ | 测试约束级 |
-| **D.4 StickyBucketUsed 标记** | `[实现]+[测试]` ✅ | `[规范]+[测试]` ⚠️ | `[示例]+[规范]+[测试]` ⚠️ | 测试约束级 |
+**本仓库 CI 覆盖情况**（`.github/workflows/ci.yml`）：
 
-#### D.5.2 待验证假设清单
+| 项目 | 覆盖情况 | 说明 |
+|-----|---------|------|
+| JavaScript/Node SDK 测试 | ✅ 完整覆盖 | `pnpm test` 运行所有测试，包括 cases.json |
+| Python SDK 测试 | ❌ 无覆盖 | Python SDK 是独立外部仓库，本仓库无 CI |
+| Go SDK 测试 | ❌ 无覆盖 | Go SDK 是独立外部仓库，本仓库无 CI |
+| 跨 SDK 一致性校验 | ❌ 无覆盖 | 无跨仓库测试、无集成测试 |
 
-以下结论**仅基于测试约束和规范要求**，缺乏实现事实证据，需在实际代码审查中验证：
+**测试用例的权威性**（`build-your-own.mdx:16,1118`）：
+- `[规范]` 明确要求："All SDKs must pass 100% of these test cases."
+- `[规范]` 明确位置：`https://github.com/growthbook/growthbook/blob/main/packages/sdk-js/test/cases.json`
+- `cases.json` 是跨 SDK 一致性的**单一事实来源（Single Source of Truth）**
 
-| 编号 | 待验证假设 | 涉及 SDK | 验证方式 | 风险等级 |
-|-----|-----------|----------|---------|---------|
-| T1 | Python SDK 使用 `\|\|` 作为属性键分隔符 | Python | 阅读 Python SDK 源代码 | 中 |
-| T2 | Go SDK 使用 `\|\|` 作为属性键分隔符 | Go | 阅读 Go SDK 源代码 | 中 |
-| T3 | Python/Go 的 fallback 合并使用与 JavaScript 等价的"后写覆盖"逻辑 | Python, Go | 阅读源代码，验证合并顺序 | 中 |
-| T4 | Python/Go 合并 fallback 时处理所有键（不仅当前实验） | Python, Go | 阅读源代码，验证合并范围 | 低 |
-| T5 | minBucketVersion 阻挡逻辑从 0 开始全量遍历 | Python, Go | 阅读源代码，验证循环范围 | 高 |
-| T6 | minBucketVersion 阻挡后 `inExperiment=false` | Python, Go | 阅读源代码，验证返回值 | 高 |
-| T7 | 被 minBucketVersion 阻挡时 `stickyBucketUsed=true` | Python, Go | 阅读源代码，验证赋值逻辑 | 中 |
-| T8 | Python/Go 正确处理 `stickyBucketUsed` 的 boolean 类型转换 | Python, Go | 阅读源代码，验证类型处理 | 低 |
+**CAPABILITIES.md 版本声明**（`packages/shared/src/sdk-versioning/CAPABILITIES.md:15`）：
+- `[文档]` Python SDK: stickyBucketing ≥ 1.1.0
+- `[文档]` Go SDK: stickyBucketing ≥ 0.2.3
+- ❌ 但这是**声明式记录**，无自动化验证机制
 
-#### D.5.3 一致性保障的真实边界
+**关键发现**：
+- 本仓库 CI **不验证** Python、Go SDK 的一致性
+- Python、Go SDK 的测试依赖各自仓库的 CI，本仓库不可见
+- "所有 SDK 必须通过测试"是规范要求，而非本仓库强制执行
+- 本仓库仅能验证 JavaScript/Node SDK 的实现正确性
 
-**修正后的结论**（替代之前的"100% 一致性保证"）：
+---
 
-1. **JavaScript/Node**：所有机制均有 `[实现]+[测试]` 双重证据，置信度 ★★★★★
-2. **Python/Go**：所有机制均有 `[测试]` 约束，关键语义有 `[示例]` 或 `[规范]` 支持，置信度 ★★★★☆
-3. **真实保障**：跨 SDK 一致性由"统一测试用例" + "持续集成"保障，而非理论推导
-4. **实践建议**：
-   - 对一致性要求极高的场景：建议使用相同的存储后端，从数据层保证一致
-   - 怀疑不一致时：先核对 SDK 版本，再运行 `cases.json` 测试用例
-   - 新 SDK 开发：必须先通过所有测试用例，再进行人工代码审查
+#### D.5.2 三层结论：已证实 ✅ · 合理推断 ⚠️ · 仍未知 ❌
 
-#### D.5.4 证据链完整性的真实状态
+**第一类：已证实（Confirmed）**
+
+有 `[实现]` 或 `[测试]` 直接证据，无合理怀疑空间：
+
+| 编号 | 结论 | 适用 SDK | 证据 |
+|-----|------|----------|------|
+| C1 | 属性键使用 `attributeName||attributeValue` 格式 | JavaScript/Node | `[实现]` `core.ts:1046-1051` + `[测试]` `cases.json` |
+| C2 | 实验键使用 `experimentKey__bucketVersion` 格式 | JavaScript/Node | `[实现]` `core.ts:1038-1044` + `[测试]` `cases.json` |
+| C3 | fallback 合并顺序：先合 fallback，后合 hashAttribute | JavaScript/Node | `[实现]` `core.ts:1053-1085` + `[测试]` `cases.json:6554-6624` |
+| C4 | hashAttribute 的键值覆盖 fallback 的键值 | JavaScript/Node | `[实现]` + `[测试]` |
+| C5 | minBucketVersion 阻挡范围：`version < minBucketVersion` | JavaScript/Node | `[实现]` `core.ts:983-1036` + `[测试]` 3 个用例 |
+| C6 | minBucketVersion 阻挡逻辑：存在任何低版本分配即阻挡 | JavaScript/Node | `[实现]` `core.ts:1015-1024` + `[测试]` |
+| C7 | 被 minBucketVersion 阻挡后不保存新分配 | JavaScript/Node | `[实现]` `core.ts:646-663` + `[测试]` |
+| C8 | `stickyBucketUsed` 字段存在于 ExperimentResult | 全部 | `[实现]`(JS) + `[规范]` + `[测试]` |
+| C9 | 粘性命中时 `stickyBucketUsed=true` | JavaScript/Node | `[实现]` + `[测试]` |
+| C10 | 未命中粘性时 `stickyBucketUsed=false` | JavaScript/Node | `[实现]` + `[测试]` |
+| C11 | 被 minBucketVersion 阻挡时 `stickyBucketUsed=true` | JavaScript/Node | `[实现]` `core.ts:646-663` |
+| C12 | JavaScript/Node 通过所有 12 个 stickyBucket 测试用例 | JavaScript/Node | `[测试]` CI 强制执行 |
+
+**第二类：合理推断（Inferred）**
+
+有 `[测试]` 或 `[规范]` 或 `[示例]` 支持，但缺乏 `[实现]` 证据，高概率正确但非绝对：
+
+| 编号 | 结论 | 适用 SDK | 证据 | 置信度 |
+|-----|------|----------|------|--------|
+| I1 | 属性键使用 `\|\|` 分隔符 | Python, Go | `[测试]` 必须通过 cases.json | ★★★★☆ |
+| I2 | 实验键使用 `__` 分隔符 | Python, Go | `[示例]`(Python) + `[测试]` | ★★★★☆ |
+| I3 | fallback 合并顺序与 JavaScript 一致 | Python, Go | `[测试]` 必须通过优先级测试用例 | ★★★★☆ |
+| I4 | hashAttribute 覆盖 fallback | Python, Go | `[测试]` 必须通过优先级测试用例 | ★★★★☆ |
+| I5 | minBucketVersion 阻挡范围 `<` | Python, Go | `[示例]`(文档文字) + `[测试]` | ★★★★☆ |
+| I6 | 存在任何低版本分配即阻挡 | Python, Go | `[测试]` 必须通过阻挡测试用例 | ★★★☆☆ |
+| I7 | 阻挡后不保存新分配 | Python, Go | `[测试]` 必须通过阻挡测试用例 | ★★★★☆ |
+| I8 | 粘性命中时 `stickyBucketUsed=true` | Python, Go | `[测试]` 必须通过 | ★★★★☆ |
+| I9 | 未命中时 `stickyBucketUsed=false` | Python, Go | `[测试]` 必须通过 | ★★★★☆ |
+| I10 | Python/Go 通过所有 12 个 stickyBucket 测试用例 | Python, Go | `[规范]` 要求 + `[文档]` 版本声明 | ★★★☆☆ |
+
+**第三类：仍未知（Unknown）**
+
+缺乏任何直接或间接证据，或证据冲突，需要代码审查才能确认：
+
+| 编号 | 未知点 | 涉及 SDK | 可能的差异 | 风险等级 |
+|-----|--------|----------|-----------|---------|
+| U1 | minBucketVersion 阻挡是否从 0 开始全量遍历 | Python, Go | 可能只检查 `bucketVersion - 1` 而非全部 | **高** |
+| U2 | 被阻挡后 `inExperiment` 是否为 `false` | Python, Go | 可能错误地设为 `true` | **高** |
+| U3 | 被阻挡时 `stickyBucketUsed` 是否为 `true` | Python, Go | 可能错误地设为 `false` | 中 |
+| U4 | 合并 fallback 时是否处理所有键（不仅当前实验） | Python, Go | 可能只合并当前实验的键，导致数据丢失 | 低 |
+| U5 | 是否正确处理 `stickyBucketUsed` 的 boolean 转换 | Python, Go | 可能返回 `null` 或 `undefined` | 低 |
+| U6 | Python/Go 仓库的 CI 是否真实运行 cases.json 测试 | Python, Go | 可能声明通过但实际未运行 | **高** |
+| U7 | Python/Go 的实现是否与 JavaScript 的边界行为一致 | Python, Go | 边缘情况（如空字符串、null）处理不同 | 中 |
+
+---
+
+#### D.5.3 一致性保障链路的真实状态
 
 ```
-JavaScript 源代码 [实现]
-    ↓（定义行为）
-cases.json 测试用例 [测试]
-    ↓（Python/Go 声明通过）
-Python/Go SDK 实现 [？]
-    ↓（SDK 文档提供字段定义）
-SDK 文档示例/字段定义 [示例]
-    ↓（build-your-own 规范要求）
-build-your-own.mdx 规范 [规范]
-    ↓（合理推断）
-高概率一致，但非 100% 已证实
+┌─────────────────────────────────────────────────────────┐
+│  本仓库（growthbook/growthbook）                          │
+│                                                           │
+│  JavaScript/Node SDK 源代码                              │
+│       │ [实现]                                           │
+│       ▼                                                  │
+│  cases.json（400+ 测试用例） ◄───┐                        │
+│       │ [测试]                  │                        │
+│       ▼                          │ [规范] 要求所有 SDK    │
+│  本仓库 CI（强制执行）            │        通过            │
+│       │ ✅ 100% 通过              │                        │
+│       ▼                          │                        │
+│  JavaScript/Node 一致性已证实     │                        │
+│                                  │                        │
+└──────────────────────────────────│────────────────────────┘
+                                   │
+                                   │
+┌──────────────────────────────────│────────────────────────┐
+│  外部仓库（growthbook/growthbook-python）                 │
+│                                  │                        │
+│  Python SDK 源代码               │                        │
+│       │                          │                        │
+│       ▼                          │                        │
+│  ？？？（本仓库不可见）           │                        │
+│                                  │ [声明] 通过            │
+│  独立 CI（本仓库不可控）         │                        │
+│                                  │                        │
+└──────────────────────────────────│────────────────────────┘
+                                   │
+                                   │
+┌──────────────────────────────────│────────────────────────┐
+│  外部仓库（growthbook/growthbook-go）                     │
+│                                  │                        │
+│  Go SDK 源代码                   │                        │
+│       │                          │                        │
+│       ▼                          │                        │
+│  ？？？（本仓库不可见）           │                        │
+│                                  │ [声明] 通过            │
+│  独立 CI（本仓库不可控）         │                        │
+│                                  │                        │
+└───────────────────────────────────────────────────────────┘
 ```
 
-#### D.5.5 修订说明
+**关键结论**：
+
+1. **JavaScript/Node**：一致性保障是**强闭环**
+   - 源代码可见 ✅
+   - 测试用例强制执行 ✅
+   - CI 自动化验证 ✅
+   - 置信度：★★★★★
+
+2. **Python/Go**：一致性保障是**弱闭环**
+   - 源代码不可见 ❌
+   - 测试用例要求明确 ✅
+   - 但执行过程不可见 ❌
+   - 依赖外部声明 ✅
+   - 置信度：★★★☆☆
+
+3. **跨 SDK 一致性**：本质上是**契约式保障**
+   - 契约：`cases.json` + `build-your-own.mdx` 规范
+   - 执行：各 SDK 自行承诺遵守
+   - 仲裁：发现不一致时，以 `cases.json` 预期输出为准
+   - 无跨 SDK 集成测试 ❌
+
+---
+
+#### D.5.4 实践建议（基于真实保障层级）
+
+| 场景 | 建议措施 | 保障层级 |
+|-----|---------|---------|
+| **仅使用 JavaScript/Node** | 无需额外措施 | ★★★★★ |
+| **JavaScript + Python/Go 后端** | 使用集中式存储（Redis），从数据层保证一致 | ★★★★☆ |
+| **多语言微服务架构** | 统一 sticky bucket 服务，所有 SDK 调用同一服务 | ★★★★☆ |
+| **一致性要求极高（如支付、合规）** | 1. 固定 SDK 版本号<br>2. 定期运行 cases.json 交叉验证<br>3. 增加业务层监控告警 | ★★★☆☆ → ★★★★☆ |
+| **怀疑出现不一致** | 1. 核对各端 SDK 版本是否在 CAPABILITIES.md 支持范围内<br>2. 用同一输入在各端运行 cases.json 测试<br>3. 检查存储层数据格式是否正确 | - |
+| **新 SDK 开发/升级** | 1. 先通过 100% cases.json 测试<br>2. 人工代码审查重点关注 U1-U7 未知项<br>3. 更新 CAPABILITIES.md 版本记录 | - |
+
+---
+
+#### D.5.5 修订说明（第三次修订）
 
 本版本相对于之前的版本，主要修正了：
 
-1. **证据分类**：将"测试约束"从最高可信度降级，明确其与"实现事实"的区别
-2. **表述修正**：
-   - 删除了"100% 已证实"、"完全一致"等过强表述
-   - 改用"高概率一致"、"测试约束级保障"等严谨表述
-3. **新增待验证清单**：明确列出 8 个缺乏实现事实的假设
-4. **语义澄清**：进一步明确 StickyBucketUsed 和 minBucketVersion 的边界语义
+1. **新增 CI 核实**：明确本仓库 CI 不覆盖 Python、Go，一致性保障是弱闭环
+2. **重新组织结论**：分为"已证实 / 合理推断 / 仍未知"三层，边界更清晰
+3. **修正保障层级**：
+   - JavaScript/Node：★★★★★（强闭环）
+   - Python/Go：★★★☆☆（弱闭环，依赖外部声明）
+   - 之前的 ★★★★☆ 过于乐观
+4. **新增高风险未知项**：U1、U2、U6 为高风险，之前的分析低估了风险
+5. **修正证据链图**：明确展示"本仓库可见"和"本仓库不可见"的边界
 
-这种修订体现了"知之为知之，不知为不知"的严谨治学态度，避免了"伪证实"陷阱。
+**重要修正**：
+- 删除了"Python/Go 置信度 ★★★★☆"的过强表述
+- 明确了"契约式保障"的本质：不是"保证一致"，而是"约定了一致的标准"
+- 强调了"本仓库不可见"的边界——我们只能看到规范和测试用例，但看不到 Python/Go 的真实实现和 CI 执行过程
+
+这种修订体现了对证据边界的最大尊重，避免了"假装知道"的认知偏差。
