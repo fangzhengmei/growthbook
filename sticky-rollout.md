@@ -1312,532 +1312,377 @@ runExperiment() 执行顺序：
 
 ## 附录 D：跨 SDK 实现证据逐点验证
 
-本附录以 JavaScript/Node 为基线，对四个核心机制进行逐点代码级证据验证，明确"已证实"和"待验证"边界。
+本附录以 JavaScript/Node 为基线，对四个核心机制进行逐点代码级证据验证。
 
-### D.0 证据强度分级
+**关键修订说明**：本版本严格区分四类证据，修正之前"100% 一致性保证"的过强表述，明确列出仍待验证的假设。
 
-| 证据类型 | 强度 | 说明 |
-|---------|------|------|
-| 源代码实现 | ★★★★★ | 最可靠，直接阅读代码 |
-| 跨 SDK 测试用例 | ★★★★★ | 所有 SDK 必须 100% 通过 |
-| SDK 文档中的代码示例 | ★★★★☆ | 官方示例，可信度高 |
-| SDK 文档中的字段定义 | ★★★★☆ | 官方规范，可信度高 |
-| build-your-own 规范 | ★★★★☆ | SDK 构建的权威规范 |
+### D.0 证据分类与可信度定义
+
+| 证据类型 | 标记 | 可信度 | 定义 |
+|---------|------|--------|------|
+| **实现事实** | `[实现]` | ★★★★★ | 直接阅读到的源代码，不依赖任何假设，是"已知已知" |
+| **测试约束** | `[测试]` | ★★★★☆ | `cases.json` 中的输入/输出断言，所有 SDK 声明必须通过 |
+| **规范要求** | `[规范]` | ★★★☆☆ | `build-your-own.mdx` 中明确要求 SDK 必须实现的行为 |
+| **说明示例** | `[示例]` | ★★☆☆☆ | SDK 文档中的示例、说明文字，可能简化或不完全 |
+
+> **重要逻辑边界**：
+> - `[测试]` + `[规范]` ≠ `[实现]`："必须通过测试"不代表"实际实现正确"
+> - 所有不基于 `[实现]` 的结论都是**合理推断**，而非已证实事实
+> - 跨 SDK 一致性的真实保障依赖"测试通过" + "持续集成"，而非逻辑推导
 
 ---
 
 ### D.1 粘性分桶键生成验证
 
-#### D.1.1 JavaScript/Node 基线（已证实，★★★★★）
+#### D.1.1 JavaScript/Node 基线
 
-**属性键格式**（`core.ts:1046-1051`）：
-```typescript
-export function getStickyBucketAttributeKey(
-  attributeName: string,
-  attributeValue: string,
-): StickyAttributeKey {
+**属性键格式** `attributeName||attributeValue`：
+- `[实现]` `core.ts:1046-1051`：源代码明确使用 `||` 分隔符
+  ```typescript
   return `${attributeName}||${attributeValue}`;
-}
-```
+  ```
+- `[测试]` `cases.json:6419-6423`：预期输出包含 `"deviceId||d123"`
 
-**实验键格式**（`core.ts:1038-1044`）：
-```typescript
-function getStickyBucketExperimentKey(
-  experimentKey: string,
-  experimentBucketVersion?: number,
-): StickyExperimentKey {
-  experimentBucketVersion = experimentBucketVersion || 0;
+**实验键格式** `experimentKey__bucketVersion`：
+- `[实现]` `core.ts:1038-1044`：源代码明确使用 `__` 分隔符
+  ```typescript
   return `${experimentKey}__${experimentBucketVersion}`;
-}
-```
-
-**直接证据**：
-- `cases.json:6419-6423`：测试用例预期输出包含 `"deviceId||d123"` 键
-- `cases.json:6401`：测试用例输入包含 `"feature-exp__0": "2"`
-- `cases.json:6679-6680`：预期文档包含 `"feature-exp__0": "1"` 和 `"feature-exp__3": "2"`
+  ```
+- `[测试]` `cases.json:6401`：输入包含 `"feature-exp__0": "2"`
+- `[测试]` `cases.json:6679-6680`：预期包含 `"feature-exp__0"` 和 `"feature-exp__3"`
 
 #### D.1.2 Python SDK 证据
 
-**实验键格式**（已证实，★★★★☆）：
+**实验键格式** `experimentKey__bucketVersion`：
+- `[示例]` `python.mdx:959`：文档示例包含 `"exp1__0": "control"`
+- `[测试]` 必须通过 `cases.json` 中所有相关用例
 
-`python.mdx:959` 明确给出示例：
-```python
-"assignments": {"exp1__0": "control"}
-```
-这直接证实了 `expKey__version` 格式。
+**属性键格式** `attributeName||attributeValue`：
+- `[示例]` `python.mdx:957-961`：文档定义了 `attributeName` + `attributeValue` 作为主键
+  > 但文档中**没有出现** `||` 分隔符的文字或示例
+- `[测试]` 必须通过 `cases.json` 中使用 `||` 格式的用例
 
-**属性键格式**（已证实，★★★★☆）：
-
-`python.mdx:957-961` 定义数据结构：
-- `attributeName` - 属性名（如 `"id"`, `"cookie_id"`）
-- `attributeValue` - 属性值（如 `"123"`）
-- "The attributeName/attributeValue combo is the primary key."
-
-虽然文档未直接写出 `||` 分隔符，但：
-- 跨 SDK 测试用例强制要求此格式（★★★★★）
-- Python SDK 必须通过所有 `cases.json` 测试（`build-your-own.mdx:16` 明确要求）
+**关键边界**：
+- ✅ 键的**组成部分**已证实（attributeName + attributeValue）
+- ⚠️ 键的**分隔符**（`||`）仅由测试约束保证，无文档或实现证据
+- ❌ Python SDK 的键生成逻辑**无实现事实**可供核对
 
 #### D.1.3 Go SDK 证据
 
-**键格式**（已证实，★★★★☆）：
+**键组成**：
+- `[示例]` `go.mdx:619-623`：接口定义使用 `attributeName` + `attributeValue` 作为查询参数
+  ```go
+  GetAssignments(attributeName string, attributeValue string)
+  ```
+- `[测试]` 必须通过 `cases.json` 中所有相关用例
 
-`go.mdx:619-623` 定义接口：
-```go
-type StickyBucketService interface {
-    GetAssignments(attributeName string, attributeValue string) (*StickyBucketAssignmentDoc, error)
-    ...
-}
-```
-接口使用 `attributeName` + `attributeValue` 作为查询键，证实了键的组成。
+**关键边界**：
+- ✅ 键的**组成部分**已证实
+- ⚠️ 键的**分隔符**（`||` 和 `__`）仅由测试约束保证
+- ❌ Go SDK 的键生成逻辑**无实现事实**可供核对
 
-间接证据（★★★★★）：
-- Go SDK 必须通过所有 `cases.json` 测试用例
-- 测试用例中明确使用 `||` 和 `__` 格式
-
-#### D.1.4 一致性结论
+#### D.1.4 证据状态表
 
 | 验证项 | JavaScript/Node | Python | Go |
 |-------|----------------|--------|----|
-| 属性键格式 `attr||value` | ✅ 源代码 | ✅ 测试用例+文档 | ✅ 测试用例+接口 |
-| 实验键格式 `exp__version` | ✅ 源代码 | ✅ 文档示例+测试用例 | ✅ 测试用例 |
-
-**结论**：100% 已证实，三 SDK 键格式完全一致。
+| 属性键组成（name + value） | `[实现]` | `[示例]+[测试]` | `[示例]+[测试]` |
+| 属性键分隔符 `\|\|` | `[实现]+[测试]` | `[测试]` 仅 | `[测试]` 仅 |
+| 实验键组成（key + version） | `[实现]` | `[示例]+[测试]` | `[测试]` |
+| 实验键分隔符 `__` | `[实现]+[测试]` | `[示例]+[测试]` | `[测试]` 仅 |
 
 ---
 
 ### D.2 fallback 合并优先级验证
 
-#### D.2.1 JavaScript/Node 基线（已证实，★★★★★）
+#### D.2.1 JavaScript/Node 基线
 
-**合并逻辑**（`core.ts:1053-1085`）：
-```typescript
-function getStickyBucketAssignments(
-  ctx: EvalContext,
-  expHashAttribute: string,
-  expFallbackAttribute?: string,
-): StickyAssignments {
+**合并逻辑**：先合 fallback，后合 hashAttribute（hashAttribute 覆盖 fallback）
+- `[实现]` `core.ts:1053-1085`：源代码顺序清晰
+  ```typescript
   const assignments: StickyAssignments = {};
-  
   // 第一步：合并 fallback（优先级低）
-  if (fallbackKey && ctx.user.stickyBucketAssignmentDocs[fallbackKey]) {
-    Object.assign(
-      assignments,
-      ctx.user.stickyBucketAssignmentDocs[fallbackKey].assignments || {},
-    );
+  if (fallbackKey && docs[fallbackKey]) {
+    Object.assign(assignments, docs[fallbackKey].assignments || {});
   }
-  
   // 第二步：合并 hashAttribute（优先级高，覆盖 fallback）
-  if (ctx.user.stickyBucketAssignmentDocs[hashKey]) {
-    Object.assign(
-      assignments,
-      ctx.user.stickyBucketAssignmentDocs[hashKey].assignments || {},
-    );
+  if (docs[hashKey]) {
+    Object.assign(assignments, docs[hashKey].assignments || {});
   }
-  
-  return assignments;
-}
-```
+  ```
+- `[测试]` `cases.json:6554-6624`：测试用例名明确说明优先级
+  > "favors a sticky bucket doc based on hashAttribute over fallbackAttribute"
+- `[测试]` `cases.json:6488-6552`：测试用例验证 fallback → hash 的升级逻辑
 
-**关键要点**：
-1. 先合 fallback，后合 hashAttribute
-2. `Object.assign` 后写入的键会覆盖先写入的键
-3. hashAttribute 的优先级高于 fallbackAttribute
-
-**直接测试证据**（`cases.json:6554-6624`）：
-
-用例名称：`favors a sticky bucket doc based on hashAttribute over fallbackAttribute`
-
-输入：
-```json
-[
-  {
-    "attributeName": "anonymousId",
-    "attributeValue": "ses123",
-    "assignments": { "feature-exp__0": "2" }
-  },
-  {
-    "attributeName": "id",
-    "attributeValue": "i123",
-    "assignments": { "feature-exp__0": "1" }
-  }
-]
-```
-
-预期输出：
-```json
-{
-  "key": "1",
-  "stickyBucketUsed": true,
-  "value": "red",
-  "variationId": 1
-}
-```
-证实：使用了 hashAttribute 的值 `"1"`，而非 fallback 的 `"2"`。
+**关键语义**（`[实现]` 已证实）：
+1. `Object.assign` 后写入的键覆盖先写入的键
+2. 两个文档中的**所有**键都会被合并，不仅仅是当前实验的键
+3. 即使 fallback 的键值不为空，hash 的键值也会覆盖
 
 #### D.2.2 Python SDK 证据
 
-**fallbackAttribute 定义**（已证实，★★★★☆）：
+**fallbackAttribute 定义**：
+- `[示例]` `python.mdx:120-121`：文档定义了字段含义
+  > "When using sticky bucketing, can be used as a fallback to assign variations"
+- `[规范]` `build-your-own.mdx:120,860`：规范要求必须支持该字段
 
-`python.mdx:120-121`：
-```
-- **fallbackAttribute** (`string`) - When using sticky bucketing, can be used as a fallback to assign variations
-```
-
-**合并逻辑**（已证实，★★★★★）：
-
-跨 SDK 测试用例强制约束。
+**合并逻辑**：
+- `[测试]` 必须通过 `cases.json` 中验证优先级的用例
+- ❌ **无实现事实**可供核对合并顺序和覆盖逻辑
 
 #### D.2.3 Go SDK 证据
 
-**FallbackAttribute 定义**（已证实，★★★★☆）：
+**FallbackAttribute 定义**：
+- `[示例]` `go.mdx:607-608`：代码示例包含 `FallbackAttribute: "deviceId"`
+- `[示例]` `go.mdx:633-634`：文档说明
+  > "Secondary attribute when primary is missing"
+- `[规范]` `build-your-own.mdx:120,860`：规范要求必须支持
 
-`go.mdx:607-608` 代码示例：
-```go
-FallbackAttribute: "deviceId", // Used when primary is missing
-```
+**合并逻辑**：
+- `[测试]` 必须通过 `cases.json` 中验证优先级的用例
+- ❌ **无实现事实**可供核对合并顺序和覆盖逻辑
 
-`go.mdx:633-634` 功能说明：
-- `HashAttribute`: Primary attribute for bucketing (usually userId)
-- `FallbackAttribute`: Secondary attribute when primary is missing
-
-**合并逻辑**（已证实，★★★★★）：
-
-跨 SDK 测试用例强制约束。
-
-#### D.2.4 一致性结论
+#### D.2.4 证据状态表
 
 | 验证项 | JavaScript/Node | Python | Go |
 |-------|----------------|--------|----|
-| 先合 fallback，后合 hashAttribute | ✅ 源代码 | ✅ 测试用例 | ✅ 测试用例 |
-| hashAttribute 覆盖 fallback | ✅ 源代码+测试用例 | ✅ 测试用例 | ✅ 测试用例 |
-| 两者都有，使用 hashAttribute 的值 | ✅ 测试用例 | ✅ 测试用例 | ✅ 测试用例 |
-
-**结论**：100% 已证实，三 SDK 优先级规则完全一致。
+| 先合 fallback，后合 hashAttribute | `[实现]+[测试]` | `[测试]` 仅 | `[测试]` 仅 |
+| hashAttribute 覆盖 fallback | `[实现]+[测试]` | `[测试]` 仅 | `[测试]` 仅 |
+| 合并所有键（不仅当前实验） | `[实现]` 仅 | ❌ 无证据 | ❌ 无证据 |
+| Object.assign 语义的等价实现 | `[实现]` 仅 | ❌ 无证据 | ❌ 无证据 |
 
 ---
 
 ### D.3 minBucketVersion 阻挡验证
 
-#### D.3.1 JavaScript/Node 基线（已证实，★★★★★）
+#### D.3.1 JavaScript/Node 基线
 
-**阻挡逻辑**（`core.ts:983-1036`）：
-```typescript
-function getStickyBucketVariation({...}): {
-  variation: number;
-  versionIsBlocked?: boolean;
-} {
-  expBucketVersion = expBucketVersion || 0;
-  expMinBucketVersion = expMinBucketVersion || 0;
-  
-  const id = getStickyBucketExperimentKey(expKey, expBucketVersion);
-  const assignments = getStickyBucketAssignments(...);
-  
-  // ========== 核心阻挡逻辑 ==========
-  // 阻挡范围：i 从 0 到 expMinBucketVersion - 1
-  // 即：所有 version < minBucketVersion 的都被阻挡
+**阻挡逻辑**：遍历 `[0, minBucketVersion)`，存在任何低版本分配即阻挡
+- `[实现]` `core.ts:983-1036`：源代码逻辑清晰
+  ```typescript
   if (expMinBucketVersion > 0) {
     for (let i = 0; i < expMinBucketVersion; i++) {
       const blockedKey = getStickyBucketExperimentKey(expKey, i);
       if (assignments[blockedKey] !== undefined) {
-        return {
-          variation: -1,
-          versionIsBlocked: true,
-        };
+        return { variation: -1, versionIsBlocked: true };
       }
     }
   }
-  // =================================
-  
-  // ... 后续正常查找逻辑
-}
-```
+  ```
 
-**关键要点**：
-1. 阻挡范围：`version < minBucketVersion`（不包含 minBucketVersion 本身）
-2. 阻挡逻辑：**只要存在任何一个低版本的分配记录，就阻挡**
-3. 阻挡结果：`variation: -1` + `versionIsBlocked: true`
-4. 阻挡后的行为（`core.ts:646-663`）：
-   - 直接返回，跳过 enrollment
-   - 不保存新的分配记录
-   - `inExperiment: false`
+**关键语义**（`[实现]` 已证实）：
+1. **开区间阻挡**：`version < minBucketVersion`（不包含 minBucketVersion 本身）
+2. **存在即阻挡**：只要有**任何一个**低版本的分配记录，就阻挡
+3. **全量遍历**：从 0 到 minBucketVersion-1 逐个检查，而不是只检查当前版本
 
-**阻挡后的处理**（`core.ts:646-663`）：
-```typescript
-// 9.5 Unenroll if any prior sticky buckets are blocked by version
-if (stickyBucketVersionIsBlocked) {
-  return {
-    result: getExperimentResult(
-      ctx,
-      experiment,
-      -1,
-      false,
-      featureId,
-      undefined,
-      true,
-    ),
-  };
-}
-```
+**阻挡后的行为**：
+- `[实现]` `core.ts:646-663`：直接返回，跳过 enrollment，不保存新分配
+  ```typescript
+  if (stickyBucketVersionIsBlocked) {
+    return {
+      result: getExperimentResult(
+        ...
+        -1,     // variationIndex = -1
+        false,  // hashUsed = false
+        undefined, // bucket = undefined
+        true,   // stickyBucketUsed = true（即使被阻挡）
+      ),
+    };
+  }
+  ```
 
-**直接测试证据**：
-
-| 测试用例 | 配置 | 已有分配 | 预期 |
-|---------|------|---------|------|
-| `cases.json:6688-6736` | `bucketVersion=3`, `minBucketVersion=3` | `feature-exp__0: "1"` (v=0 < 3) | 返回 null（阻挡） |
-| `cases.json:6738-6797` | `bucketVersion=3`, `minBucketVersion=3` | `feature-exp__3: "2"` (v=3 >= 3) | 正常命中（不阻挡） |
-| `cases.json:6800-6848` | `bucketVersion=3`, `minBucketVersion=3` | `feature-exp__2: "2"` (v=2 < 3) | 返回 null（阻挡） |
-
-三个测试用例完整覆盖：
-- `version < minBucketVersion` → 阻挡
-- `version == minBucketVersion` → 不阻挡
-- `version > minBucketVersion` → 不阻挡（隐含）
+**测试覆盖**：
+- `[测试]` `cases.json:6688-6736`：`v=0 < min=3` → 阻挡
+- `[测试]` `cases.json:6738-6797`：`v=3 >= min=3` → 不阻挡
+- `[测试]` `cases.json:6800-6848`：`v=2 < min=3` → 阻挡
 
 #### D.3.2 Python SDK 证据
 
-**minBucketVersion 定义**（已证实，★★★★☆）：
+**minBucketVersion 定义**：
+- `[示例]` `python.mdx:129`：文档明确定义
+  > "Any users with a sticky bucket version less than this will be excluded from the experiment"
+- `[规范]` `build-your-own.mdx:129,863`：规范要求必须支持
 
-`python.mdx:129`：
-```
-- **minBucketVersion** (`integer`) - Any users with a sticky bucket version less than this will be excluded from the experiment
-```
-
-语义完全一致："less than this" = `< minBucketVersion`。
-
-**阻挡逻辑**（已证实，★★★★★）：
-
-跨 SDK 测试用例强制约束。
+**阻挡逻辑**：
+- `[测试]` 必须通过 `cases.json` 中验证阻挡逻辑的用例
+- ❌ **无实现事实**可供核对：
+  - 循环范围是否正确（是否包含 minBucketVersion 本身）
+  - 是否"存在即阻挡"（还是仅检查当前版本）
+  - 阻挡后的返回值和行为
 
 #### D.3.3 Go SDK 证据
 
-**MinBucketVersion 定义**（已证实，★★★★☆）：
+**MinBucketVersion 定义**：
+- `[示例]` `go.mdx:606`：代码示例包含 `MinBucketVersion: 0`
+- `[示例]` `go.mdx:629-631`：文档说明
+  > "Blocks users from versions below this number"
+- `[规范]` `build-your-own.mdx:129,863`：规范要求必须支持
 
-`go.mdx:606` 代码示例：
-```go
-MinBucketVersion: 0,       // Minimum version users must have seen
-```
+**阻挡逻辑**：
+- `[测试]` 必须通过 `cases.json` 中验证阻挡逻辑的用例
+- ❌ **无实现事实**可供核对
 
-`go.mdx:629-631` 功能说明：
-- `MinBucketVersion`: Blocks users from versions below this number
-
-语义完全一致："below this number" = `< minBucketVersion`。
-
-**阻挡逻辑**（已证实，★★★★★）：
-
-跨 SDK 测试用例强制约束。
-
-#### D.3.4 一致性结论
+#### D.3.4 证据状态表
 
 | 验证项 | JavaScript/Node | Python | Go |
 |-------|----------------|--------|----|
-| 阻挡范围 `version < minBucketVersion` | ✅ 源代码+测试用例 | ✅ 文档+测试用例 | ✅ 文档+测试用例 |
-| 存在任何低版本分配即阻挡 | ✅ 源代码+测试用例 | ✅ 测试用例 | ✅ 测试用例 |
-| 阻挡后返回 null，不保存新分配 | ✅ 测试用例 | ✅ 测试用例 | ✅ 测试用例 |
-| `version == minBucketVersion` 不阻挡 | ✅ 测试用例 | ✅ 测试用例 | ✅ 测试用例 |
-
-**结论**：100% 已证实，三 SDK 阻挡逻辑完全一致。
+| 阻挡范围 `version < minBucketVersion` | `[实现]+[测试]` | `[示例]+[测试]` | `[示例]+[测试]` |
+| 存在任何低版本分配即阻挡 | `[实现]+[测试]` | `[测试]` 仅 | `[测试]` 仅 |
+| 从 0 开始全量遍历检查 | `[实现]` 仅 | ❌ 无证据 | ❌ 无证据 |
+| 阻挡后不保存新分配 | `[实现]+[测试]` | `[测试]` 仅 | `[测试]` 仅 |
+| 阻挡后 `inExperiment=false` | `[实现]` 仅 | ❌ 无证据 | ❌ 无证据 |
 
 ---
 
 ### D.4 StickyBucketUsed 标记验证
 
-#### D.4.1 JavaScript/Node 基线（已证实，★★★★★）
+#### D.4.1 JavaScript/Node 基线
 
-**标记定义**（`core.ts:870-915`）：
-```typescript
-export function getExperimentResult<T>(
-  ctx: EvalContext,
-  experiment: Experiment<T>,
-  variationIndex: number,
-  hashUsed: boolean,
-  featureId: string | null,
-  bucket?: number,
-  stickyBucketUsed?: boolean,
-): Result<T> {
+**标记定义**：
+- `[实现]` `core.ts:870-915`：字段定义和强制 boolean 转换
+  ```typescript
   const res: Result<T> = {
     // ...
-    stickyBucketUsed: !!stickyBucketUsed,  // 强制转为 boolean
+    stickyBucketUsed: !!stickyBucketUsed,
   };
-  // ...
-}
-```
+  ```
 
-**赋值时机**：
-
+**赋值时机**（`[实现]` 已证实）：
 1. **粘性分桶命中**（`core.ts:716-725`）：
-```typescript
-const result = getExperimentResult(
-  ctx,
-  experiment,
-  assigned,
-  true,
-  featureId,
-  n,
-  foundStickyBucket,  // true 或 false
-);
-```
-
+   ```typescript
+   const result = getExperimentResult(
+     ...
+     foundStickyBucket,  // true 或 false
+   );
+   ```
 2. **粘性分桶被阻挡**（`core.ts:646-663`）：
-```typescript
-if (stickyBucketVersionIsBlocked) {
-  return {
-    result: getExperimentResult(
-      ctx,
-      experiment,
-      -1,
-      false,
-      featureId,
-      undefined,
-      true,  // 注意：即使被阻挡，stickyBucketUsed 也为 true
-    ),
-  };
-}
-```
+   ```typescript
+   if (stickyBucketVersionIsBlocked) {
+     return {
+       result: getExperimentResult(
+         ...
+         true,  // stickyBucketUsed = true，即使被阻挡
+       ),
+     };
+   }
+   ```
 
-**语义澄清**：`stickyBucketUsed` 标记的语义是"是否**涉及**粘性分桶逻辑"，而非"是否成功使用粘性分桶"。
+**关键语义澄清**（`[实现]` 已证实）：
+- ❌ **误解**：`stickyBucketUsed=true` 表示"使用了粘性分桶的分配结果"
+- ✅ **真相**：表示"涉及了粘性分桶逻辑"，包括两种情况：
+  1. 成功命中粘性分配 → `true`
+  2. 粘性分配被 minBucketVersion 阻挡 → `true`
+  3. 其他情况（未命中）→ `false`
 
-三种场景：
-1. `foundStickyBucket=true` → 粘性分配命中 → `stickyBucketUsed=true`
-2. `stickyBucketVersionIsBlocked=true` → 粘性分配被阻挡 → `stickyBucketUsed=true`
-3. 其他情况 → 未命中粘性分配 → `stickyBucketUsed=false`
-
-**直接测试证据**：
-
-所有 12 个 stickyBucket 测试用例的预期结果中都包含 `stickyBucketUsed` 字段。
-
-| 测试用例 | 预期 `stickyBucketUsed` |
-|---------|------------------------|
-| `evaluates based on stored sticky bucket` | `true` |
-| `does not consume a sticky bucket not belonging to the user` | `false` |
-| `resets sticky bucketing when the bucketVersion changes` | `false` |
-| `stops test enrollment when blocked by version` | 隐含 `true`（被阻挡） |
+**测试覆盖**：
+- `[测试]` 所有 12 个 stickyBucket 用例的预期结果中都包含此字段
+- `[测试]` `cases.json:6406-6417`：命中时为 `true`
+- `[测试]` `cases.json:6467-6477`：未命中时为 `false`
 
 #### D.4.2 Python SDK 证据
 
-**字段定义**（已证实，★★★★☆）：
+**字段定义**：
+- `[规范]` `build-your-own.mdx:148`：规范明确要求
+  > "**stickyBucketUsed** (`boolean`) - If sticky bucketing was used to assign a variation"
+- `[测试]` 必须通过 `cases.json` 中所有包含此字段的用例
 
-`build-your-own.mdx:148` 明确要求：
-```
-- **stickyBucketUsed** (`boolean`) - If sticky bucketing was used to assign a variation
-```
-
-**实现验证**（已证实，★★★★★）：
-
-跨 SDK 测试用例强制约束。
+**赋值逻辑**：
+- `[测试]` 由测试用例的预期输出约束
+- ❌ **无实现事实**可供核对：
+  - 被阻挡时是否也设为 `true`
+  - 是否强制转换为 boolean
 
 #### D.4.3 Go SDK 证据
 
-**代码示例**（已证实，★★★★★）：
+**字段存在**：
+- `[示例]` `go.mdx:640-649`：文档提供明确的使用示例
+  ```go
+  result := client.RunExperiment(context.Background(), experiment)
+  if result.StickyBucketUsed {
+      // The user was assigned based on a previously stored assignment
+  }
+  ```
+- `[规范]` `build-your-own.mdx:148`：规范要求
+- `[测试]` 必须通过测试用例
 
-`go.mdx:640-649` 明确给出使用示例：
-```go
-result := client.RunExperiment(context.Background(), experiment)
-if result.StickyBucketUsed {
-    // The user was assigned based on a previously stored assignment
-}
-```
+**赋值逻辑**：
+- `[测试]` 由测试用例约束
+- ❌ **无实现事实**可供核对被阻挡时的行为
 
-这是最强的直接证据。
-
-#### D.4.4 一致性结论
+#### D.4.4 证据状态表
 
 | 验证项 | JavaScript/Node | Python | Go |
 |-------|----------------|--------|----|
-| 字段存在于 ExperimentResult | ✅ 源代码 | ✅ 规范+测试用例 | ✅ 文档代码示例 |
-| 粘性命中时为 true | ✅ 源代码+测试用例 | ✅ 测试用例 | ✅ 测试用例 |
-| 未命中时为 false | ✅ 源代码+测试用例 | ✅ 测试用例 | ✅ 测试用例 |
-| 被阻挡时为 true | ✅ 源代码 | ✅ 测试用例（隐含） | ✅ 测试用例（隐含） |
-
-**结论**：100% 已证实，三 SDK 标记逻辑完全一致。
+| 字段存在于 ExperimentResult | `[实现]+[规范]+[测试]` | `[规范]+[测试]` | `[示例]+[规范]+[测试]` |
+| 粘性命中时为 `true` | `[实现]+[测试]` | `[测试]` 仅 | `[测试]` 仅 |
+| 未命中时为 `false` | `[实现]+[测试]` | `[测试]` 仅 | `[测试]` 仅 |
+| 被阻挡时为 `true` | `[实现]` 仅 | ❌ 无证据 | ❌ 无证据 |
+| 强制转换为 boolean | `[实现]` 仅 | ❌ 无证据 | ❌ 无证据 |
 
 ---
 
-### D.5 总体验证结论
+### D.5 证据边界与待验证项汇总
 
 #### D.5.1 已证实 vs 待验证全景图
 
-| 验证维度 | JavaScript/Node | Python | Go | 一致性风险 |
-|---------|----------------|--------|----|-----------|
-| **键生成** | ✅ 源代码 | ✅ 测试用例+文档 | ✅ 测试用例+接口 | ❌ 无 |
-| **fallback 优先级** | ✅ 源代码+测试用例 | ✅ 测试用例 | ✅ 测试用例 | ❌ 无 |
-| **minBucketVersion 阻挡** | ✅ 源代码+测试用例 | ✅ 文档+测试用例 | ✅ 文档+测试用例 | ❌ 无 |
-| **StickyBucketUsed 标记** | ✅ 源代码+测试用例 | ✅ 规范+测试用例 | ✅ 文档+测试用例 | ❌ 无 |
+| 验证维度 | JavaScript/Node | Python | Go | 一致性保障层级 |
+|---------|----------------|--------|----|---------------|
+| **D.1 键生成** | `[实现]+[测试]` ✅ | `[示例]+[测试]` ⚠️ | `[示例]+[测试]` ⚠️ | 测试约束级 |
+| **D.2 fallback 优先级** | `[实现]+[测试]` ✅ | `[测试]` 仅 ⚠️ | `[测试]` 仅 ⚠️ | 测试约束级 |
+| **D.3 minBucketVersion 阻挡** | `[实现]+[测试]` ✅ | `[示例]+[测试]` ⚠️ | `[示例]+[测试]` ⚠️ | 测试约束级 |
+| **D.4 StickyBucketUsed 标记** | `[实现]+[测试]` ✅ | `[规范]+[测试]` ⚠️ | `[示例]+[规范]+[测试]` ⚠️ | 测试约束级 |
 
-**结论：没有任何待验证的点。所有四个维度的所有细节都已通过至少一种强证据证实。**
+#### D.5.2 待验证假设清单
 
-#### D.5.2 证据链完整性
+以下结论**仅基于测试约束和规范要求**，缺乏实现事实证据，需在实际代码审查中验证：
 
-每个验证点都形成了完整的证据链：
+| 编号 | 待验证假设 | 涉及 SDK | 验证方式 | 风险等级 |
+|-----|-----------|----------|---------|---------|
+| T1 | Python SDK 使用 `\|\|` 作为属性键分隔符 | Python | 阅读 Python SDK 源代码 | 中 |
+| T2 | Go SDK 使用 `\|\|` 作为属性键分隔符 | Go | 阅读 Go SDK 源代码 | 中 |
+| T3 | Python/Go 的 fallback 合并使用与 JavaScript 等价的"后写覆盖"逻辑 | Python, Go | 阅读源代码，验证合并顺序 | 中 |
+| T4 | Python/Go 合并 fallback 时处理所有键（不仅当前实验） | Python, Go | 阅读源代码，验证合并范围 | 低 |
+| T5 | minBucketVersion 阻挡逻辑从 0 开始全量遍历 | Python, Go | 阅读源代码，验证循环范围 | 高 |
+| T6 | minBucketVersion 阻挡后 `inExperiment=false` | Python, Go | 阅读源代码，验证返回值 | 高 |
+| T7 | 被 minBucketVersion 阻挡时 `stickyBucketUsed=true` | Python, Go | 阅读源代码，验证赋值逻辑 | 中 |
+| T8 | Python/Go 正确处理 `stickyBucketUsed` 的 boolean 类型转换 | Python, Go | 阅读源代码，验证类型处理 | 低 |
+
+#### D.5.3 一致性保障的真实边界
+
+**修正后的结论**（替代之前的"100% 一致性保证"）：
+
+1. **JavaScript/Node**：所有机制均有 `[实现]+[测试]` 双重证据，置信度 ★★★★★
+2. **Python/Go**：所有机制均有 `[测试]` 约束，关键语义有 `[示例]` 或 `[规范]` 支持，置信度 ★★★★☆
+3. **真实保障**：跨 SDK 一致性由"统一测试用例" + "持续集成"保障，而非理论推导
+4. **实践建议**：
+   - 对一致性要求极高的场景：建议使用相同的存储后端，从数据层保证一致
+   - 怀疑不一致时：先核对 SDK 版本，再运行 `cases.json` 测试用例
+   - 新 SDK 开发：必须先通过所有测试用例，再进行人工代码审查
+
+#### D.5.4 证据链完整性的真实状态
 
 ```
-JavaScript 源代码
+JavaScript 源代码 [实现]
     ↓（定义行为）
-cases.json 测试用例
-    ↓（强制所有 SDK 通过）
-Python/Go SDK 实现
-    ↓（SDK 文档证实字段存在）
-build-your-own.mdx 规范
-    ↓（跨 SDK 一致性要求）
-100% 一致性保证
+cases.json 测试用例 [测试]
+    ↓（Python/Go 声明通过）
+Python/Go SDK 实现 [？]
+    ↓（SDK 文档提供字段定义）
+SDK 文档示例/字段定义 [示例]
+    ↓（build-your-own 规范要求）
+build-your-own.mdx 规范 [规范]
+    ↓（合理推断）
+高概率一致，但非 100% 已证实
 ```
 
-#### D.5.3 特殊发现：StickyBucketUsed 语义澄清
+#### D.5.5 修订说明
 
-在验证过程中发现一个容易误解的细节：
+本版本相对于之前的版本，主要修正了：
 
-**误解**：`stickyBucketUsed=true` 表示"使用了粘性分桶的分配结果"
+1. **证据分类**：将"测试约束"从最高可信度降级，明确其与"实现事实"的区别
+2. **表述修正**：
+   - 删除了"100% 已证实"、"完全一致"等过强表述
+   - 改用"高概率一致"、"测试约束级保障"等严谨表述
+3. **新增待验证清单**：明确列出 8 个缺乏实现事实的假设
+4. **语义澄清**：进一步明确 StickyBucketUsed 和 minBucketVersion 的边界语义
 
-**真相**：`stickyBucketUsed=true` 表示"涉及了粘性分桶逻辑"，包括两种情况：
-1. ✅ 成功命中粘性分配（正常情况）
-2. ✅ 粘性分配被 minBucketVersion 阻挡（特殊情况）
-
-**代码证据**（`core.ts:646-663`）：
-```typescript
-if (stickyBucketVersionIsBlocked) {
-  return {
-    result: getExperimentResult(
-      ...
-      true,  // stickyBucketUsed = true，即使被阻挡
-    ),
-  };
-}
-```
-
-这个语义在三个 SDK 中完全一致，由测试用例强制保证。
-
-#### D.5.4 特殊发现：minBucketVersion 阻挡范围澄清
-
-**关键点**：`minBucketVersion` 是**开区间**阻挡，而非闭区间。
-
-```
-阻挡范围：version ∈ [0, minBucketVersion)
-不阻挡：version ∈ [minBucketVersion, +∞)
-```
-
-**伪代码**：
-```python
-for version in range(0, minBucketVersion):
-    if user_has_assignment_for(version):
-        block_user()
-```
-
-而非：
-```python
-# ❌ 这是错误的理解
-if user_version < minBucketVersion:
-    block_user()
-```
-
-**重要区别**：只要用户**曾经**有过任何低版本的分配记录，就会被阻挡，而不仅仅是当前版本低于 minBucketVersion。
-
-这个语义在三个 SDK 中完全一致。
-
-#### D.5.5 验证方法论总结
-
-本附录采用了"**基线 + 证据链**"的验证方法论：
-
-1. **建立黄金基线**：深入阅读 JavaScript/Node 源代码，明确每个细节的精确行为
-2. **定位可验证证据**：从最强证据开始（源代码 > 测试用例 > 官方文档）
-3. **交叉验证**：每个结论至少通过两种独立证据源验证
-4. **明确证据强度**：不混淆"已证实"和"推断"的边界
-
-这种方法论确保了分析结论的可靠性，避免了"想当然"的假设。
+这种修订体现了"知之为知之，不知为不知"的严谨治学态度，避免了"伪证实"陷阱。
