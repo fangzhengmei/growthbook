@@ -543,3 +543,217 @@ const gb = new GrowthBook({
 6. **阻止机制**：`blockedChangeIds`、`disableVisualExperiments`、`disableJsInjection`
 7. **自定义回调**：`applyDomChangesCallback` 接管逻辑
 
+---
+
+## 十、仓内可证据部分与扩展外未知部分区分
+
+### 10.1 仓内可证据部分（代码库中有完整实现）
+
+以下功能在代码库中有完整的源代码证据：
+
+| 模块 | 关键文件 | 功能描述 |
+|------|----------|----------|
+| 扩展检测 | `packages/front-end/components/OpenVisualEditorLink.tsx` | 通过 fetch 扩展内部资源探测扩展是否安装 |
+| 消息通信 | 同上 | 通过 `window.postMessage` 发送 `GB_REQUEST_OPEN_VISUAL_EDITOR` 消息 |
+| 数据结构 | `packages/shared/types/visual-changeset.d.ts` | `VisualChangesetInterface`、`VisualChange`、`DOMMutation` 类型定义 |
+| 验证器 | `packages/shared/src/validators/visual-changesets.ts` | 可视化变更集参数验证逻辑 |
+| 后端模型 | `packages/back-end/src/models/VisualChangesetModel.ts` | CRUD、变体绑定、SDK 负载刷新 |
+| 后端路由 | `packages/back-end/src/api/visual-changesets/*.ts` | REST API 接口定义 |
+| 变更回放 | `packages/sdk-js/src/GrowthBook.ts:1084-1110` | `_applyDOMChanges` 注入 CSS/JS 并调用 `dom-mutator` |
+| 生命周期管理 | `packages/sdk-js/src/GrowthBook.ts:676-802` | `_runAutoExperiment`、`_updateAllAutoExperiments` |
+| URL 匹配 | `packages/sdk-js/src/util.ts:86-182` | `isURLTargeted`、`_evalSimpleUrlTarget` |
+| 防闪烁 | `packages/sdk-js/src/auto-wrapper.ts:60-97` | `setAntiFlicker` / `unsetAntiFlicker` |
+| 安全控制 | `packages/sdk-js/src/GrowthBook.ts:1006-1055` | `_isAutoExperimentBlockedByContext` 各种开关 |
+| 测试用例 | `packages/sdk-js/test/visual-changes.test.ts` | 11 个完整的端到端测试场景 |
+
+### 10.2 扩展外未知部分（浏览器扩展代码不在此仓库）
+
+以下功能在浏览器扩展中实现，代码库中只有调用接口和数据格式约定：
+
+| 功能 | 接口约定 | 扩展内部实现（推测） |
+|------|----------|---------------------|
+| **DOM 选择器生成** | 输出标准 CSS 选择器字符串 | 从目标元素向上遍历 DOM 树，组合 id/class/标签名/nth-child |
+| **元素高亮交互** | 无直接代码证据 | 鼠标 hover 时添加高亮边框样式（如蓝色轮廓） |
+| **编辑器 UI 覆盖层** | 通过 `?vc-id=` URL 参数触发 | iframe 或 fixed 定位的侧边栏/工具栏 |
+| **拖拽重排交互** | `parentSelector` + `insertBeforeSelector` 格式 | HTML5 Drag & Drop API 监听拖拽事件 |
+| **实时预览** | 无直接代码证据 | 编辑时立即调用 `dom-mutator` 应用变更 |
+| **元素属性拾取** | `attribute` 字段约定为标准 HTML 属性名 | `element.getAttributeNames()` + 属性值读取 |
+| **选择器冲突检测** | 无直接代码证据 | 验证 `document.querySelectorAll(selector).length === 1` |
+
+> **边界说明**：代码库与扩展的交互边界在 `DOMMutation` 数据结构。扩展负责生成符合该结构的数据，代码库负责存储、分发和回放。扩展内部的选择器生成算法不影响 SDK 运行，只要输出的选择器能被 `document.querySelector` 正确解析即可。
+
+---
+
+## 十一、DOM 选择器生成依据（基于仓内证据反推）
+
+### 11.1 选择器必须满足的约束条件
+
+从 `dom-mutator` 库的接口规范（https://github.com/growthbook/dom-mutator）和测试用例反推，选择器必须满足：
+
+```
+约束1: 有效的 CSS 选择器语法
+  ↓ 必须能通过 document.querySelector(selector) 解析
+  ↓ 不能包含伪元素 ::before/::after（不可变）
+  ↓ 不能包含伪类 :hover/:active（运行时不生效）
+
+约束2: 可被 MutationObserver 持续监听
+  ↓ 选择器匹配的元素在 DOM 树中必须是可观察的
+  ↓ 支持 Shadow DOM（取决于 dom-mutator 实现）
+
+约束3: 唯一性
+  ↓ document.querySelectorAll(selector).length === 1
+  ↓ 若不唯一，dom-mutator 会应用到所有匹配元素
+```
+
+### 11.2 选择器生成优先级（从测试用例和类型反推）
+
+基于 `packages/sdk-js/test/visual-changes.test.ts` 中的测试数据和 `DOMMutation` 类型定义，扩展生成选择器的优先级应为：
+
+```
+优先级 1: id 属性 → "#submit-btn"
+  依据: id 在页面中唯一，解析速度最快，最稳定
+
+优先级 2: data-* 属性 → "[data-testid='checkout-button']"
+  依据: data-testid 等属性专为测试设计，不受样式变化影响
+
+优先级 3: 稳定 class 组合 → ".btn-primary.checkout"
+  依据: 多个 class 组合可提高唯一性
+
+优先级 4: 标签名 + 层级路径 → "header > nav > ul > li:nth-child(2)"
+  依据: 当无 id/data-* 属性时，使用 DOM 结构定位
+
+优先级 5: nth-child / nth-of-type → ".item:nth-child(3)"
+  依据: 同级元素无区分特征时的最后手段
+```
+
+### 11.3 `dom-mutator` 库声明式变更格式
+
+GrowthBook 官方维护的 `dom-mutator@0.6.0` 库定义了 `DeclarativeMutation` 格式（与 SDK 中 `DOMMutation` 完全兼容）：
+
+```typescript
+// 来自 dom-mutator 官方文档
+type DeclarativeMutation = {
+  selector: string;           // CSS 选择器
+  action: 'set' | 'append' | 'remove';  // 操作类型
+  attribute: 'html' | 'class' | 'position' | string;  // 目标属性
+  value?: string;             // 新值
+  parentSelector?: string;    // 拖拽目标父元素
+  insertBeforeSelector?: string;  // 插入位置参照
+};
+```
+
+**各 attribute 含义**：
+
+| attribute 值 | 对应 DOM API | 示例 |
+|--------------|--------------|------|
+| `html` | `element.innerHTML` | `<h1> → 替换为新标题` |
+| `class` | `element.classList` | 添加/移除 `.active` 类 |
+| `position` | `parent.insertBefore()` | 移动元素到新位置 |
+| 其他字符串 | `element.setAttribute()` | `href`, `src`, `title`, `data-*` |
+
+---
+
+## 十二、失败时排查边界
+
+### 12.1 选择器运行时失败场景
+
+dom-mutator 库的设计哲学是 **静默等待元素出现**，不会抛出异常。
+
+```
+场景 1: 选择器匹配不到元素
+  行为: dom-mutator 使用 MutationObserver 持续监听 DOM，元素出现后自动应用
+  排查点: 
+    - 检查元素是否是动态加载（如 SPA 路由切换后才渲染）
+    - 检查选择器是否拼写错误（大小写敏感）
+    - 检查元素是否在 Shadow DOM 或 iframe 中
+  超时: 无内置超时，一直等待到 destroy() 被调用
+
+场景 2: 选择器匹配到多个元素
+  行为: dom-mutator 将变更应用到所有匹配元素
+  排查点:
+    - 扩展生成选择器时是否做了唯一性验证
+    - 页面结构变更导致选择器精度下降
+    - 可通过浏览器控制台验证: document.querySelectorAll(selector).length
+
+场景 3: 元素被 React/Vue 重新渲染覆盖
+  行为: dom-mutator 监听目标元素的 MutationObserver，外部变更后自动重新应用
+  排查点:
+    - 检查是否频繁触发重渲染（导致性能问题）
+    - 可使用 mutate.attribute() 替代 mutate.html() 减少重绘
+```
+
+### 12.2 SDK 层面失败边界
+
+**可在代码库中找到证据的失败场景**：
+
+| 失败场景 | 判定位置 | 行为 | 排查点 |
+|----------|----------|------|--------|
+| **JS 注入被禁用** | `GrowthBook.ts:1068-1070` | 整个实验被阻止，不应用任何变更 | 检查 `disableJsInjection: true`，且变体包含 `js` 字段 |
+| **可视化实验被禁用** | `GrowthBook.ts:1064-1065` | 跳过所有可视化类型实验 | 检查 `disableVisualExperiments: true` |
+| **changeId 被屏蔽** | `GrowthBook.ts:1074-1076` | 按 ID 屏蔽特定变更 | 检查 `blockedChangeIds` 数组 |
+| **URL 不匹配** | `util.ts:86-182` | 不应用变更，或撤销已应用的变更 | 验证 `urlPatterns` 规则是否正确 |
+| **CSP 阻止脚本** | 无直接代码，需浏览器控制台查看 | JS 注入失败，CSS/DOM 变更可能仍生效 | 设置 `jsInjectionNonce` 或放宽 CSP |
+| **SSR 环境** | `GrowthBook.ts:1087` | `!isBrowser` 时直接 return | 检查是否在 Node.js 环境调用 |
+
+### 12.3 调试工具链
+
+**仓内可用的调试手段**：
+
+```javascript
+// 1. 查看当前激活的实验
+console.log(gb._activeAutoExperiments);  // Map<experiment, {undo, valueHash}>
+
+// 2. 自定义回调接管变更，打印调试信息
+const gb = new GrowthBook({
+  applyDomChangesCallback: (changes) => {
+    console.log('[GB Debug] Applying changes:', changes);
+    // 逐个验证选择器
+    changes.domMutations?.forEach(m => {
+      const el = document.querySelector(m.selector);
+      if (!el) console.warn('[GB Debug] Selector not found:', m.selector);
+    });
+    // 返回默认实现
+    return () => { /* 自定义撤销 */ };
+  }
+});
+
+// 3. 手动验证 URL 匹配
+import { isURLTargeted } from '@growthbook/growthbook';
+console.log(isURLTargeted(window.location.href, experiment.urlPatterns));
+
+// 4. 暂停/恢复 dom-mutator 的全局观察
+import { disconnectGlobalObserver, connectGlobalObserver } from 'dom-mutator';
+// 批量 DOM 操作前暂停，避免频繁重应用
+disconnectGlobalObserver();
+// ... 操作 DOM ...
+connectGlobalObserver();
+```
+
+### 12.4 典型排查路径
+
+```
+问题: 页面元素没有变更
+  ↓
+步骤1: 确认 SDK 初始化正常 → 检查 growthbook.loaded / 控制台错误
+  ↓ 否
+修正 SDK 配置（clientKey, apiHost）
+  ↓ 是
+步骤2: 确认用户被分配到实验变体 → console.log(gb.getExperimentValue(...))
+  ↓ 否
+检查 targeting 条件 / hashAttribute / 流量分配
+  ↓ 是
+步骤3: 确认 URL 匹配 → 调用 isURLTargeted() 验证
+  ↓ 否
+修正 urlPatterns 规则
+  ↓ 是
+步骤4: 确认选择器有效 → document.querySelector(selector) !== null
+  ↓ 否
+元素未渲染 / 选择器过期，重新在编辑器中选择
+  ↓ 是
+步骤5: 检查阻止开关 → disableVisualExperiments / disableJsInjection / blockedChangeIds
+  ↓ 否
+步骤6: 检查 CSP / 浏览器控制台错误
+  ↓
+最终定位到根因
+```
+
