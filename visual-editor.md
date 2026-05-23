@@ -388,27 +388,37 @@ function unsetAntiFlicker() {
         ↓  ✅ 仓内已证据
 3. 跳转到目标页面（带vc-id参数）
    https://target.com/page?vc-id=vcs_xxx&v-idx=1
-        ↓  ❓ 未知待验证（扩展内部逻辑）
+        ↓  ⚠️ 仓外推测（扩展API调用约定）
 4. 浏览器扩展检测到 vc-id 参数
-   ├─ [推测] 注入编辑器UI覆盖层到页面
-   ├─ [推测] 从GrowthBook API拉取变更集数据
-   └─ [推测] 初始化选择模式
-        ↓  ❓ 未知待验证（扩展内部逻辑）
+   ├─ ✅ 仓内已证据: 前端跳转时传递 ?vc-id=xxx 参数 (OpenVisualEditorLink.tsx:55-60)
+   ├─ ❓ 未知待验证: 扩展如何解析 URL 参数
+   ├─ ⚠️ 仓外推测: 扩展从 API 拉取变更集数据（路径见下文分层说明）
+   └─ ❓ 未知待验证: 扩展初始化选择模式的实现
+        ↓  ❓ 未知待验证（扩展内部交互逻辑）
 5. 用户选择页面元素（选择模式）
-   ├─ [推测] 扩展监听鼠标hover和click事件
-   ├─ [推测] 高亮目标元素
-   ├─ [推测] 捕获点击的 DOM 元素
-   └─ [推测] 生成 CSS 选择器
-        ↓  ❓ 未知待验证（扩展内部逻辑）
+   ├─ ❓ 未知待验证: 扩展监听鼠标hover和click事件的实现
+   ├─ ❓ 未知待验证: 扩展高亮目标元素的样式和方式
+   ├─ ❓ 未知待验证: 扩展捕获点击 DOM 元素的逻辑
+   └─ ❓ 未知待验证: 扩展生成 CSS 选择器的算法
+        ↓  ❓ 未知待验证（扩展内部交互逻辑）
 6. 用户编辑变体内容
-   ├─ 修改 InnerHTML / 属性 / CSS类
-   ├─ 或拖拽元素调整位置
-   ├─ [推测] 实时预览变更效果
-   └─ 生成 DOMMutation 对象
-        ↓  ✅ 仓内已证据
-7. 保存变更到后端（路径随调用方不同）
-   前端 UI 调用：PUT /visual-changesets/:id（JWT认证）
-   浏览器扩展调用：PUT /api/v1/visual-changesets/:id（API Key认证）
+   ├─ 编辑内容（HTML/属性/CSS类/拖拽）由用户操作生成
+   ├─ ❓ 未知待验证: 扩展实时预览变更效果的实现
+   └─ ✅ 仓内已证据: 生成的 DOMMutation 对象格式（类型定义）
+        ↓  ⚠️ 仓外推测（扩展API调用约定）
+7. 保存变更到后端（扩展调用路径分层说明）
+   ╭───────────────────────────────────────────────────────────╮
+   │ ✅ 仓内已证据: 前端传递 apiHost 和 apiKey 给扩展         │
+   │   (OpenVisualEditorLink.tsx:106-115)                    │
+   │ ✅ 仓内已证据: apiKey 是 visualEditor 角色的持久化密钥    │
+   │ ✅ 仓内已证据: /api/v1/* 路由支持 API Key 认证            │
+   │   (app.ts:369-376, authenticateApiRequestMiddleware.ts)  │
+   │ ⚠️ 仓外推测: 扩展应使用 Bearer <apiKey> 认证头             │
+   │ ⚠️ 仓外推测: 扩展应调用 /api/v1/visual-changesets/:id     │
+   │ ❓ 未知待验证: 扩展实际请求的完整URL和请求头               │
+   ╰───────────────────────────────────────────────────────────╯
+   前端 UI 调用（✅ 仓内已证据）: PUT /visual-changesets/:id（JWT认证）
+   浏览器扩展调用（⚠️ 仓外推测）: PUT /api/v1/visual-changesets/:id（API Key认证）
    {
      visualChanges: [{
        id: vc_xxx,
@@ -478,12 +488,12 @@ export const createVisualChangeset = async ({ experiment, ... }) => {
 
 **关键证据**：前端 `apiCall` 调用路径无 `/api/v1` 前缀（`auth.tsx:342`）→ `fetch(getApiHost() + url)`
 
-| 操作 | 方法 | 实际路径（单数/复数混用） | 调用方 | 控制器入口 | 证据位置 |
-|------|------|--------------------------|--------|------------|----------|
-| 创建变更集 | POST | `/experiments/:id/visual-changeset`（**单数**） | 前端 UI | `experimentsController.postVisualChangeset` | `app.ts:756-758`, `VisualChangesetModal.tsx:80` |
-| 更新变更集 | PUT | `/visual-changesets/:id`（复数） | 前端 UI / 扩展 | `experimentsController.putVisualChangeset` | `app.ts:760`, `VisualChangesetModal.tsx:89` |
-| 删除变更集 | DELETE | `/visual-changesets/:id`（复数） | 前端 UI | `experimentsController.deleteVisualChangeset` | `app.ts:761-764`, `VisualChangesetTable.tsx:152` |
-| 获取编辑器Key | GET | `/visual-editor/key` | 前端 UI | `experimentsController.findOrCreateVisualEditorToken` | `app.ts:772-776`, `OpenVisualEditorLink.tsx` |
+| 操作 | 方法 | 实际路径（单数/复数混用） | 调用方（证据层级） | 控制器入口 | 证据位置 |
+|------|------|--------------------------|-------------------|------------|----------|
+| 创建变更集 | POST | `/experiments/:id/visual-changeset`（**单数**） | 前端 UI（✅ 仓内已证据） | `experimentsController.postVisualChangeset` | `app.ts:756-758`, `VisualChangesetModal.tsx:80` |
+| 更新变更集 | PUT | `/visual-changesets/:id`（复数） | 前端 UI（✅ 仓内已证据） | `experimentsController.putVisualChangeset` | `app.ts:760`, `VisualChangesetModal.tsx:89` |
+| 删除变更集 | DELETE | `/visual-changesets/:id`（复数） | 前端 UI（✅ 仓内已证据） | `experimentsController.deleteVisualChangeset` | `app.ts:761-764`, `VisualChangesetTable.tsx:152` |
+| 获取编辑器Key | GET | `/visual-editor/key` | 前端 UI（✅ 仓内已证据） | `experimentsController.findOrCreateVisualEditorToken` | `app.ts:772-776`, `OpenVisualEditorLink.tsx` |
 
 > **⚠️ 关键发现**：创建接口使用**单数** `/visual-changeset`，更新/删除使用**复数** `/visual-changesets`，存在单复数不一致。
 
@@ -491,14 +501,14 @@ export const createVisualChangeset = async ({ experiment, ... }) => {
 
 **关键证据**：挂载在 `apiRouter` 下（`app.ts:369-376`）→ 路径自动带 `/api/v1/` 前缀
 
-| 操作 | 方法 | 规范路径（全复数） | 调用方 | Handler 入口 | 证据位置 |
-|------|------|-------------------|--------|-------------|----------|
-| 列出变更集 | GET | `/api/v1/experiments/:id/visual-changesets` | 外部 API | `listVisualChangesets` | `visual-changesets.ts:119` |
-| 创建变更集 | POST | `/api/v1/experiments/:id/visual-changesets`（**复数**） | 外部 API | `postVisualChangesets` | `visual-changesets.ts:136` |
-| 获取变更集 | GET | `/api/v1/visual-changesets/:id` | 外部 API / 扩展 | `getVisualChangeset` | `visual-changesets.ts:168` |
-| 更新变更集 | PUT | `/api/v1/visual-changesets/:id` | 外部 API / 扩展 | `putVisualChangeset` | `visual-changesets.ts:238` |
-| 添加单条变更 | POST | `/api/v1/visual-changesets/:id/visual-change` | 外部 API | `postVisualChange` | `visual-changesets.ts:285` |
-| 更新单条变更 | PUT | `/api/v1/visual-changesets/:id/visual-change/:visualChangeId` | 外部 API | `putVisualChange` | `visual-changesets.ts:313` |
+| 操作 | 方法 | 规范路径（全复数） | 调用方（证据层级） | Handler 入口 | 证据位置 |
+|------|------|-------------------|-------------------|-------------|----------|
+| 列出变更集 | GET | `/api/v1/experiments/:id/visual-changesets` | 外部 API（✅ 仓内已证据）<br>浏览器扩展（⚠️ 仓外推测） | `listVisualChangesets` | `visual-changesets.ts:119` |
+| 创建变更集 | POST | `/api/v1/experiments/:id/visual-changesets`（**复数**） | 外部 API（✅ 仓内已证据）<br>浏览器扩展（❓ 未知待验证，扩展可通过旧路由创建） | `postVisualChangesets` | `visual-changesets.ts:136` |
+| 获取变更集 | GET | `/api/v1/visual-changesets/:id` | 外部 API（✅ 仓内已证据）<br>浏览器扩展（⚠️ 仓外推测） | `getVisualChangeset` | `visual-changesets.ts:168` |
+| 更新变更集 | PUT | `/api/v1/visual-changesets/:id` | 外部 API（✅ 仓内已证据）<br>浏览器扩展（⚠️ 仓外推测） | `putVisualChangeset` | `visual-changesets.ts:238` |
+| 添加单条变更 | POST | `/api/v1/visual-changesets/:id/visual-change` | 外部 API（✅ 仓内已证据）<br>浏览器扩展（❓ 未知待验证） | `postVisualChange` | `visual-changesets.ts:285` |
+| 更新单条变更 | PUT | `/api/v1/visual-changesets/:id/visual-change/:visualChangeId` | 外部 API（✅ 仓内已证据）<br>浏览器扩展（❓ 未知待验证） | `putVisualChange` | `visual-changesets.ts:313` |
 
 ##### 表 3：控制器与 Handler 对应关系
 
@@ -510,10 +520,31 @@ export const createVisualChangeset = async ({ experiment, ... }) => {
 | 获取单个 | 无（新路由独占） | `getVisualChangeset` | `findVisualChangesetById()` |
 | 列表 | 无（新路由独占） | `listVisualChangesets` | `findVisualChangesetsByExperiment()` |
 
+---
+
+##### 表 4：浏览器扩展 API 调用证据层级分层
+
+**核心前置证据（✅ 仓内已证据）**：
+1. 前端通过 `postMessage` 传递 `apiHost` 和 `apiKey` 给扩展（`OpenVisualEditorLink.tsx:106-115`）
+2. `apiHost` 格式：如 `https://api.growthbook.io`，**不带 `/api/v1` 后缀**
+3. `apiKey` 是 `visualEditor` 角色的持久化密钥，可用于 API Key 认证
+4. `/api/v1/*` 路由通过 `authenticateApiRequestMiddleware` 支持 `Authorization: Bearer <key>` 认证
+5. 旧路由（无前缀）仅支持 JWT Cookie 认证，不支持 API Key 认证
+
+| 扩展行为 | 证据层级 | 说明 |
+|----------|----------|------|
+| 扩展使用 `Authorization: Bearer <apiKey>` 头 | ⚠️ 仓外推测 | 基于 API Key 认证中间件的要求推断 |
+| 扩展调用 `GET /api/v1/visual-changesets/:id` 拉取数据 | ⚠️ 仓外推测 | 这是 API Key 可访问的最合理获取路径 |
+| 扩展调用 `PUT /api/v1/visual-changesets/:id` 保存变更 | ⚠️ 仓外推测 | 这是 API Key 可访问的更新路径 |
+| 扩展调用 `GET /api/v1/experiments/:id/visual-changesets` 列表 | ❓ 未知待验证 | 扩展可能不需要列表功能 |
+| 扩展实际请求的完整 URL 拼接方式 | ❓ 未知待验证 | `apiHost + "/api/v1/..."` 只是合理推测 |
+| 扩展使用的 HTTP 客户端、超时、重试机制 | ❓ 未知待验证 | 完全无仓内证据 |
+
 > **⚠️ 事实修正**：
 > 1. 前端实际调用的创建路径是 **单数** `/experiments/:id/visual-changeset`，不是复数 `/visual-changesets`
 > 2. 存在两套接口：旧路由（JWT，前端用）和新路由（API Key，外部用）
 > 3. 单复数不一致是历史遗留问题：创建是单数，更新/删除是复数
+> 4. 浏览器扩展调用 `/api/v1` 路径是**仓外推测**，非确定性结论
 
 #### 6.2.3 URL 匹配逻辑
 
@@ -713,7 +744,22 @@ const gb = new GrowthBook({
 
 以下功能不在此代码库中，但可通过公开的接口约定、类型定义、第三方库文档进行合理推测：
 
-#### 10.2.1 dom-mutator 库行为（公开开源库）
+#### 10.2.1 浏览器扩展 API 调用行为
+
+**核心前置证据（✅ 仓内已证据）**：
+- 前端通过 `postMessage` 传递 `apiHost`（无 `/api/v1` 后缀）和 `apiKey` 给扩展
+- `/api/v1/*` 路由支持 API Key 认证（`Authorization: Bearer <key>`）
+- 旧路由（无前缀）仅支持 JWT Cookie 认证
+
+**合理推测内容**：
+| 推测 | 依据 | 置信度 |
+|------|------|--------|
+| 扩展使用 `Authorization: Bearer <apiKey>` 请求头 | API Key 认证中间件要求 | 高 |
+| 扩展调用 `/api/v1/visual-changesets/:id` 读取和保存变更 | 这是 API Key 可访问的唯一更新路径 | 高 |
+| 扩展不会调用旧路由（无前缀） | 扩展无 JWT Cookie，无法通过旧路由认证 | 高 |
+| 扩展不创建变更集，只读取和更新 | 变更集由前端 UI 创建后才打开编辑器 | 高 |
+
+#### 10.2.2 dom-mutator 库行为（公开开源库）
 
 来源：https://github.com/growthbook/dom-mutator
 
@@ -755,6 +801,18 @@ const gb = new GrowthBook({
 ### 10.3 ❓ 未知待验证（完全无代码证据）
 
 以下功能完全在浏览器扩展中实现，此代码库中没有任何证据，需要实际调试扩展或查看扩展源码才能确认：
+
+#### 10.3.1 扩展 API 调用未知点
+
+| 行为 | 接口约定 | 未知点 | 验证方式 |
+|------|----------|--------|----------|
+| **扩展实际请求 URL** | 无直接证据 | 扩展是否真的拼接了 `/api/v1/` 前缀 | 在目标页面 Network 面板查看实际请求 |
+| **扩展 HTTP 客户端** | 无直接证据 | 使用 `fetch` 还是 `XMLHttpRequest`，超时和重试设置 | 调试扩展源码 |
+| **扩展请求头细节** | 无直接证据 | 是否添加了额外的 `User-Agent` 或自定义头 | Network 面板查看 |
+| **扩展错误处理** | 无直接证据 | API 调用失败时如何提示用户，是否重试 | 手动构造错误场景测试 |
+| **扩展缓存策略** | 无直接证据 | 是否缓存 GET 请求结果，缓存多久 | 连续编辑观察请求模式 |
+
+#### 10.3.2 扩展交互功能未知点
 
 | 功能 | 接口约定 | 未知点 |
 |------|----------|--------|
@@ -941,23 +999,46 @@ console.log('Current URL:', gb.getURL());
 | "创建接口路径 `/experiments/:id/visual-changesets`" | 前端主用路径是**单数** `/experiments/:id/visual-changeset`（JWT认证），复数 `/api/v1/experiments/:id/visual-changesets` 是 API 兼容路径（API Key认证） | `app.ts:756-758`, `VisualChangesetModal.tsx:80`, `visual-changesets.ts:136` |
 | "API 路径描述不完整" | 存在**两套独立路由系统**：旧路由（JWT，无前缀，前端用）和新路由（API Key，`/api/v1/` 前缀，外部用） | `app.ts:756-764`, `app.ts:369-376` |
 | "单复数一致性" | 创建接口是单数 `/visual-changeset`，更新/删除接口是复数 `/visual-changesets`，为历史遗留不一致 | `app.ts:756-764` |
+| "浏览器扩展调用 `/api/v1` 路径是确定事实" | 扩展调用 `/api/v1` 路径是**仓外推测**，非确定性结论。仓内只有前端传递 `apiHost` 和 `apiKey` 的证据，无扩展实际请求行为的证据 | `OpenVisualEditorLink.tsx:106-115`, `authenticateApiRequestMiddleware.ts:28-60` |
+| "浏览器扩展负责创建变更集" | 变更集由**前端 UI** 在打开编辑器之前创建完成，扩展只负责读取（GET）和更新（PUT）已存在的变更集 | `VisualChangesetModal.tsx:78-87`, `OpenVisualEditorLink.tsx:23-130` |
 
 ---
 
-## 新增：路由边界排障清单
+## 新增：路由边界排障清单（分层标注证据）
 
-| 问题场景 | 排查要点 | 验证命令/方式 |
-|----------|----------|--------------|
-| **前端创建变更集 404** | 检查是否调用了复数路径（应调用单数 `/experiments/:id/visual-changeset`） | 查看 Network 面板请求 URL |
-| **扩展保存变更 401** | 检查是否缺少 API Key，或调用了无前缀的旧路由（扩展应调用 `/api/v1/visual-changesets/:id`） | 检查请求头 `Authorization: Bearer <apiKey>` |
-| **外部 API 调用 404** | 检查是否遗漏了 `/api/v1/` 前缀 | 正确路径应为 `/api/v1/visual-changesets/:id` |
-| **PUT 更新返回空 data** | 检查是否调用了旧控制器（返回 `data` 字段）还是新 Handler（返回 `visualChangeset` 字段） | 旧控制器: `{status:200, data:{...}}` <br> 新 Handler: `{visualChangeset:{...}}` |
-| **POST 创建返回格式不一致** | 旧控制器返回 `{status:200, visualChangeset:{...}}`，新 Handler 返回 `{visualChangeset:{...}}` | 根据调用路径判断响应格式 |
+### 仓内可排障问题（✅ 有完整调试手段）
 
-### 调用方路径选择速查表
+| 问题场景 | 排查要点 | 验证命令/方式 | 证据层级 |
+|----------|----------|--------------|----------|
+| **前端创建变更集 404** | 检查是否调用了复数路径（应调用单数 `/experiments/:id/visual-changeset`） | 查看 Network 面板请求 URL | ✅ 仓内已证据 |
+| **前端更新变更集 401** | 检查 JWT Cookie 是否有效，用户登录状态 | 检查 `document.cookie` 中的会话 token | ✅ 仓内已证据 |
+| **外部 API 调用 404** | 检查是否遗漏了 `/api/v1/` 前缀 | 正确路径应为 `/api/v1/visual-changesets/:id` | ✅ 仓内已证据 |
+| **外部 API 调用 401** | 检查 API Key 是否有效，格式是否为 `Bearer <key>` | 检查 `Authorization` 请求头 | ✅ 仓内已证据 |
+| **PUT 更新返回字段不一致** | 旧控制器返回 `{status:200, data:{...}}`，新 Handler 返回 `{visualChangeset:{...}}` | 根据调用路径判断响应格式 | ✅ 仓内已证据 |
+| **POST 创建返回格式不一致** | 旧控制器返回 `{status:200, visualChangeset:{...}}`，新 Handler 返回 `{visualChangeset:{...}}` | 根据调用路径判断响应格式 | ✅ 仓内已证据 |
 
-| 调用方 | 认证方式 | 创建路径 | 更新/删除路径 |
-|--------|----------|----------|--------------|
-| **前端 UI** | JWT (Cookie) | `/experiments/:id/visual-changeset`（单数） | `/visual-changesets/:id`（复数） |
-| **浏览器扩展** | API Key (Bearer) | `/api/v1/experiments/:id/visual-changesets`（复数） | `/api/v1/visual-changesets/:id`（复数） |
-| **外部集成** | API Key (Bearer) | `/api/v1/experiments/:id/visual-changesets`（复数） | `/api/v1/visual-changesets/:id`（复数） |
+### 浏览器扩展相关问题（需结合扩展调试）
+
+| 问题场景 | 仓内可验证部分 | 需扩展调试部分 | 证据层级 |
+|----------|----------------|----------------|----------|
+| **扩展保存变更失败 401** | ✅ 检查 `/visual-editor/key` 是否返回有效密钥 | ❓ 检查扩展是否正确使用 `Bearer` 认证头 | ⚠️ 仓外推测 |
+| **扩展保存变更失败 404** | ✅ 确认 `vc-id` URL 参数存在且有效 | ❓ 检查扩展拼接的完整 URL（是否有 `/api/v1/` 前缀） | ❓ 未知待验证 |
+| **扩展无法加载变更集** | ✅ 确认变更集 ID 有效，后端 API 正常 | ❓ 检查扩展实际调用的 GET 请求 URL | ❓ 未知待验证 |
+| **扩展保存后前端无更新** | ✅ 确认后端 `PUT` 接口返回成功，SDK 缓存已刷新 | ❓ 检查扩展是否调用了正确的 PUT 接口 | ⚠️ 仓外推测 |
+
+> **扩展排障实操建议**：
+> 1. 在目标页面打开浏览器开发者工具，切换到 **Network 面板**
+> 2. 过滤 `visual-changesets` 关键字，查看扩展发出的实际请求
+> 3. 检查请求 URL：`https://<apiHost>/api/v1/visual-changesets/<vc-id>?`
+> 4. 检查请求头：`Authorization: Bearer <apiKey>`
+> 5. 检查请求方法和 Body 格式是否与 API 文档一致
+
+### 调用方路径选择速查表（标注证据层级）
+
+| 调用方 | 认证方式（证据层级） | 创建路径（证据层级） | 更新/删除路径（证据层级） |
+|--------|---------------------|---------------------|--------------------------|
+| **前端 UI** | JWT (Cookie)（✅ 仓内已证据） | `/experiments/:id/visual-changeset`（单数）（✅ 仓内已证据） | `/visual-changesets/:id`（复数）（✅ 仓内已证据） |
+| **浏览器扩展** | API Key (Bearer)（⚠️ 仓外推测） | 无（扩展不创建，由前端创建） | `/api/v1/visual-changesets/:id`（复数）（⚠️ 仓外推测） |
+| **外部集成** | API Key (Bearer)（✅ 仓内已证据） | `/api/v1/experiments/:id/visual-changesets`（复数）（✅ 仓内已证据） | `/api/v1/visual-changesets/:id`（复数）（✅ 仓内已证据） |
+
+> **说明**：浏览器扩展在整个链路中**不负责创建**变更集，变更集由前端 UI 在打开编辑器之前创建完成。扩展只负责读取（GET）和更新（PUT）已存在的变更集。
