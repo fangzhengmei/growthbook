@@ -700,8 +700,8 @@ options = [
 | 状态值 | published | merged |
 | 变更表示 | 完整快照（rules、defaultValue 等） | JSON Patch (RFC 6902) |
 | 配置位置 | `org.settings.requireReviews` | `org.settings.approvalFlows` |
-| 审核接口 | `/feature/:id/:version/submit-review` | `/revision/:id/review` |
-| 发布接口 | `/feature/:id/:version/publish` | `/revision/:id/merge` |
+| 审核接口 | `/features/:id/revisions/:version/submit-review` | `/revision/:id/review` |
+| 发布接口 | `/features/:id/revisions/:version/publish` | `/revision/:id/merge` |
 | 适配器模式 | 无（硬编码逻辑） | 有（EntityRevisionAdapter） |
 
 **注意**：Feature 的审批配置使用 `requireReviews` 数组，SavedGroup 使用 `approvalFlows` 对象。两套配置不共享，需要分别配置。
@@ -823,13 +823,121 @@ Bypass 权限**仅在发布环节**生效，在审核环节不生效：
 
 ---
 
-## 十、核心代码索引
+## 十、接口写法易混淆点说明
+
+### 10.1 `/feature`（旧版/错误写法）与 `/features/:id/revisions/:version/*`（正确写法）的区别
+
+在代码审查和文档编写过程中，容易混淆两套不同的 API 接口风格。以下是清晰的对比：
+
+#### 错误/旧版写法：`/feature/:id/:version/*`
+- **是否存在**：代码库中**不存在**此路径
+- **常见错误点**：
+  - 单数 `feature` 而非复数 `features`
+  - 缺少 `revisions` 中间路径段
+  - 直接在 feature 后拼接 version，而非 `revisions/:version`
+
+#### 正确写法（Feature 审批接口）：`/features/:id/revisions/:version/*`
+- **实际路径定义**（`packages/shared/src/validators/feature-revisions.ts`）：
+  ```typescript
+  // 提交审核请求
+  path: "/features/:id/revisions/:version/request-review"
+  
+  // 提交审核决策
+  path: "/features/:id/revisions/:version/submit-review"
+  
+  // 发布
+  path: "/features/:id/revisions/:version/publish"
+  ```
+- **路径结构解析**：
+  - `/features`：复数，表示 Feature 集合
+  - `/:id`：Feature 的 ID
+  - `/revisions`：表示进入修订子资源
+  - `/:version`：修订的版本号（数字，如 1, 2, 3）
+  - `/*`：具体操作（`request-review` / `submit-review` / `publish`）
+
+#### 另一套正确写法（通用修订接口）：`/revision/:id/*`
+- **实际路径定义**（`packages/back-end/src/routers/revision/revision.controller.ts` 代码注释）：
+  ```typescript
+  // 提交审核
+  // region POST /revision/:id/submit
+  
+  // 审核决策
+  // region POST /revision/:id/review
+  
+  // 合并/发布
+  // region POST /revision/:id/merge
+  ```
+- **路径结构解析**：
+  - `/revision`：**单数**，表示通用修订集合（仅 SavedGroup 等通用实体使用）
+  - `/:id`：修订的 ID（字符串 UUID，而非数字版本号）
+  - `/*`：具体操作（`submit` / `review` / `merge`）
+
+#### 三套接口路径对比表
+
+| 系统 | 接口前缀 | ID 类型 | 提交审核 | 审核决策 | 发布/合并 |
+|------|---------|---------|---------|---------|----------|
+| Feature 修订（V1） | `/features/:id/revisions/:version` | 数字 version | `request-review` | `submit-review` | `publish` |
+| Feature 修订（V2） | `/v2/features/:id/revisions/:version` | 数字 version | `request-review` | `submit-review` | `publish` |
+| 通用修订（SavedGroup） | `/revision/:id` | 字符串 UUID | `submit` | `review` | `merge` |
+
+#### 为什么有两种不同的命名风格？
+
+1. **历史演进原因**：
+   - Feature 修订系统先实现，采用了 RESTful 嵌套资源风格：`/features/:id/revisions/:version`
+   - 通用修订系统后实现，为了简化路径，采用了根级资源风格：`/revision/:id`
+
+2. **ID 类型差异**：
+   - Feature 修订使用**数字版本号**（version），每个 Feature 从 1 开始递增
+   - 通用修订使用**字符串 UUID**（id），全局唯一
+
+3. **操作命名差异**：
+   | 操作 | Feature 修订 | 通用修订 | 原因 |
+   |------|-------------|---------|------|
+   | 提交审核 | `request-review` | `submit` | Feature 强调"请求审核"动作，通用修订强调"提交"动作 |
+   | 审核决策 | `submit-review` | `review` | Feature 强调"提交审核结果"，通用修订简化为"review" |
+   | 发布 | `publish` | `merge` | Feature 是"发布到线上"，通用修订是"合并且应用变更" |
+
+#### 常见错误检查清单
+
+✅ 正确：
+- `POST /features/my_feature/revisions/3/request-review`
+- `POST /features/my_feature/revisions/3/submit-review`
+- `POST /features/my_feature/revisions/3/publish`
+- `POST /revision/rev_abc123/submit`
+- `POST /revision/rev_abc123/review`
+- `POST /revision/rev_abc123/merge`
+
+❌ 错误：
+- `POST /feature/my_feature/3/request-review` （单数 feature，缺少 revisions）
+- `POST /features/my_feature/3/submit-review` （缺少 revisions 路径段）
+- `POST /features/my_feature/revisions/3/review` （应该是 submit-review，不是 review）
+- `POST /revisions/rev_abc123/merge` （通用修订是单数 /revision）
+
+---
+
+## 十一、核心代码索引
+
+### 11.1 API 路径定义（Validator）
+
+| API | 文件位置 | 路径定义 |
+|-----|----------|---------|
+| Feature 提交审核请求 | `packages/shared/src/validators/feature-revisions.ts:272-286` | `path: "/features/:id/revisions/:version/request-review"` |
+| Feature 提交审核决策 | `packages/shared/src/validators/feature-revisions.ts:292-306` | `path: "/features/:id/revisions/:version/submit-review"` |
+| Feature 发布 | `packages/shared/src/validators/feature-revisions.ts:188-202` | `path: "/features/:id/revisions/:version/publish"` |
+| Feature V2 提交审核请求 | `packages/shared/src/validators/feature-revisions-v2.ts:362-373` | `path: "/features/:id/revisions/:version/request-review"` |
+| Feature V2 提交审核决策 | `packages/shared/src/validators/feature-revisions-v2.ts:375-386` | `path: "/features/:id/revisions/:version/submit-review"` |
+| Feature V2 发布 | `packages/shared/src/validators/feature-revisions-v2.ts:290-301` | `path: "/features/:id/revisions/:version/publish"` |
+| 通用修订提交审核 | `packages/back-end/src/routers/revision/revision.controller.ts:369` | `POST /revision/:id/submit` |
+| 通用修订审核决策 | `packages/back-end/src/routers/revision/revision.controller.ts:428` | `POST /revision/:id/review` |
+| 通用修订合并 | `packages/back-end/src/routers/revision/revision.controller.ts:870` | `POST /revision/:id/merge` |
+
+### 11.2 业务逻辑实现
 
 | 功能 | 文件位置 | 关键函数/类 |
 |------|----------|------------|
-| Feature 提交审核请求 | `packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts:14-79` | `requestReview` |
-| Feature 提交审核决策 | `packages/back-end/src/api/features/postFeatureRevisionSubmitReview.ts:21-123` | `submitRevisionReview` |
-| Feature 发布 | `packages/back-end/src/api/features/postFeatureRevisionPublish.ts:28-179` | `publishFeatureRevision` |
+| Feature 提交审核请求逻辑 | `packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts:14-79` | `requestReview` |
+| Feature 提交审核决策逻辑 | `packages/back-end/src/api/features/postFeatureRevisionSubmitReview.ts:21-123` | `submitRevisionReview` |
+| Feature 发布逻辑 | `packages/back-end/src/api/features/postFeatureRevisionPublish.ts:28-179` | `publishFeatureRevision` |
 | Feature 审核状态变更 | `packages/back-end/src/models/FeatureRevisionModel.ts:1055-1143` | `markRevisionAsReviewRequested`, `submitReviewAndComments` |
 | Feature 贡献者追踪 | `packages/back-end/src/models/FeatureRevisionModel.ts:933-937` | `updateRevision` 中的 `$addToSet: { contributors }` |
 | 审批判定 | `packages/shared/src/util/features.ts` | `checkIfRevisionNeedsReview` |
