@@ -807,7 +807,7 @@ export function startStreaming(
 
 ##### init (异步) 的 startStreaming 调用路径
 
-**文件**: `packages/sdk-js/src/GrowthBook.ts:264, 279, 289`
+**文件**: `packages/sdk-js/src/GrowthBook.ts:269-293`
 
 ```typescript
 public async init(options?: InitOptions): Promise<InitResponse> {
@@ -820,26 +820,50 @@ public async init(options?: InitOptions): Promise<InitResponse> {
   }
 
   if (options.payload) {
-    await this.setPayload(options.payload);
-    startStreaming(this, options);  // 调用点 1
+    await this.setPayload(options.payload);  // setPayload 不调用 startStreaming！
+    startStreaming(this, options);  // 调用点 1（有 payload 分支）
     return { success: true, source: "init" };
   } else {
     const { data, ...res } = await this._refresh({
       ...options,
       allowStale: true,
     });
-    startStreaming(this, options);  // 调用点 2
-    await this.setPayload(data || {});
+    startStreaming(this, options);  // 调用点 1（无 payload 分支）
+    await this.setPayload(data || {});  // setPayload 不调用 startStreaming！
     return res;
   }
 }
+```
 
-// setPayload 内部也调用 startStreaming
-// GrowthBook.ts:264
+> **关键事实**：`setPayload` **不调用** `startStreaming`！无论哪个分支，单次 `init()` 调用只会调用 **1 次** `startStreaming`。
+
+##### setPayload 的实际行为（不含 startStreaming）
+
+**文件**: `packages/sdk-js/src/GrowthBook.ts:213-230`
+
+```typescript
 public async setPayload(payload: FeatureApiResponse): Promise<void> {
-  // ... 解密、更新 features ...
+  this._payload = payload;
+  const data = await decryptPayload(payload, this._options.decryptionKey);
+  this._decryptedPayload = data;
+  await this.refreshStickyBuckets(data);
+  if (data.features) this._options.features = data.features;
+  if (data.savedGroups) this._options.savedGroups = data.savedGroups;
+  if (data.experiments) {
+    this._options.experiments = data.experiments;
+    this._updateAllAutoExperiments();
+  }
   this.ready = true;
-  startStreaming(this, options);  // 调用点 3
+  this._render();  // 只触发 React 重渲染，不调用 startStreaming！
+}
+
+// GrowthBookClient.setPayload 甚至连 _render 都不调用
+// GrowthBookClient.ts:85-99
+public async setPayload(payload: FeatureApiResponse): Promise<void> {
+  this._payload = payload;
+  // ... 解密、更新 features/experiments/savedGroups ...
+  this.ready = true;
+  // 没有 _render，也没有 startStreaming！
 }
 ```
 
@@ -877,16 +901,33 @@ public initSync(options: InitSyncOptions): GrowthBook {
 | 差异点 | init (异步) | initSync (同步) |
 |--------|------------|----------------|
 | `cacheSettings` 处理 | ✅ 调用 `configureCache(options.cacheSettings)` | ❌ 不支持 `cacheSettings` 参数 |
-| `startStreaming` 调用次数 | 1-3 次（取决于代码路径） | 固定 1 次 |
+| `startStreaming` 调用次数 | **固定 1 次**（两个分支各 1 次调用点） | 固定 1 次 |
+| `setPayload` 调用 startStreaming | ❌ 从不调用 | ❌ 从不调用 |
 | `payload` 参数 | 可选 | 必填 |
 | 加密 payload 支持 | ✅ 支持（异步解密） | ❌ 不支持（直接抛错） |
 | 调用 `_refresh` 拉取远程 | ✅ 无 payload 时调用 | ❌ 从不调用（必须本地提供 payload） |
 | `stickyBucketService` 处理 | 异步版本 | 同步版本 |
 | `streaming` 参数 | 可选，支持 `undefined` | 可选，支持 `undefined` |
 
-> **关键差异**：`init` 在 `setPayload` 中也会调用 `startStreaming`，因此一次 `init()` 调用可能触发两次 `startStreaming`（先在 `_refresh` 后调用一次，再在 `setPayload` 中调用一次）。而 `initSync` 只在末尾调用一次。但由于 `startStreaming` 内部 `subscribe` 是幂等的，多次调用不会导致重复订阅。
+> **更正说明**：之前错误地认为 `init` 可能多次调用 `startStreaming`（1-3 次），实际上无论哪个分支，单次 `init()` 调用都只会调用 **1 次** `startStreaming`。`setPayload` 从不调用 `startStreaming`，只负责更新数据和触发重渲染。
 
-**状态延续场景**：
+##### 所有调用 startStreaming 的位置汇总
+
+通过全局搜索 `startStreaming(`，确认只有 7 处调用：
+
+| 位置 | 文件 | 行号 | 说明 |
+|------|------|------|------|
+| `GrowthBook.initSync` | GrowthBook.ts | 264 | 同步初始化末尾 |
+| `GrowthBook.init` (有 payload) | GrowthBook.ts | 279 | 异步初始化有 payload 分支 |
+| `GrowthBook.init` (无 payload) | GrowthBook.ts | 289 | 异步初始化无 payload 分支 |
+| `GrowthBookClient.initSync` | GrowthBookClient.ts | 119 | 同步初始化末尾 |
+| `GrowthBookClient.init` (有 payload) | GrowthBookClient.ts | 133 | 异步初始化有 payload 分支 |
+| `GrowthBookClient.init` (无 payload) | GrowthBookClient.ts | 143 | 异步初始化无 payload 分支 |
+| `startStreaming` 定义 | feature-repository.ts | 568 | 函数定义 |
+
+> **关键结论**：只有 `init()` 和 `initSync()` 会调用 `startStreaming`。`setPayload()`、`refreshFeatures()`、`loadFeatures()` 等方法都**不调用** `startStreaming`。
+
+**状态延续场景**（更正后）：
 
 | 调用序列 | 最终订阅状态 | 说明 |
 |----------|-------------|------|
@@ -894,11 +935,59 @@ public initSync(options: InitSyncOptions): GrowthBook {
 | `init({ streaming: true })` → `init({ streaming: false })` | ✅ 已订阅 | streaming=false 不取消订阅 |
 | `init({ streaming: true })` → `destroy()` | ❌ 未订阅 | destroy 调用 unsubscribe |
 | `init({ streaming: false })` → `init({ streaming: true })` | ✅ 已订阅 | 第二次 streaming=true 触发订阅 |
-| 直接 `refreshFeatures({ streaming: false })` | ❌ 不影响 | refreshFeatures 不调用 startStreaming |
+| `init({ streaming: true })` → `refreshFeatures()` | ✅ 已订阅 | refreshFeatures 不调用 startStreaming，不改变订阅 |
+| `init({ streaming: true })` → `setPayload()` | ✅ 已订阅 | setPayload 不调用 startStreaming，不改变订阅 |
 
-> **修正说明**：`init({ streaming: false })` **不会取消**之前 `streaming=true` 建立的订阅，因为 `startStreaming` 在 `streaming=false` 分支是无操作。订阅状态具有"粘性"，一旦订阅除非 `destroy()` 或全局清空否则保持。
+> **修正说明**：`init({ streaming: false })` **不会取消**之前 `streaming=true` 建立的订阅，因为 `startStreaming` 在 `streaming=false` 分支是无操作。订阅状态具有"强粘性"，一旦订阅除非 `destroy()` 或全局清空否则保持，即使后续调用 `refreshFeatures()` 或 `setPayload()` 也不会改变订阅状态。
 
-#### 5.6.2 边界条件总结
+#### 5.6.2 更正对订阅粘性与更新分发判断的影响
+
+##### 订阅粘性的真实强度
+
+| 操作 | 是否改变订阅状态 | 对已订阅实例的影响 |
+|------|-----------------|-------------------|
+| `init({ streaming: true })` | ✅ 订阅（幂等） | 无变化（已订阅） |
+| `init({ streaming: false })` | ❌ 不改变 | 继续接收更新 |
+| `init()` (不传 streaming) | ❌ 不改变 | 继续接收更新 |
+| `refreshFeatures()` | ❌ 不改变 | 继续接收更新 |
+| `setPayload()` | ❌ 不改变 | 继续接收更新 |
+| `destroy()` | ✅ 取消订阅 | 停止接收更新 |
+| `destroy({ destroyAllStreams: true })` | ✅ 全局清空 | 所有实例停止接收更新 |
+| `configureCache({ backgroundSync: false })` | ✅ 全局清空 | 所有实例停止接收更新 |
+
+> **关键影响**：订阅粘性比之前理解的更强。一旦通过 `init({ streaming: true })` 订阅，除非显式 `destroy()` 或全局清空，否则**任何其他操作**（包括后续的 `init({ streaming: false })`、`refreshFeatures()`、`setPayload()` 等）都不会改变订阅状态，实例会持续接收 SSE 更新。
+
+##### 更新分发判断的完整链路
+
+```
+SSE 事件到达
+    │
+    ▼
+1. 流是否存在？（全局 streams Map）
+    │
+    ▼
+2. supportsSSE.has(key)？（服务端标记）
+    │
+    ▼
+3. cacheSettings.backgroundSync？（全局开关）
+    │
+    ▼
+4. subscribedInstances.get(key) 有实例？（订阅集合）
+    │
+    ▼
+5. 遍历实例 → refreshInstance(instance, data)
+    │
+    ▼
+6. 实例.setPayload(data) → 不检查订阅状态 → 直接更新数据 + _render
+```
+
+> **更新分发关键点**：
+> - 第 4 步是**唯一**的订阅检查点，决定哪些实例会收到通知
+> - 第 6 步 `refreshInstance` 内部调用 `setPayload`，**不再次检查订阅状态**
+> - 只要第 4 步通过，实例就会收到数据更新和重渲染
+> - 这意味着：一旦实例在 `subscribedInstances` 中，它就会持续收到更新，不管后续做了什么操作（除非被 `unsubscribe`）
+
+#### 5.6.3 边界条件总结
 
 | 场景 | 是否接收 SSE 更新 | 说明 |
 |------|------------------|------|
@@ -910,6 +999,8 @@ public initSync(options: InitSyncOptions): GrowthBook {
 | 直接 `new GrowthBook({ clientKey })` | ❌ 否 | 不调用 init 也不订阅 |
 | 实例已 `destroy()` | ❌ 否 | `unsubscribe` 从集合中移除 |
 | 同一 clientKey 的不同实例 | 取决于各自是否订阅 | 实例独立管理订阅状态 |
+| 订阅后调用 `refreshFeatures()` | ✅ 是 | 不改变订阅状态 |
+| 订阅后调用 `setPayload()` | ✅ 是 | 不改变订阅状态 |
 
 ### 5.7 backgroundSync=false 的全局副作用
 
@@ -1576,11 +1667,16 @@ function onFeatureUsage(ctx, key, ret): void {
 6. **setURL 不总是触发重渲染**：非 remoteEval 模式下 `setURL` 不调用 `_render()`
 7. **core.ts 评估层有副作用**：会修改传入的 ctx 对象（tracked*、devLogs、stickyBucketAssignmentDocs 等）
 8. **GrowthBook 与 GrowthBookClient 回调归属不同**：单用户 vs 多用户模式导致回调在 Global/User 中的归属不同
-9. **streaming 参数具有粘性**：`init({ streaming: false })` 不会取消之前 `streaming=true` 建立的订阅，除非 `destroy()` 或全局清空
+9. **streaming 参数具有强粘性**：`init({ streaming: false })` 不会取消之前 `streaming=true` 建立的订阅，除非 `destroy()` 或全局清空
 10. **backgroundSync=false 有两条路径，影响不同**：`configureCache` 路径会立即清空所有流和订阅，`refreshFeatures` 路径只阻止新建但保留现有
 11. **destroyAllStreams 是全局破坏性操作**：会清空所有实例订阅、关闭所有 SSE 流，慎用
 12. **可建流但未订阅不分发**：三重门控机制（流创建 → 事件分发 → 实例刷新），每一层都独立判断，流存在不代表实例能收到更新
 13. **订阅状态跨 init 调用保留**：多次调用 `init()` 时，`streaming` 参数不会主动取消之前的订阅状态
-14. **init 与 initSync 调用路径不同**：init 支持 `cacheSettings` 和可能多次调用 `startStreaming`，initSync 不支持 `cacheSettings` 且只调用一次 `startStreaming`
-15. **refreshFeatures 公开参数与内部行为不一致**：公开 API 只有 `timeout` 和 `skipCache`，内部实际会计算 `backgroundSync` 但公开调用不会触发禁用
-16. **backgroundSync 计算链路有差异**：GrowthBook 有实例级 `_options.backgroundSync`，GrowthBookClient 直接 fallback 到 `true`
+14. **setPayload 不调用 startStreaming**：只负责更新数据和触发重渲染，不改变订阅状态
+15. **init/initSync 每次调用 startStreaming 固定 1 次**：无论哪个分支，单次 init/initSync 调用都只会调用 1 次 startStreaming
+16. **只有 init/initSync 会调用 startStreaming**：`setPayload()`、`refreshFeatures()`、`loadFeatures()` 等方法都不调用 startStreaming
+17. **订阅粘性极强**：一旦订阅，除非 `destroy()` 或全局清空，`refreshFeatures()`、`setPayload()`、甚至 `init({ streaming: false })` 都不会改变订阅状态
+18. **订阅检查只有一个点**：SSE 事件分发时检查 `subscribedInstances`，通过后直接调用 `setPayload`，不再二次检查
+19. **init 与 initSync 调用路径不同**：init 支持 `cacheSettings`（可能全局清空流），initSync 不支持 `cacheSettings`
+20. **refreshFeatures 公开参数与内部行为不一致**：公开 API 只有 `timeout` 和 `skipCache`，内部实际会计算 `backgroundSync` 但公开调用不会触发禁用
+21. **backgroundSync 计算链路有差异**：GrowthBook 有实例级 `_options.backgroundSync`，GrowthBookClient 直接 fallback 到 `true`
