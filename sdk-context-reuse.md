@@ -25,9 +25,9 @@ GrowthBook SDK 采用**双层架构**设计：
 │  └───────────────────┬────────────────────────────────┘  │
 │                      │ 传递 EvalContext                   │
 │  ┌───────────────────▼────────────────────────────────┐  │
-│  │  core.ts (纯函数评估层)                             │  │
+│  │  core.ts (评估层 - 有副作用)                        │  │
 │  │  - evalFeature() / runExperiment()                │  │
-│  │  - 无状态、纯函数、依赖注入                         │  │
+│  │  - 依赖注入 + 可变 ctx + 回调触发                   │  │
 │  └───────────────────┬────────────────────────────────┘  │
 │                      │ 调用 repository                    │
 │  ┌───────────────────▼────────────────────────────────┐  │
@@ -39,6 +39,8 @@ GrowthBook SDK 采用**双层架构**设计：
 │  └────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────┘
 ```
+
+> **修正说明**：`core.ts` 不是纯函数层，评估过程会修改传入的 `ctx` 对象并触发回调，属于**有副作用的依赖注入层**。
 
 ---
 
@@ -158,7 +160,7 @@ constructor(options?: Options) {
 
 ### 3.1 上下文拆分设计
 
-**核心思想**：将配置拆分为**全局不变**和**用户可变**两部分，通过 `EvalContext` 传递给纯函数评估层。
+**核心思想**：将配置拆分为**全局不变**和**用户可变**两部分，通过 `EvalContext` 传递给评估层。
 
 **文件**: `packages/sdk-js/src/GrowthBook.ts:626-674`
 
@@ -189,33 +191,13 @@ export type GlobalContext = {
   savedGroups?: SavedGroupsValues;    // 保存的用户组
   forcedVariations?: Record<string, number>;    // 全局强制变体
   forcedFeatureValues?: Map<string, any>;       // 全局强制特性值
-  trackingCallback?: TrackingCallbackWithUser;  // 全局追踪回调
-  onFeatureUsage?: FeatureUsageCallbackWithUser; // 全局特性使用回调
+  trackingCallback?: TrackingCallbackWithUser;  // 全局追踪回调（带user参数）
+  onFeatureUsage?: FeatureUsageCallbackWithUser; // 全局特性使用回调（带user参数）
   eventLogger?: EventLogger;                    // 事件日志
   onExperimentEval?: (experiment: Experiment, result: Result) => void;
   saveDeferredTrack?: (data: TrackingData) => void;
   recordChangeId?: (changeId: string) => void;
 };
-```
-
-**组装逻辑** (`GrowthBook.ts:659-673`):
-```typescript
-private _getGlobalContext(): GlobalContext {
-  return {
-    features: this._options.features,
-    experiments: this._options.experiments,
-    log: this.log,
-    enabled: this._options.enabled,
-    qaMode: this._options.qaMode,
-    savedGroups: this._options.savedGroups,
-    groups: this._options.groups,
-    overrides: this._options.overrides,
-    onExperimentEval: this._onExperimentEval,
-    recordChangeId: this._recordChangedId,
-    saveDeferredTrack: this._saveDeferredTrack,
-    eventLogger: this._options.eventLogger,
-  };
-}
 ```
 
 ### 3.3 UserContext - 用户级可变配置
@@ -235,36 +217,12 @@ export type UserContext = {
   forcedVariations?: Record<string, number>;  // 用户级强制变体
   forcedFeatureValues?: Map<string, any>;     // 用户级强制特性值
   attributeOverrides?: Attributes;            // 属性覆盖
-  trackingCallback?: TrackingCallback;        // 用户级追踪回调
-  onFeatureUsage?: FeatureUsageCallback;      // 用户级特性使用回调
+  trackingCallback?: TrackingCallback;        // 用户级追踪回调（不带user参数）
+  onFeatureUsage?: FeatureUsageCallback;      // 用户级特性使用回调（不带user参数）
   trackedExperiments?: Set<string>;           // 已追踪实验（去重）
   trackedFeatureUsage?: Record<string, string>; // 已追踪特性（去重）
   devLogs?: LogUnion[];                       // 开发日志
 };
-```
-
-**组装逻辑** (`GrowthBook.ts:636-658`):
-```typescript
-private _getUserContext(): UserContext {
-  return {
-    attributes: this._options.user
-      ? { ...this._options.user, ...this._options.attributes }
-      : this._options.attributes,
-    enableDevMode: this._options.enableDevMode,
-    blockedChangeIds: this._options.blockedChangeIds,
-    stickyBucketAssignmentDocs: this._options.stickyBucketAssignmentDocs,
-    url: this._getContextUrl(),
-    forcedVariations: this._options.forcedVariations,
-    forcedFeatureValues: this._options.forcedFeatureValues,
-    attributeOverrides: this._options.attributeOverrides,
-    saveStickyBucketAssignmentDoc: this._saveStickyBucketAssignmentDoc,
-    trackingCallback: this._options.trackingCallback,
-    onFeatureUsage: this._options.onFeatureUsage,
-    devLogs: this.logs,
-    trackedExperiments: this._trackedExperiments,
-    trackedFeatureUsage: this._trackedFeatures,
-  };
-}
 ```
 
 ### 3.4 StackContext - 调用栈级上下文
@@ -276,7 +234,111 @@ export type StackContext = {
 };
 ```
 
-### 3.5 配置合并优先级
+### 3.5 GrowthBook 与 GrowthBookClient 的回调归属差异
+
+#### GrowthBook 的上下文组装（单用户模式）
+
+**文件**: `packages/sdk-js/src/GrowthBook.ts:636-674`
+
+```typescript
+private _getUserContext(): UserContext {
+  return {
+    attributes: this._options.user
+      ? { ...this._options.user, ...this._options.attributes }
+      : this._options.attributes,
+    enableDevMode: this._options.enableDevMode,
+    blockedChangeIds: this._options.blockedChangeIds,
+    stickyBucketAssignmentDocs: this._options.stickyBucketAssignmentDocs,
+    url: this._getContextUrl(),
+    forcedVariations: this._options.forcedVariations,      // ← 在 user
+    forcedFeatureValues: this._options.forcedFeatureValues, // ← 在 user
+    attributeOverrides: this._options.attributeOverrides,
+    saveStickyBucketAssignmentDoc: this._saveStickyBucketAssignmentDoc,
+    trackingCallback: this._options.trackingCallback,       // ← 在 user
+    onFeatureUsage: this._options.onFeatureUsage,           // ← 在 user
+    devLogs: this.logs,
+    trackedExperiments: this._trackedExperiments,
+    trackedFeatureUsage: this._trackedFeatures,
+  };
+}
+
+private _getGlobalContext(): GlobalContext {
+  return {
+    features: this._options.features,
+    experiments: this._options.experiments,
+    log: this.log,
+    enabled: this._options.enabled,
+    qaMode: this._options.qaMode,
+    savedGroups: this._options.savedGroups,
+    groups: this._options.groups,
+    overrides: this._options.overrides,
+    onExperimentEval: this._onExperimentEval,    // ← 实例级回调
+    recordChangeId: this._recordChangedId,       // ← 实例级回调
+    saveDeferredTrack: this._saveDeferredTrack,  // ← 实例级回调
+    eventLogger: this._options.eventLogger,
+    // 注意：trackingCallback / onFeatureUsage / forced* 不在 global 中
+  };
+}
+```
+
+#### GrowthBookClient 的上下文组装（多用户模式）
+
+**文件**: `packages/sdk-js/src/GrowthBookClient.ts:262-295`
+
+```typescript
+// GrowthBookClient 没有 _getUserContext() 方法
+// userContext 由调用方在每次调用 evalFeature 时传入
+private _getEvalContext(userContext: UserContext): EvalContext {
+  if (this._options.globalAttributes) {
+    userContext = {
+      ...userContext,
+      attributes: {
+        ...this._options.globalAttributes,
+        ...userContext.attributes,
+      },
+    };
+  }
+
+  return {
+    user: userContext,  // ← 直接使用传入的 userContext
+    global: this._getGlobalContext(),
+    stack: {
+      evaluatedFeatures: new Set(),
+    },
+  };
+}
+
+private _getGlobalContext(): GlobalContext {
+  return {
+    features: this._features,
+    experiments: this._experiments,
+    log: this.log,
+    enabled: this._options.enabled,
+    qaMode: this._options.qaMode,
+    savedGroups: this._options.savedGroups,
+    forcedFeatureValues: this._options.forcedFeatureValues,  // ← 在 global
+    forcedVariations: this._options.forcedVariations,         // ← 在 global
+    trackingCallback: this._options.trackingCallback,         // ← 在 global
+    onFeatureUsage: this._options.onFeatureUsage,             // ← 在 global
+    // 注意：没有 onExperimentEval / recordChangeId / saveDeferredTrack
+  };
+}
+```
+
+#### 差异对照表
+
+| 配置项 | GrowthBook 归属 | GrowthBookClient 归属 | 说明 |
+|--------|----------------|----------------------|------|
+| `forcedFeatureValues` | UserContext | GlobalContext | GrowthBook 是单用户，Client 是多用户共享全局强制值 |
+| `forcedVariations` | UserContext | GlobalContext | 同上 |
+| `trackingCallback` | UserContext | GlobalContext | GrowthBook 回调不带 user 参数，Client 带 user 参数 |
+| `onFeatureUsage` | UserContext | GlobalContext | 同上 |
+| `onExperimentEval` | GlobalContext | ❌ 不存在 | GrowthBook 实例级实验评估回调 |
+| `recordChangeId` | GlobalContext | ❌ 不存在 | GrowthBook 变更 ID 记录 |
+| `saveDeferredTrack` | GlobalContext | ❌ 不存在 | GrowthBook 延迟追踪保存 |
+| `_getUserContext()` | ✅ 内部方法 | ❌ 不存在 | Client 需要调用方传入 userContext |
+
+### 3.6 配置合并优先级
 
 在 `core.ts` 中评估时，配置按以下优先级合并：
 
@@ -291,7 +353,7 @@ export type StackContext = {
   同时触发 GlobalContext.trackingCallback 和 UserContext.trackingCallback
 ```
 
-**代码示例** (`core.ts:39-49`):
+**代码示例** (`core.ts:39-62`):
 ```typescript
 function getForcedFeatureValues(ctx: EvalContext) {
   const ret: Map<string, any> = new Map();
@@ -304,6 +366,14 @@ function getForcedFeatureValues(ctx: EvalContext) {
     ctx.user.forcedFeatureValues.forEach((v, k) => ret.set(k, v));
   }
   return ret;
+}
+
+function getForcedVariations(ctx: EvalContext) {
+  // 合并而非覆盖
+  if (ctx.global.forcedVariations && ctx.user.forcedVariations) {
+    return { ...ctx.global.forcedVariations, ...ctx.user.forcedVariations };
+  }
+  return ctx.global.forcedVariations || ctx.user.forcedVariations || {};
 }
 ```
 
@@ -320,9 +390,10 @@ React Component
 GrowthBook.evalFeature(id)
     │
     ▼ _getEvalContext()  [UserContext + GlobalContext + StackContext]
-core.evalFeature(id, ctx)  [纯函数，无副作用]
+core.evalFeature(id, ctx)  [依赖注入，有副作用]
     │
-    ├─► 检查循环依赖 (StackContext.evaluatedFeatures)
+    ├─► 修改 ctx.stack.evaluatedFeatures.add(id)
+    ├─► 检查循环依赖
     ├─► 检查强制值 (getForcedFeatureValues)
     ├─► 检查特性是否存在
     ├─► 遍历规则 (FeatureRule[])
@@ -331,12 +402,20 @@ core.evalFeature(id, ctx)  [纯函数，无副作用]
     │   ├─► 条件评估 (condition → mongrule)
     │   ├─► 百分比推送 (coverage → hash)
     │   └─► 实验规则 → runExperiment()
-    └─► onFeatureUsage() 回调
+    │        ├─► 修改 ctx.user.trackedExperiments
+    │        ├─► 修改 ctx.user.stickyBucketAssignmentDocs
+    │        ├─► 调用 saveStickyBucketAssignmentDoc 持久化
+    │        └─► 触发 onExperimentViewed 回调
+    ├─► 修改 ctx.user.trackedFeatureUsage
+    ├─► 修改 ctx.user.devLogs
+    └─► 触发 onFeatureUsage() 回调
     │
     ▼ 返回 FeatureResult
 ```
 
-### 4.2 核心评估函数设计
+> **修正说明**：评估过程会**修改传入的 ctx 对象**（stack.evaluatedFeatures、user.trackedExperiments、user.trackedFeatureUsage、user.stickyBucketAssignmentDocs）并触发多个回调，**不是纯函数**。
+
+### 4.2 核心评估函数的副作用分析
 
 **文件**: `packages/sdk-js/src/core.ts:172-383`
 
@@ -345,49 +424,24 @@ export function evalFeature<V = unknown>(
   id: string,
   ctx: EvalContext  // 依赖注入，不直接引用 GrowthBook 实例
 ): FeatureResult<V | null> {
-  // 1. 循环依赖检测
+  // 副作用 1: 修改 ctx.stack.evaluatedFeatures
   if (ctx.stack.evaluatedFeatures.has(id)) {
     return getFeatureResult(ctx, id, null, "cyclicPrerequisite");
   }
   ctx.stack.evaluatedFeatures.add(id);
+  ctx.stack.id = id;
 
-  // 2. 全局强制值覆盖
-  const forcedValues = getForcedFeatureValues(ctx);
-  if (forcedValues.has(id)) {
-    return getFeatureResult(ctx, id, forcedValues.get(id), "override");
-  }
-
-  // 3. 未知特性
-  if (!ctx.global.features || !ctx.global.features[id]) {
-    return getFeatureResult(ctx, id, null, "unknownFeature");
-  }
+  // ... 强制值检查、特性存在性检查 ...
 
   const feature = ctx.global.features[id];
 
-  // 4. 规则遍历
   if (feature.rules) {
     for (const rule of feature.rules) {
-      // 先决条件（递归调用 evalFeature）
-      if (rule.parentConditions) {
-        for (const parentCondition of rule.parentConditions) {
-          const parentResult = evalFeature(parentCondition.id, ctx);
-          // ... 先决条件检查逻辑
-        }
-      }
+      // ... 先决条件、过滤器、条件、百分比检查 ...
 
-      // 过滤器
-      if (rule.filters && isFilteredOut(rule.filters, ctx)) continue;
-
-      // 强制值规则
-      if ("force" in rule) {
-        if (rule.condition && !conditionPasses(rule.condition, ctx)) continue;
-        if (!isIncludedInRollout(ctx, ...)) continue;
-        return getFeatureResult(ctx, id, rule.force, "force", rule.id);
-      }
-
-      // 实验规则
       if (rule.variations) {
-        const exp: Experiment<V> = { /* 从 rule 构造实验 */ };
+        const exp: Experiment<V> = { /* 构造实验 */ };
+        // 调用 runExperiment（内部有大量副作用）
         const { result } = runExperiment(exp, id, ctx);
         if (result.inExperiment && !result.passthrough) {
           return getFeatureResult(ctx, id, result.value, "experiment", rule.id, exp, result);
@@ -396,9 +450,96 @@ export function evalFeature<V = unknown>(
     }
   }
 
-  // 5. 默认值
   return getFeatureResult(ctx, id, feature.defaultValue ?? null, "defaultValue");
 }
+```
+
+#### getFeatureResult 中的副作用
+
+**文件**: `packages/sdk-js/src/core.ts:787-812`
+
+```typescript
+function getFeatureResult<T>(ctx, key, value, source, ruleId?, experiment?, result?): FeatureResult<T> {
+  const ret: FeatureResult = { value, on: !!value, off: !value, source, ruleId: ruleId || "" };
+  if (experiment) ret.experiment = experiment;
+  if (result) ret.experimentResult = result;
+
+  // 副作用 2: 触发 onFeatureUsage 回调
+  if (source !== "override") {
+    onFeatureUsage(ctx, key, ret);
+  }
+
+  return ret;
+}
+```
+
+#### onFeatureUsage 中的副作用
+
+**文件**: `packages/sdk-js/src/core.ts:125-170`
+
+```typescript
+function onFeatureUsage(ctx, key, ret): void {
+  // 副作用 3: 修改 ctx.user.trackedFeatureUsage
+  if (ctx.user.trackedFeatureUsage) {
+    const stringifiedValue = JSON.stringify(ret.value);
+    if (ctx.user.trackedFeatureUsage[key] === stringifiedValue) return;
+    ctx.user.trackedFeatureUsage[key] = stringifiedValue;
+
+    // 副作用 4: 修改 ctx.user.devLogs
+    if (ctx.user.enableDevMode && ctx.user.devLogs) {
+      ctx.user.devLogs.push({
+        featureKey: key,
+        result: ret,
+        timestamp: Date.now().toString(),
+        logType: "feature",
+      });
+    }
+  }
+
+  // 副作用 5: 触发全局和用户级回调
+  if (ctx.global.onFeatureUsage) safeCall(() => ctx.global.onFeatureUsage(key, ret, ctx.user));
+  if (ctx.user.onFeatureUsage) safeCall(() => ctx.user.onFeatureUsage(key, ret));
+  if (ctx.global.eventLogger) safeCall(() => ctx.global.eventLogger(...));
+}
+```
+
+#### runExperiment 中的副作用
+
+**文件**: `packages/sdk-js/src/core.ts:727-770`
+
+```typescript
+// runExperiment 内部的副作用：
+
+// 副作用 6: 修改 ctx.user.trackedExperiments
+function onExperimentViewed(ctx, experiment, result) {
+  if (ctx.user.trackedExperiments) {
+    const k = getExperimentDedupeKey(experiment, result);
+    if (ctx.user.trackedExperiments.has(k)) return [];
+    ctx.user.trackedExperiments.add(k);  // ← 修改
+  }
+  // ... 触发追踪回调
+}
+
+// 副作用 7: 修改 ctx.user.stickyBucketAssignmentDocs
+// 副作用 8: 调用 saveStickyBucketAssignmentDoc 持久化存储
+if (ctx.user.saveStickyBucketAssignmentDoc && !experiment.disableStickyBucketing) {
+  const { changed, key: attrKey, doc } = generateStickyBucketAssignmentDoc(...);
+  if (changed) {
+    ctx.user.stickyBucketAssignmentDocs =
+      ctx.user.stickyBucketAssignmentDocs || {};
+    ctx.user.stickyBucketAssignmentDocs[attrKey] = doc;  // ← 修改
+    ctx.user.saveStickyBucketAssignmentDoc(doc);  // ← 持久化
+  }
+}
+
+// 副作用 9: 触发 saveDeferredTrack
+if (trackingCalls.length === 0 && ctx.global.saveDeferredTrack) {
+  ctx.global.saveDeferredTrack({ experiment, result });
+}
+
+// 副作用 10: 触发 recordChangeId
+"changeId" in experiment && experiment.changeId &&
+  ctx.global.recordChangeId && ctx.global.recordChangeId(experiment.changeId);
 ```
 
 ---
@@ -446,9 +587,10 @@ function getCacheKey(instance: GrowthBook | GrowthBookClient): string {
     return baseKey;
   }
 
-  // 远程评估模式：包含影响评估结果的所有变量
+  // 远程评估模式：包含影响评估结果的变量
   const attributes = instance.getAttributes();
-  const cacheKeyAttributes = instance.getCacheKeyAttributes() || Object.keys(attributes);
+  const cacheKeyAttributes =
+    instance.getCacheKeyAttributes() || Object.keys(instance.getAttributes());
   const ca: Attributes = {};
   cacheKeyAttributes.forEach(key => { ca[key] = attributes[key]; });
 
@@ -459,7 +601,47 @@ function getCacheKey(instance: GrowthBook | GrowthBookClient): string {
 }
 ```
 
-### 5.3 SWR (Stale-While-Revalidate) 缓存策略
+### 5.3 remoteEval 缓存键与请求载荷不对齐
+
+#### 缓存键组成（getCacheKey）
+
+```typescript
+// 缓存键包含 3 部分（经过过滤）
+return `${baseKey}||${JSON.stringify({
+  ca,   // 经过 cacheKeyAttributes 过滤的属性子集
+  fv,   // forcedVariations
+  url,  // 当前 URL
+})}`;
+```
+
+#### 实际请求载荷（fetchFeatures）
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:392-403`
+
+```typescript
+// 请求载荷包含 4 部分（完整）
+payload: {
+  attributes: instance.getAttributes(),              // 完整属性，不过滤
+  forcedVariations: instance.getForcedVariations(),  // 同缓存键
+  forcedFeatures: Array.from(instance.getForcedFeatures().entries()),  // ← 缓存键缺少！
+  url: instance.getUrl(),                            // 同缓存键
+}
+```
+
+#### 不对齐问题分析
+
+| 字段 | 缓存键 | 请求载荷 | 说明 |
+|------|--------|----------|------|
+| `attributes` | `ca`（经 `cacheKeyAttributes` 过滤） | 完整 `getAttributes()` | 可能导致不同属性集但相同缓存键的请求共享缓存 |
+| `forcedFeatures` | ❌ 缺失 | ✅ 包含 | 不同 `forcedFeatures` 的请求会错误共享缓存 |
+| `forcedVariations` | ✅ `fv` | ✅ 相同 | 对齐 |
+| `url` | ✅ `url` | ✅ 相同 | 对齐 |
+
+**边界情况**：
+- 当设置了 `forcedFeatures` 时，缓存键不会包含它，导致相同属性/URL/forcedVariations 但不同 forcedFeatures 的请求会命中同一缓存
+- 当 `cacheKeyAttributes` 只配置了部分属性时，属性变化但缓存键不变，也会导致缓存命中错误
+
+### 5.4 SWR (Stale-While-Revalidate) 缓存策略
 
 **文件**: `packages/sdk-js/src/feature-repository.ts:206-256`
 
@@ -478,7 +660,6 @@ async function fetchFeaturesWithCache({
 
   // 缓存有效或允许陈旧数据
   if (existing && (allowStale || existing.staleAt > now) && existing.staleAt > minStaleAt) {
-    // 后台刷新过期缓存
     if (existing.staleAt < now) {
       fetchFeatures(instance);  // 后台异步刷新
     } else {
@@ -493,7 +674,7 @@ async function fetchFeaturesWithCache({
 }
 ```
 
-### 5.4 请求去重机制
+### 5.5 请求去重机制
 
 **文件**: `packages/sdk-js/src/feature-repository.ts:381-446`
 
@@ -504,7 +685,11 @@ async function fetchFeatures(instance: GrowthBook | GrowthBookClient): Promise<F
   // 关键：如果已有进行中的请求，直接返回同一个 Promise
   let promise = activeFetches.get(cacheKey);
   if (!promise) {
-    promise = (polyfills.fetch as typeof globalThis.fetch)(url, options)
+    const fetcher = remoteEval
+      ? helpers.fetchRemoteEvalCall({ /* 远程评估请求 */ })
+      : helpers.fetchFeaturesCall({ /* 普通请求 */ });
+
+    promise = fetcher
       .then(res => res.json())
       .then(data => {
         onNewFeatureData(key, cacheKey, data);  // 更新缓存 + 通知所有实例
@@ -523,9 +708,82 @@ async function fetchFeatures(instance: GrowthBook | GrowthBookClient): Promise<F
 }
 ```
 
-### 5.5 多实例广播机制
+### 5.6 SSE 只对已订阅实例生效的边界
+
+#### 订阅流程
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:568-581`
+
+```typescript
+export function startStreaming(
+  instance: GrowthBook | GrowthBookClient,
+  options: InitOptions | InitSyncOptions,
+) {
+  if (options.streaming) {
+    if (!instance.getClientKey()) {
+      throw new Error("Must specify clientKey to enable streaming");
+    }
+    if (options.payload) {
+      startAutoRefresh(instance, true);
+    }
+    subscribe(instance);  // ← 只有调用 startStreaming 且 streaming=true 才会订阅
+  }
+}
+
+function subscribe(instance): void {
+  const key = getKey(instance);
+  const subs = subscribedInstances.get(key) || new Set();
+  subs.add(instance);
+  subscribedInstances.set(key, subs);
+}
+```
+
+#### SSE 事件通知边界
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:473-484`
+
+```typescript
+cb: (event: MessageEvent<string>) => {
+  try {
+    if (event.type === "features-updated") {
+      // 只通知已订阅的实例
+      const instances = subscribedInstances.get(key);
+      instances && instances.forEach(instance => fetchFeatures(instance));
+    } else if (event.type === "features") {
+      const json = JSON.parse(event.data);
+      // onNewFeatureData 也只通知已订阅实例
+      onNewFeatureData(key, cacheKey, json);
+    }
+  } catch (e) { onSSEError(channel); }
+}
+```
+
+#### onNewFeatureData 通知边界
 
 **文件**: `packages/sdk-js/src/feature-repository.ts:338-371`
+
+```typescript
+function onNewFeatureData(key, cacheKey, data): void {
+  // ... 更新缓存 ...
+
+  // 只通知已订阅该 key 的实例
+  const instances = subscribedInstances.get(key);
+  instances && instances.forEach(instance => refreshInstance(instance, data));
+}
+```
+
+#### 边界条件总结
+
+| 场景 | 是否接收 SSE 更新 | 说明 |
+|------|------------------|------|
+| `init({ streaming: true })` | ✅ 是 | 调用 `startStreaming` → `subscribe` |
+| `init({ streaming: false })` | ❌ 否 | 不订阅 |
+| `init()` 不传 streaming | ❌ 否 | 默认不订阅 |
+| 直接 `new GrowthBook({ clientKey })` | ❌ 否 | 不调用 init 也不订阅 |
+| 实例已 `destroy()` | ❌ 否 | `unsubscribe` 从集合中移除 |
+| 同一 clientKey 的不同实例 | 取决于各自是否订阅 | 实例独立管理订阅状态 |
+
+### 5.7 多实例广播机制
 
 ```typescript
 function onNewFeatureData(
@@ -550,58 +808,19 @@ function onNewFeatureData(
       staleAt: new Date(Date.now() + cacheSettings.staleTTL),
       sse: supportsSSE.has(key),
     });
-    cleanupCache();  // 维护 maxEntries 限制
+    cleanupCache();
   }
 
   // 3. 持久化到 localStorage
   updatePersistentCache();
 
-  // 4. 通知所有订阅该 key 的 GrowthBook 实例
+  // 4. 只通知已订阅该 key 的 GrowthBook 实例
   const instances = subscribedInstances.get(key);
   instances && instances.forEach(instance => refreshInstance(instance, data));
 }
 ```
 
-### 5.6 SSE 实时更新流
-
-**文件**: `packages/sdk-js/src/feature-repository.ts:449-503`
-
-```typescript
-function startAutoRefresh(instance: GrowthBook, forceSSE: boolean = false): void {
-  const key = getKey(instance);
-
-  // 检查是否支持 SSE（通过响应头 x-sse-support 判断）
-  if (cacheSettings.backgroundSync && supportsSSE.has(key) && polyfills.EventSource) {
-    if (streams.has(key)) return;  // 已有流，不重复创建
-
-    const channel: ScopedChannel = {
-      src: null,
-      host: streamingHost,
-      clientKey,
-      cb: (event: MessageEvent<string>) => {
-        try {
-          if (event.type === "features-updated") {
-            // 通知所有实例重新拉取
-            const instances = subscribedInstances.get(key);
-            instances?.forEach(instance => fetchFeatures(instance));
-          } else if (event.type === "features") {
-            // 直接接收 payload
-            const json = JSON.parse(event.data);
-            onNewFeatureData(key, cacheKey, json);
-          }
-        } catch (e) { onSSEError(channel); }
-      },
-      errors: 0,
-      state: "active",
-    };
-
-    streams.set(key, channel);
-    enableChannel(channel);  // 创建 EventSource 连接
-  }
-}
-```
-
-### 5.7 实例订阅与取消订阅
+### 5.8 实例订阅与取消订阅
 
 ```typescript
 function subscribe(instance: GrowthBook | GrowthBookClient): void {
@@ -644,32 +863,71 @@ private _render() {
 }
 ```
 
-**触发 `_render()` 的场景**：
+#### 实际触发 `_render()` 的场景（纠正后）
 
-1. **setPayload** - 新特性数据到达 (`GrowthBook.ts:213-230`)
+**文件**: `packages/sdk-js/src/GrowthBook.ts`
+
+1. **setPayload** - 新特性数据到达 (`:213-230`)
    ```typescript
    public async setPayload(payload: FeatureApiResponse): Promise<void> {
      this._payload = payload;
      // ... 解密、更新 _options.features
      this.ready = true;
-     this._render();  // 触发重渲染
+     this._render();  // ✅ 触发重渲染
    }
    ```
 
-2. **setAttributes** - 用户属性变更 (`GrowthBook.ts:424-435`)
+2. **setAttributes** - 用户属性变更 (`:424-435`)
    ```typescript
    public async setAttributes(attributes: Attributes) {
      this._options.attributes = attributes;
      // ... 刷新粘性桶
-     this._render();  // 触发重渲染
+     this._render();  // ✅ 触发重渲染
    }
    ```
 
-3. **setForcedVariations** / **setForcedFeatures** - 强制值变更
+3. **setForcedVariations** - 强制变体变更 (`:454-462`)
+   ```typescript
+   public async setForcedVariations(vars: Record<string, number>) {
+     this._options.forcedVariations = vars || {};
+     // ... remoteEval 刷新
+     this._render();  // ✅ 触发重渲染
+   }
+   ```
 
-4. **setURL** - URL 变更
+4. **setForcedFeatures** - 强制特性变更 (`:465-468`)
+   ```typescript
+   public setForcedFeatures(map: Map<string, any>) {
+     this._options.forcedFeatureValues = map;
+     this._render();  // ✅ 触发重渲染
+   }
+   ```
 
-5. **setFeatures** (deprecated) - 直接设置特性
+5. **setFeatures** (deprecated) - 直接设置特性 (`:381-385`)
+   ```typescript
+   public setFeatures(features: Record<string, FeatureDefinition>) {
+     this._options.features = features;
+     this.ready = true;
+     this._render();  // ✅ 触发重渲染
+   }
+   ```
+
+6. **setURL** - URL 变更 (`:470-480`)
+   ```typescript
+   public async setURL(url: string) {
+     if (url === this._options.url) return;
+     this._options.url = url;
+     this._redirectedUrl = "";
+     if (this._options.remoteEval) {
+       await this._refreshForRemoteEval();  // 这会调用 setPayload → _render
+       this._updateAllAutoExperiments(true);
+       return;
+     }
+     this._updateAllAutoExperiments(true);  // ❌ 非 remoteEval 模式下不调用 _render
+   }
+   ```
+
+> **修正说明**：`setURL` 在 **非 remoteEval 模式下不直接触发 `_render()`**，只调用 `_updateAllAutoExperiments()` 更新自动实验。只有在 remoteEval 模式下，通过 `_refreshForRemoteEval()` → `setPayload()` 间接触发重渲染。
 
 ### 6.2 订阅机制（Subscriptions）
 
@@ -738,14 +996,14 @@ function onFeatureUsage(ctx, key, ret): void {
 
 ## 七、协作面总结
 
-### 7.1 关键协作接口
+### 7.1 关键协作接口（修正后）
 
 | 协作面 | 实现方式 | 核心代码位置 |
 |--------|---------|-------------|
 | **实例持有** | React Context 持有 JS 实例引用 | `GrowthBookReact.tsx:26-28` |
 | **渲染控制** | JS 核心通过 `setRenderer` 回调控制 React | `GrowthBookReact.tsx:183-193` |
 | **配置传递** | `_getEvalContext()` 拆分为 Global+User+Stack | `GrowthBook.ts:626-674` |
-| **评估逻辑** | `core.ts` 纯函数，接收 EvalContext | `core.ts:172-383` |
+| **评估逻辑** | `core.ts` 依赖注入 + 有副作用的评估 | `core.ts:172-383` |
 | **缓存共享** | `feature-repository.ts` 模块级全局变量 | `feature-repository.ts:108-117` |
 | **请求去重** | `activeFetches` Map 存储进行中的 Promise | `feature-repository.ts:390-391` |
 | **多实例广播** | `subscribedInstances` Map + `onNewFeatureData` | `feature-repository.ts:368-371` |
@@ -774,15 +1032,16 @@ function onFeatureUsage(ctx, key, ret): void {
 │              ▼               ▼                               │
 │    GlobalContext       UserContext                           │
 │    (features,          (attributes,                         │
-│     experiments,       url, forced*)                         │
-│     savedGroups)                                             │
+│     experiments,       url, forced*,                        │
+│     savedGroups,       tracked*,                            │
+│     instance cb)        devLogs)                            │
 └──────────────────────┬──────────────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────────────┐
-│  core.ts (纯函数层)                                           │
+│  core.ts (评估层 - 有副作用)                                 │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │  evalFeature(id, ctx)                                │   │
-│  │  runExperiment(exp, ctx)                             │   │
+│  │  evalFeature(id, ctx)                                │───┼─── 修改 ctx.*
+│  │  runExperiment(exp, ctx)                             │───┼─── 触发回调
 │  └──────────────────────────────────────────────────────┘   │
 └──────────────────────┬──────────────────────────────────────┘
                        │
@@ -791,7 +1050,7 @@ function onFeatureUsage(ctx, key, ret): void {
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │  cache: Map<cacheKey, CacheEntry>                    │   │
 │  │  activeFetches: Map<cacheKey, Promise>               │───┼─── 多实例共享
-│  │  subscribedInstances: Map<key, Set<Instance>>        │   │
+│  │  subscribedInstances: Map<key, Set<Instance>>        │───┼─── 仅订阅实例可见
 │  │  streams: Map<key, ScopedChannel>                    │   │
 │  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
@@ -799,15 +1058,20 @@ function onFeatureUsage(ctx, key, ret): void {
 
 ### 7.3 设计亮点
 
-1. **关注点分离**：React 层只负责 UI 集成，JS 核心负责业务逻辑，core 层纯函数评估
+1. **关注点分离**：React 层只负责 UI 集成，JS 核心负责业务逻辑，core 层负责评估算法
 2. **依赖注入**：评估逻辑不直接依赖 GrowthBook 实例，而是通过 EvalContext 注入
 3. **缓存全局共享**：模块级存储实现多实例缓存复用，避免重复网络请求
 4. **渲染控制反转**：JS 核心通过回调控制 React 重渲染，保持实例的框架无关性
 5. **上下文分层**：Global/User/Stack 三层上下文设计，清晰区分不同生命周期的配置
+6. **双客户端设计**：GrowthBook（单用户）与 GrowthBookClient（多用户）适配不同场景
 
-### 7.4 潜在注意点
+### 7.4 已确认的边界与注意点
 
 1. **缓存是全局的**：多个 `GrowthBook` 实例（即使在不同 React 应用中）共享同一缓存
 2. **实例必须手动销毁**：调用 `destroy()` 才能从 `subscribedInstances` 中移除，否则内存泄漏
 3. **SSE 流也是全局共享**：同一 clientKey 的多个实例共享一个 SSE 连接
-4. **remoteEval 模式缓存 key 包含用户属性**：不同用户不会共享缓存，但同一用户的多个实例会共享
+4. **remoteEval 缓存键与请求载荷不对齐**：缺少 `forcedFeatures`，`attributes` 经过过滤可能导致缓存错误命中
+5. **SSE 只对已订阅实例生效**：必须 `init({ streaming: true })` 才会订阅并接收实时更新
+6. **setURL 不总是触发重渲染**：非 remoteEval 模式下 `setURL` 不调用 `_render()`
+7. **core.ts 评估层有副作用**：会修改传入的 ctx 对象（tracked*、devLogs、stickyBucketAssignmentDocs 等）
+8. **GrowthBook 与 GrowthBookClient 回调归属不同**：单用户 vs 多用户模式导致回调在 Global/User 中的归属不同
