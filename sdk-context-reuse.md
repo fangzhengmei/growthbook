@@ -803,17 +803,88 @@ export function startStreaming(
 - `streaming=false` 或 `undefined`：**不做任何操作**，既不订阅也不取消已有订阅
 - 取消订阅的唯一方式：调用 `destroy()` → `unsubscribe()` 或 `clearAutoRefresh()`
 
-**调用路径**（每次 init 都会调用 startStreaming）：
+**调用路径对比**：
+
+##### init (异步) 的 startStreaming 调用路径
+
+**文件**: `packages/sdk-js/src/GrowthBook.ts:264, 279, 289`
 
 ```typescript
-// GrowthBook.init 三处调用 startStreaming
-// 1. setPayload 成功后
-// 2. init 有 payload 分支
-// 3. init 无 payload 分支
+public async init(options?: InitOptions): Promise<InitResponse> {
+  this._initialized = true;
+  options = options || {};
 
-// GrowthBook.ts:264, 279, 289
-startStreaming(this, options);
+  // init 独有：先配置 cacheSettings（可能全局影响）
+  if (options.cacheSettings) {
+    configureCache(options.cacheSettings);  // ← init 独有，initSync 没有
+  }
+
+  if (options.payload) {
+    await this.setPayload(options.payload);
+    startStreaming(this, options);  // 调用点 1
+    return { success: true, source: "init" };
+  } else {
+    const { data, ...res } = await this._refresh({
+      ...options,
+      allowStale: true,
+    });
+    startStreaming(this, options);  // 调用点 2
+    await this.setPayload(data || {});
+    return res;
+  }
+}
+
+// setPayload 内部也调用 startStreaming
+// GrowthBook.ts:264
+public async setPayload(payload: FeatureApiResponse): Promise<void> {
+  // ... 解密、更新 features ...
+  this.ready = true;
+  startStreaming(this, options);  // 调用点 3
+}
 ```
+
+##### initSync (同步) 的 startStreaming 调用路径
+
+**文件**: `packages/sdk-js/src/GrowthBook.ts:232-266`
+
+```typescript
+public initSync(options: InitSyncOptions): GrowthBook {
+  this._initialized = true;
+
+  const payload = options.payload;
+
+  // initSync 没有 cacheSettings 配置步骤！
+  // 没有 configureCache 调用
+
+  // ... 同步设置 payload ...
+  this._payload = payload;
+  if (payload.features) this._options.features = payload.features;
+  if (payload.experiments) {
+    this._options.experiments = payload.experiments;
+    this._updateAllAutoExperiments();
+  }
+
+  this.ready = true;
+
+  startStreaming(this, options);  // 唯一调用点
+
+  return this;
+}
+```
+
+##### init vs initSync 调用路径差异对照表
+
+| 差异点 | init (异步) | initSync (同步) |
+|--------|------------|----------------|
+| `cacheSettings` 处理 | ✅ 调用 `configureCache(options.cacheSettings)` | ❌ 不支持 `cacheSettings` 参数 |
+| `startStreaming` 调用次数 | 1-3 次（取决于代码路径） | 固定 1 次 |
+| `payload` 参数 | 可选 | 必填 |
+| 加密 payload 支持 | ✅ 支持（异步解密） | ❌ 不支持（直接抛错） |
+| 调用 `_refresh` 拉取远程 | ✅ 无 payload 时调用 | ❌ 从不调用（必须本地提供 payload） |
+| `stickyBucketService` 处理 | 异步版本 | 同步版本 |
+| `streaming` 参数 | 可选，支持 `undefined` | 可选，支持 `undefined` |
+
+> **关键差异**：`init` 在 `setPayload` 中也会调用 `startStreaming`，因此一次 `init()` 调用可能触发两次 `startStreaming`（先在 `_refresh` 后调用一次，再在 `setPayload` 中调用一次）。而 `initSync` 只在末尾调用一次。但由于 `startStreaming` 内部 `subscribe` 是幂等的，多次调用不会导致重复订阅。
 
 **状态延续场景**：
 
@@ -862,37 +933,82 @@ export function configureCache(overrides: Partial<CacheSettings>): void {
 }
 ```
 
-#### backgroundSync=false 的设置路径
+#### backgroundSync=false 的设置路径与差异影响
 
-**路径 1：通过 cacheSettings 设置**
+##### 路径 1：configureCache({ backgroundSync: false }) — 激进清空
+
+**触发场景**：`init({ cacheSettings: { backgroundSync: false } })`
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:123-128`
+
 ```typescript
-// GrowthBook.ts:273-275
-public async init(options?: InitOptions): Promise<InitResponse> {
-  if (options.cacheSettings) {
-    configureCache(options.cacheSettings);  // 全局生效！
+export function configureCache(overrides: Partial<CacheSettings>): void {
+  Object.assign(cacheSettings, overrides);
+  if (!cacheSettings.backgroundSync) {
+    clearAutoRefresh();  // ← 立即清空所有 SSE 流和所有实例订阅！
   }
-  // ...
 }
 ```
 
-**路径 2：通过 refreshFeatures 设置**
+**行为特点**：
+- ✅ 设置 `cacheSettings.backgroundSync = false`
+- ✅ **立即调用 `clearAutoRefresh()`**
+- ✅ 关闭所有现有 SSE 连接
+- ✅ 清空所有实例的订阅状态
+- ✅ 清空 `supportsSSE` 标记
+- ✅ 阻止后续所有实例创建新的 SSE 流
+
+---
+
+##### 路径 2：refreshFeatures 传入 backgroundSync=false — 静默阻止
+
+**触发场景**：内部 `_refresh` 调用，间接由 `refreshFeatures()` 或 `init()` 无 payload 分支触发
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:139-162`
+
 ```typescript
-// feature-repository.ts:150-154
-export async function refreshFeatures({ ..., backgroundSync }) {
+export async function refreshFeatures({
+  instance, timeout, skipCache, allowStale, backgroundSync
+}): Promise<FetchResponse> {
   if (!backgroundSync) {
-    cacheSettings.backgroundSync = false;  // 全局生效！
+    cacheSettings.backgroundSync = false;  // ← 只修改全局变量，不清空！
   }
-  // ...
+  // 不调用 clearAutoRefresh()！
+  return fetchFeaturesWithCache({ ... });
 }
-
-// 调用时传入
-// GrowthBook.ts:366
-backgroundSync: streaming ?? this._options.backgroundSync ?? true,
 ```
 
-**路径 3：通过 GrowthBook 选项设置**
+**行为特点**：
+- ✅ 设置 `cacheSettings.backgroundSync = false`
+- ❌ **不调用 `clearAutoRefresh()`**
+- ❌ 不关闭现有 SSE 连接
+- ❌ 不清空现有实例订阅
+- ❌ 不清空 `supportsSSE` 标记
+- ✅ 阻止后续所有实例创建新的 SSE 流
+
+---
+
+##### 两条路径的差异影响对照表
+
+| 影响 | configureCache 路径 | refreshFeatures 路径 |
+|------|---------------------|----------------------|
+| 修改 `cacheSettings.backgroundSync` | ✅ 是 | ✅ 是 |
+| 调用 `clearAutoRefresh()` | ✅ 是 | ❌ 否 |
+| 关闭现有 SSE 连接 | ✅ 是 | ❌ 否（继续运行） |
+| 清空 `subscribedInstances` | ✅ 是 | ❌ 否（保留） |
+| 清空 `supportsSSE` 标记 | ✅ 是 | ❌ 否（保留） |
+| 阻止新建 SSE 流 | ✅ 是 | ✅ 是 |
+| 已有订阅实例是否继续收更新 | ❌ 否（被清空） | ✅ 是（流继续运行） |
+
+> **关键差异**：configureCache 路径是**破坏性全局重置**，refreshFeatures 路径是**静默渐进式禁用**。后者保留现有流和订阅，只阻止新建。
+
+---
+
+##### 路径 3：通过 GrowthBook 选项自动推导
+
+**文件**: `packages/sdk-js/src/auto-wrapper.ts:180-185`
+
 ```typescript
-// auto-wrapper.ts:180-185
 gb.init({
   streaming: !(
     windowContext.noStreaming ||
@@ -902,14 +1018,17 @@ gb.init({
 });
 ```
 
-#### backgroundSync=false 的全局影响
+这个路径不直接设置 `cacheSettings.backgroundSync`，只影响 `streaming` 参数，进而影响 `_refresh` 调用时传入的 `backgroundSync` 值。
+
+#### backgroundSync=false 的全局影响总结
 
 | 影响范围 | 具体表现 | 代码位置 |
 |---------|---------|---------|
-| **立即清空所有流** | 调用 `clearAutoRefresh()`，关闭所有 SSE 连接，清空所有实例订阅 | `feature-repository.ts:126` |
 | **阻止新建 SSE 流** | `startAutoRefresh` 中 `cacheSettings.backgroundSync` 检查不通过，不创建流 | `feature-repository.ts:463` |
 | **所有实例受影响** | 模块级变量，同一 JavaScript 运行时内所有 GrowthBook 实例都受影响 | 模块级状态 |
 | **无法单独恢复** | 必须再次调用 `configureCache({ backgroundSync: true })` 全局恢复 | 全局设置 |
+| **configureCache 额外影响** | 立即清空所有流和订阅 | `feature-repository.ts:126` |
+| **refreshFeatures 额外影响** | 仅阻止新建，保留现有流和订阅 | `feature-repository.ts:152-154` |
 
 #### clearAutoRefresh 的完整清理逻辑
 
@@ -923,6 +1042,114 @@ export function clearAutoRefresh() {
   helpers.stopIdleListener();             // 停止空闲流清理
 }
 ```
+
+### 5.7.1 refreshFeatures 公开参数口径与内部 backgroundSync 行为关系
+
+#### 公开参数口径（对外 API）
+
+**文件**: `packages/sdk-js/src/types/growthbook.ts:538-541`
+
+```typescript
+// 公开的 RefreshFeaturesOptions 只有两个参数
+export type RefreshFeaturesOptions = {
+  timeout?: number;
+  skipCache?: boolean;
+  // ❌ 没有 streaming 参数
+  // ❌ 没有 backgroundSync 参数
+};
+```
+
+#### 内部实际参数（私有 _refresh 方法）
+
+**文件**: `packages/sdk-js/src/GrowthBook.ts:348-356`
+
+```typescript
+// 内部 _refresh 方法接收额外的内部参数
+private async _refresh({
+  timeout,
+  skipCache,
+  allowStale,
+  streaming,  // ← 内部参数，公开 API 无法直接传入
+}: RefreshFeaturesOptions & {
+  allowStale?: boolean;
+  streaming?: boolean;  // 内部扩展参数
+}) {
+  // ...
+  return refreshFeatures({
+    instance: this,
+    timeout,
+    skipCache: skipCache || this._options.disableCache,
+    allowStale,
+    // backgroundSync 的值由多级 fallback 计算得出
+    backgroundSync: streaming ?? this._options.backgroundSync ?? true,  // ← 关键计算逻辑
+  });
+}
+```
+
+#### backgroundSync 值的计算链路
+
+**文件**: `packages/sdk-js/src/GrowthBook.ts:366` 和 `GrowthBookClient.ts:200`
+
+```typescript
+// GrowthBook 的计算逻辑
+backgroundSync: streaming ?? this._options.backgroundSync ?? true
+
+// GrowthBookClient 的计算逻辑（没有实例级 backgroundSync 选项）
+backgroundSync: streaming ?? true
+```
+
+**计算优先级（从高到低）**：
+
+| 优先级 | 来源 | 类型 | 说明 |
+|--------|------|------|------|
+| 1 | `streaming` 参数 | 内部传入 | 来自 `_refresh` 的内部 `streaming` 参数，只有 `init()` 等内部调用能设置 |
+| 2 | `this._options.backgroundSync` | 实例配置 | 仅 GrowthBook 有，构造时传入 |
+| 3 | `true` | 默认值 | 硬编码默认 |
+
+#### 公开调用路径的实际行为
+
+```typescript
+// 公开 API：用户只能传 timeout 和 skipCache
+public async refreshFeatures(options?: RefreshFeaturesOptions): Promise<void> {
+  const res = await this._refresh({
+    ...(options || {}),
+    allowStale: false,  // ← 强制 allowStale=false
+    // ← 不传入 streaming 参数，使用 undefined
+  });
+  if (res.data) {
+    await this.setPayload(res.data);
+  }
+}
+```
+
+**用户调用 `refreshFeatures()` 时的实际行为**：
+
+1. `streaming` 参数为 `undefined`（不传入）
+2. `backgroundSync` 计算值：
+   - GrowthBook：`undefined ?? this._options.backgroundSync ?? true` → 取决于实例配置
+   - GrowthBookClient：`undefined ?? true` → 始终为 `true`
+3. 因此 `cacheSettings.backgroundSync` **不会被设置为 false**
+4. 公开调用 `refreshFeatures()` **不会触发静默禁用 SSE 的副作用**
+
+#### 只有内部调用会触发 backgroundSync=false
+
+**能传入 `streaming=false` 的内部调用路径**：
+
+1. `init()` 无 payload 分支：`this._refresh({ ...options, allowStale: true })`
+   - 如果用户传 `init({ streaming: false })`，`streaming=false` 会传递给 `_refresh`
+   - `backgroundSync = false ?? options.backgroundSync ?? true` → 可能为 `false`
+
+2. `loadFeatures()`（已废弃）：
+   ```typescript
+   streaming: (this._options.backgroundSync ?? true) &&
+              (options.autoRefresh || this._options.subscribeToChanges)
+   ```
+
+3. 其他内部 `_refresh` 调用（如果有）
+
+> **关键结论**：公开的 `refreshFeatures()` API **不会**将 `backgroundSync` 设置为 `false`。只有通过 `init({ streaming: false })` 等内部路径才会触发这一副作用。这是公开参数口径与内部行为的重要差异。
+
+---
 
 ### 5.8 destroyAllStreams 清空全局订阅与流的影响
 
@@ -1350,7 +1577,10 @@ function onFeatureUsage(ctx, key, ret): void {
 7. **core.ts 评估层有副作用**：会修改传入的 ctx 对象（tracked*、devLogs、stickyBucketAssignmentDocs 等）
 8. **GrowthBook 与 GrowthBookClient 回调归属不同**：单用户 vs 多用户模式导致回调在 Global/User 中的归属不同
 9. **streaming 参数具有粘性**：`init({ streaming: false })` 不会取消之前 `streaming=true` 建立的订阅，除非 `destroy()` 或全局清空
-10. **backgroundSync=false 是全局副作用**：会立即清空所有 SSE 流和所有实例订阅，影响同一运行时内所有实例
+10. **backgroundSync=false 有两条路径，影响不同**：`configureCache` 路径会立即清空所有流和订阅，`refreshFeatures` 路径只阻止新建但保留现有
 11. **destroyAllStreams 是全局破坏性操作**：会清空所有实例订阅、关闭所有 SSE 流，慎用
 12. **可建流但未订阅不分发**：三重门控机制（流创建 → 事件分发 → 实例刷新），每一层都独立判断，流存在不代表实例能收到更新
 13. **订阅状态跨 init 调用保留**：多次调用 `init()` 时，`streaming` 参数不会主动取消之前的订阅状态
+14. **init 与 initSync 调用路径不同**：init 支持 `cacheSettings` 和可能多次调用 `startStreaming`，initSync 不支持 `cacheSettings` 且只调用一次 `startStreaming`
+15. **refreshFeatures 公开参数与内部行为不一致**：公开 API 只有 `timeout` 和 `skipCache`，内部实际会计算 `backgroundSync` 但公开调用不会触发禁用
+16. **backgroundSync 计算链路有差异**：GrowthBook 有实例级 `_options.backgroundSync`，GrowthBookClient 直接 fallback 到 `true`
