@@ -52,10 +52,10 @@ draft ──提交审核──► pending-review ──批准──► approved 
 
 ### 2.1 提交流程核心代码
 
-**入口 API**：`POST /feature/:id/:version/request`
+**入口 API**：`POST /features/:id/revisions/:version/request-review`
 
 **处理文件**：
-- `packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts`
+- `packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts:14-79`
 - `packages/back-end/src/models/FeatureRevisionModel.ts:1055-1092`
 
 ### 2.2 提交条件检查
@@ -162,7 +162,83 @@ export const canUserReviewEntity = ({
 };
 ```
 
-### 3.2 禁止自审核（Self-Approval Block）
+### 3.2 Feature 审核决策的两层限制机制（Submit Review）
+
+**入口 API**：`POST /features/:id/revisions/:version/submit-review`
+
+**处理文件**：`packages/back-end/src/api/features/postFeatureRevisionSubmitReview.ts:21-123`
+
+**核心限制逻辑**（按顺序检查，先严格后宽松）：
+
+```typescript
+// 第一层：创建者（createdBy）限制 — 最严格
+// postFeatureRevisionSubmitReview.ts:49-57
+if (
+  revision.createdBy != null &&
+  "id" in revision.createdBy &&
+  revision.createdBy.id === req.context.userId &&
+  action !== "comment"
+) {
+  throw new BadRequestError("Cannot submit a review on a draft you created");
+}
+
+// 第二层：贡献者（contributors）限制 — 仅阻止 approve
+// postFeatureRevisionSubmitReview.ts:59-76
+if (action === "approve") {
+  const requireReviews = req.context.org.settings?.requireReviews;
+  const reviewSetting = Array.isArray(requireReviews)
+    ? getReviewSetting(requireReviews, feature)
+    : undefined;
+  if (reviewSetting?.blockSelfApproval) {
+    const isSelfApproval = (revision.contributors ?? []).some(
+      (c) => c != null && "id" in c && c.id === req.context.userId,
+    );
+    if (isSelfApproval) {
+      throw new BadRequestError(
+        "You cannot approve a draft you contributed to.",
+      );
+    }
+  }
+}
+```
+
+**两层限制对比表**：
+
+| 限制层级 | 适用对象 | 限制动作 | 允许动作 | 触发条件 |
+|---------|----------|----------|----------|----------|
+| 第一层 | `createdBy`（创建者） | `approve` + `request-changes` | 仅 `comment` | 无条件，始终生效 |
+| 第二层 | `contributors`（贡献者） | 仅 `approve` | `request-changes` + `comment` | `blockSelfApproval=true` |
+
+> **关键设计意图**（代码注释第60行）：
+> "request-changes / comment are intentionally allowed."
+> 贡献者虽然不能批准自己参与的变更，但可以提出修改要求和评论，这促进了协作而非完全阻塞。
+
+**contributors 字段的维护**：
+```typescript
+// FeatureRevisionModel.ts:933-937
+const contributorUpdate =
+  log.user != null ? { $addToSet: { contributors: log.user } } : {};
+```
+每次调用 `updateRevision` 编辑草稿时，编辑者会被原子地（`$addToSet`）添加到 `contributors` 数组，避免并发编辑导致的数组覆盖问题。
+
+**审核操作允许的状态**：
+```typescript
+// postFeatureRevisionSubmitReview.ts:78-87
+if (
+  action !== "comment" &&
+  !["pending-review", "changes-requested", "approved"].includes(
+    revision.status,
+  )
+) {
+  throw new BadRequestError(...);
+}
+```
+- `comment`：无状态限制，任何状态都可评论
+- `approve` / `request-changes`：仅在 `pending-review`、`changes-requested`、`approved` 状态下允许
+
+---
+
+### 3.3 通用修订禁止自审核（Self-Approval Block）
 
 **基础规则**：作者不能批准自己的变更
 ```typescript
@@ -203,7 +279,7 @@ if (decision === "approve" && isUserBlockedFromApproving({...})) {
 }
 ```
 
-### 3.3 审核操作与状态变更
+### 3.4 审核操作与状态变更
 
 **三种审核决策**（`ReviewDecision`）：
 
@@ -239,7 +315,7 @@ async addReview(id, userId, decision, comment) {
 }
 ```
 
-### 3.4 审批需求判定（何时需要审批？）
+### 3.5 审批需求判定（何时需要审批？）
 
 **核心函数**：`checkIfRevisionNeedsReview`
 
@@ -310,10 +386,10 @@ type RequireReview = {
 
 ### 4.1 Feature 发布流程
 
-**入口 API**：`POST /feature/:id/:version/publish`
+**入口 API**：`POST /features/:id/revisions/:version/publish`
 
 **处理文件**：
-- `packages/back-end/src/api/features/postFeatureRevisionPublish.ts`
+- `packages/back-end/src/api/features/postFeatureRevisionPublish.ts:28-179`
 - `packages/back-end/src/models/FeatureModel.ts`
 
 ### 4.2 发布前置检查
@@ -632,15 +708,133 @@ options = [
 
 ---
 
-## 九、核心代码索引
+## 九、提交请求、审核决策与发布门禁的关联细节
+
+### 9.1 三个环节的完整链路图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    提交请求 (Request Review)                     │
+│  API: POST /features/:id/revisions/:version/request-review       │
+│  权限: canManageFeatureDrafts                                    │
+│  状态: 仅 draft 可提交                                           │
+│  结果: draft → pending-review，清除 datePublished                │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    审核决策 (Submit Review)                      │
+│  API: POST /features/:id/revisions/:version/submit-review        │
+│  权限: canReviewFeatureDrafts                                    │
+│  两层限制（按顺序）:                                             │
+│    1. 创建者(createdBy): 禁止 approve + request-changes          │
+│       仅允许 comment                                             │
+│    2. 贡献者(contributors) + blockSelfApproval=true:             │
+│       仅禁止 approve，允许 request-changes + comment             │
+│  状态要求:                                                        │
+│    comment: 无状态限制                                           │
+│    approve/request-changes: pending-review / changes-requested / │
+│                             approved                             │
+│  结果:                                                           │
+│    approve: → approved                                           │
+│    request-changes: → changes-requested                          │
+│    comment: 状态不变                                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    发布门禁 (Publish)                            │
+│  API: POST /features/:id/revisions/:version/publish              │
+│  六项检查（按顺序，不满足即终止）:                               │
+│    1. 编辑权限: canUpdateFeature                                 │
+│    2. 状态检查: 非 published / discarded                         │
+│    3. 冲突检查: autoMerge 无冲突                                 │
+│    4. 审批需求重估: checkIfRevisionNeedsReview(合并后状态)       │
+│       └─ 关键: 基于「合并后最终状态」vs「当前线上状态」          │
+│          而非修订创建时的差异                                    │
+│    5. 审批状态 + Bypass 检查:                                    │
+│       requiresReview && status≠approved && !canBypass → 拒绝     │
+│    6. 发布环境权限: canPublishFeature(envsToCheck)               │
+│  结果: approved → published                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 关键关联点详解
+
+#### 关联点 1：状态流转的连续性
+
+| 前序状态 | 操作 | 后续状态 | 允许的下一操作 |
+|---------|------|---------|---------------|
+| `draft` | request-review | `pending-review` | submit-review (approve/request-changes/comment) |
+| `pending-review` | submit-review (approve) | `approved` | publish, submit-review (comment 即可) |
+| `pending-review` | submit-review (request-changes) | `changes-requested` | updateRevision (编辑后自动 → pending-review) |
+| `changes-requested` | updateRevision (有内容变更) | `pending-review` | submit-review |
+| `approved` | updateRevision + resetReviewOnChange=true | `pending-review` | submit-review |
+
+#### 关联点 2：发布时的审批重估 — 最容易忽略的边界
+
+**问题场景**：
+- 周一：用户 A 创建修订，修改了生产环境的规则，提交审核
+- 周二：审批人 B 批准，状态变为 `approved`
+- 周三：管理员修改了组织审批配置，新增了生产环境需要审批
+- 周四：用户 A 点击发布
+
+**会发生什么？**
+```typescript
+// postFeatureRevisionPublish.ts:96-117
+const requiresReview = checkIfRevisionNeedsReview({
+  feature,
+  baseRevision: filledLive,        // 周四的线上状态
+  revision: effectiveRevision,     // 周四合并后的最终状态
+  // ...
+});
+
+if (requiresReview && revision.status !== "approved" && !canBypass) {
+  throw new BadRequestError(...);  // 即使周二已批准，周四仍可能被拒绝！
+}
+```
+
+**关键洞察**：
+- `revision.status === "approved"` 只是**必要条件**，不是**充分条件**
+- 发布时会用**最新的审批策略**重新评估**最新的变更差异**
+- 这意味着：即使已批准，如果审批策略变了，或线上状态变了导致变更范围扩大，发布仍可能被阻止
+
+#### 关联点 3：两层审核限制的协作关系
+
+| 用户角色 | blockSelfApproval | approve | request-changes | comment |
+|---------|-------------------|---------|-----------------|---------|
+| 非创建者、非贡献者 | false | ✅ | ✅ | ✅ |
+| 非创建者、非贡献者 | true | ✅ | ✅ | ✅ |
+| 贡献者（非创建者） | false | ✅ | ✅ | ✅ |
+| 贡献者（非创建者） | true | ❌ | ✅ | ✅ |
+| 创建者（也是贡献者） | false | ❌ | ❌ | ✅ |
+| 创建者（也是贡献者） | true | ❌ | ❌ | ✅ |
+
+> **注意**：创建者始终在 `contributors` 数组中（因为创建时的初始编辑会添加自己），所以第二层限制对创建者实际上是冗余的，但第一层限制已经更严格地阻止了所有非评论操作。
+
+#### 关联点 4：Bypass 权限的作用时机
+
+Bypass 权限**仅在发布环节**生效，在审核环节不生效：
+- 提交审核（request-review）：不检查 bypass
+- 审核决策（submit-review）：不检查 bypass，两层限制始终生效
+- 发布（publish）：检查 bypass，可以跳过审批状态要求
+
+这意味着：即使有 bypass 权限，你也不能批准自己的变更，但你可以**跳过审批流程直接发布**。
+
+---
+
+## 十、核心代码索引
 
 | 功能 | 文件位置 | 关键函数/类 |
 |------|----------|------------|
+| Feature 提交审核请求 | `packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts:14-79` | `requestReview` |
+| Feature 提交审核决策 | `packages/back-end/src/api/features/postFeatureRevisionSubmitReview.ts:21-123` | `submitRevisionReview` |
+| Feature 发布 | `packages/back-end/src/api/features/postFeatureRevisionPublish.ts:28-179` | `publishFeatureRevision` |
+| Feature 审核状态变更 | `packages/back-end/src/models/FeatureRevisionModel.ts:1055-1143` | `markRevisionAsReviewRequested`, `submitReviewAndComments` |
+| Feature 贡献者追踪 | `packages/back-end/src/models/FeatureRevisionModel.ts:933-937` | `updateRevision` 中的 `$addToSet: { contributors }` |
 | 审批判定 | `packages/shared/src/util/features.ts` | `checkIfRevisionNeedsReview` |
 | 审核人权限 | `packages/shared/src/revisions/helpers.ts` | `canUserReviewEntity`, `isUserBlockedFromApproving` |
-| 审核操作 | `packages/back-end/src/models/RevisionModel.ts` | `addReview`, `submitForReview` |
-| Feature 提交审核 | `packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts` | `requestReview` |
-| Feature 发布 | `packages/back-end/src/api/features/postFeatureRevisionPublish.ts` | `publishFeatureRevision` |
+| 通用修订审核操作 | `packages/back-end/src/models/RevisionModel.ts` | `addReview`, `submitForReview` |
 | 通用修订控制器 | `packages/back-end/src/routers/revision/revision.controller.ts` | `postReview`, `postMerge`, `postSubmit` |
 | 通用修订工具 | `packages/back-end/src/revisions/util.ts` | `buildMergeDesiredState`, `createOrUpdateRevision` |
 | 权限定义 | `packages/shared/src/permissions/permissionsClass.ts` | `Permissions` 类 |
