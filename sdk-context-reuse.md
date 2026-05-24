@@ -772,18 +772,292 @@ function onNewFeatureData(key, cacheKey, data): void {
 }
 ```
 
-#### 边界条件总结
+#### 5.6.1 streaming 参数与订阅状态延续关系
+
+**核心机制**：`startStreaming` 每次调用时**都会重新根据当前 `options.streaming` 参数决定是否订阅/保留订阅**，不存在"一次订阅永久生效"的机制。
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:568-581`
+
+```typescript
+export function startStreaming(
+  instance: GrowthBook | GrowthBookClient,
+  options: InitOptions | InitSyncOptions,
+) {
+  // 每次调用都重新判断 streaming 参数
+  if (options.streaming) {
+    if (!instance.getClientKey()) {
+      throw new Error("Must specify clientKey to enable streaming");
+    }
+    if (options.payload) {
+      startAutoRefresh(instance, true);
+    }
+    subscribe(instance);  // streaming=true 时订阅（已订阅则幂等添加）
+  }
+  // streaming=false 或 undefined 时：不做任何操作！
+  // 不会主动取消之前的订阅！
+}
+```
+
+**关键行为**：
+- `streaming=true`：调用 `subscribe(instance)`，将实例加入 `subscribedInstances`（幂等，重复添加不影响）
+- `streaming=false` 或 `undefined`：**不做任何操作**，既不订阅也不取消已有订阅
+- 取消订阅的唯一方式：调用 `destroy()` → `unsubscribe()` 或 `clearAutoRefresh()`
+
+**调用路径**（每次 init 都会调用 startStreaming）：
+
+```typescript
+// GrowthBook.init 三处调用 startStreaming
+// 1. setPayload 成功后
+// 2. init 有 payload 分支
+// 3. init 无 payload 分支
+
+// GrowthBook.ts:264, 279, 289
+startStreaming(this, options);
+```
+
+**状态延续场景**：
+
+| 调用序列 | 最终订阅状态 | 说明 |
+|----------|-------------|------|
+| `init({ streaming: true })` → `init()` | ✅ 已订阅 | 第二次 streaming 未传，不取消已有订阅 |
+| `init({ streaming: true })` → `init({ streaming: false })` | ✅ 已订阅 | streaming=false 不取消订阅 |
+| `init({ streaming: true })` → `destroy()` | ❌ 未订阅 | destroy 调用 unsubscribe |
+| `init({ streaming: false })` → `init({ streaming: true })` | ✅ 已订阅 | 第二次 streaming=true 触发订阅 |
+| 直接 `refreshFeatures({ streaming: false })` | ❌ 不影响 | refreshFeatures 不调用 startStreaming |
+
+> **修正说明**：`init({ streaming: false })` **不会取消**之前 `streaming=true` 建立的订阅，因为 `startStreaming` 在 `streaming=false` 分支是无操作。订阅状态具有"粘性"，一旦订阅除非 `destroy()` 或全局清空否则保持。
+
+#### 5.6.2 边界条件总结
 
 | 场景 | 是否接收 SSE 更新 | 说明 |
 |------|------------------|------|
 | `init({ streaming: true })` | ✅ 是 | 调用 `startStreaming` → `subscribe` |
-| `init({ streaming: false })` | ❌ 否 | 不订阅 |
-| `init()` 不传 streaming | ❌ 否 | 默认不订阅 |
+| `init({ streaming: false })` 首次调用 | ❌ 否 | 不订阅 |
+| `init({ streaming: false })` 后续调用 | ✅/❌ 取决于之前状态 | streaming=false 不主动取消订阅 |
+| `init()` 不传 streaming 首次调用 | ❌ 否 | 默认不订阅 |
+| `init()` 不传 streaming 后续调用 | ✅/❌ 取决于之前状态 | 不改变已有订阅状态 |
 | 直接 `new GrowthBook({ clientKey })` | ❌ 否 | 不调用 init 也不订阅 |
 | 实例已 `destroy()` | ❌ 否 | `unsubscribe` 从集合中移除 |
 | 同一 clientKey 的不同实例 | 取决于各自是否订阅 | 实例独立管理订阅状态 |
 
-### 5.7 多实例广播机制
+### 5.7 backgroundSync=false 的全局副作用
+
+**关键洞察**：`backgroundSync` 是**模块级全局设置**，一旦设置为 `false` 会影响**所有实例**的 SSE 流创建。
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:34, 123-128`
+
+```typescript
+// 模块级全局配置
+const cacheSettings: CacheSettings = {
+  backgroundSync: true,  // 默认开启
+  // ...
+};
+
+// 全局配置入口
+export function configureCache(overrides: Partial<CacheSettings>): void {
+  Object.assign(cacheSettings, overrides);
+  if (!cacheSettings.backgroundSync) {
+    clearAutoRefresh();  // 立即清空所有 SSE 流和订阅！
+  }
+}
+```
+
+#### backgroundSync=false 的设置路径
+
+**路径 1：通过 cacheSettings 设置**
+```typescript
+// GrowthBook.ts:273-275
+public async init(options?: InitOptions): Promise<InitResponse> {
+  if (options.cacheSettings) {
+    configureCache(options.cacheSettings);  // 全局生效！
+  }
+  // ...
+}
+```
+
+**路径 2：通过 refreshFeatures 设置**
+```typescript
+// feature-repository.ts:150-154
+export async function refreshFeatures({ ..., backgroundSync }) {
+  if (!backgroundSync) {
+    cacheSettings.backgroundSync = false;  // 全局生效！
+  }
+  // ...
+}
+
+// 调用时传入
+// GrowthBook.ts:366
+backgroundSync: streaming ?? this._options.backgroundSync ?? true,
+```
+
+**路径 3：通过 GrowthBook 选项设置**
+```typescript
+// auto-wrapper.ts:180-185
+gb.init({
+  streaming: !(
+    windowContext.noStreaming ||
+    dataContext.noStreaming ||
+    windowContext.backgroundSync === false  // backgroundSync=false 会禁用 streaming
+  ),
+});
+```
+
+#### backgroundSync=false 的全局影响
+
+| 影响范围 | 具体表现 | 代码位置 |
+|---------|---------|---------|
+| **立即清空所有流** | 调用 `clearAutoRefresh()`，关闭所有 SSE 连接，清空所有实例订阅 | `feature-repository.ts:126` |
+| **阻止新建 SSE 流** | `startAutoRefresh` 中 `cacheSettings.backgroundSync` 检查不通过，不创建流 | `feature-repository.ts:463` |
+| **所有实例受影响** | 模块级变量，同一 JavaScript 运行时内所有 GrowthBook 实例都受影响 | 模块级状态 |
+| **无法单独恢复** | 必须再次调用 `configureCache({ backgroundSync: true })` 全局恢复 | 全局设置 |
+
+#### clearAutoRefresh 的完整清理逻辑
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:554-566`
+
+```typescript
+export function clearAutoRefresh() {
+  supportsSSE.clear();                    // 清空 SSE 支持标记
+  streams.forEach(destroyChannel);       // 关闭所有 SSE 连接
+  subscribedInstances.clear();            // 清空所有实例订阅
+  helpers.stopIdleListener();             // 停止空闲流清理
+}
+```
+
+### 5.8 destroyAllStreams 清空全局订阅与流的影响
+
+**文件**: `packages/sdk-js/src/GrowthBook.ts:569-572`
+
+```typescript
+public destroy(options?: DestroyOptions) {
+  // ... 清理实例自身状态 ...
+  unsubscribe(this);  // 只取消当前实例订阅
+  if (options.destroyAllStreams) {
+    clearAutoRefresh();  // 全局清空！
+  }
+}
+
+// GrowthBookClient 同样实现
+// GrowthBookClient.ts:218-221
+public destroy(options?: DestroyOptions) {
+  unsubscribe(this);
+  if (options.destroyAllStreams) {
+    clearAutoRefresh();  // 全局清空！
+  }
+}
+```
+
+#### destroyAllStreams 的全局影响
+
+| 影响对象 | 无 destroyAllStreams | 有 destroyAllStreams |
+|---------|---------------------|---------------------|
+| **当前实例** | `unsubscribe(this)` 移除 | `unsubscribe(this)` + 全局清空 |
+| **其他实例订阅** | 不受影响 | 全部被清空（`subscribedInstances.clear()`） |
+| **SSE 流** | 继续运行 | 全部关闭（`streams.forEach(destroyChannel)`） |
+| **SSE 支持标记** | 保留 | 全部清空（`supportsSSE.clear()`） |
+| **后续实例 init** | 正常建立订阅和流 | 需要重新检测 SSE 支持，重新建立 |
+
+> **注意**：`destroyAllStreams` 是**全局破坏性操作**，会影响同一运行时内所有其他 GrowthBook 实例。除非明确知道整个应用都不再需要 SSE，否则不要使用。
+
+### 5.9 "可建流但未订阅不分发"的机制链路
+
+这是一个三重门控机制：**流创建门控 → 事件分发门控 → 实例刷新门控**，每一层都有独立的判断条件。
+
+#### 第一门控：流是否能创建（startAutoRefresh）
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:462-467`
+
+```typescript
+if (
+  cacheSettings.backgroundSync &&    // 条件 1：全局 backgroundSync 未禁用
+  supportsSSE.has(key) &&            // 条件 2：服务端支持 SSE（通过响应头标记）
+  polyfills.EventSource              // 条件 3：运行时支持 EventSource
+) {
+  if (streams.has(key)) return;       // 条件 4：同 key 流不存在
+  // 创建 SSE 流...
+}
+```
+
+**可建流场景**：以上 4 个条件同时满足时，流会被创建。
+
+#### 第二门控：事件是否分发到实例（SSE 回调）
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:473-484`
+
+```typescript
+cb: (event: MessageEvent<string>) => {
+  if (event.type === "features-updated") {
+    // 只从 subscribedInstances 中取实例
+    const instances = subscribedInstances.get(key);
+    instances && instances.forEach(instance => fetchFeatures(instance));
+  } else if (event.type === "features") {
+    const json = JSON.parse(event.data);
+    // onNewFeatureData 内部也是只通知 subscribedInstances
+    onNewFeatureData(key, cacheKey, json);
+  }
+}
+```
+
+**分发规则**：即使流存在且收到事件，也只通知 `subscribedInstances` 中的实例。
+
+#### 第三门控：实例是否接收更新（onNewFeatureData）
+
+**文件**: `packages/sdk-js/src/feature-repository.ts:368-371`
+
+```typescript
+function onNewFeatureData(key, cacheKey, data): void {
+  // ... 更新缓存（所有实例共享）...
+  
+  // 只通知已订阅实例
+  const instances = subscribedInstances.get(key);
+  instances && instances.forEach(instance => refreshInstance(instance, data));
+}
+```
+
+#### 完整机制链路图
+
+```
+SSE 服务端事件
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│ 第一门控：startAutoRefresh                   │
+│ - backgroundSync === true?                  │
+│ - supportsSSE.has(key)?                     │
+│ - EventSource 可用?                         │
+└───────────────────┬─────────────────────────┘
+                    │ 流已创建
+                    ▼
+┌─────────────────────────────────────────────┐
+│ 第二门控：SSE 回调分发                       │
+│ - subscribedInstances.get(key) 有值?        │
+│ - 是 → 遍历实例调用 fetchFeatures            │
+│ - 否 → 丢弃事件                              │
+└───────────────────┬─────────────────────────┘
+                    │ 实例在订阅集合中
+                    ▼
+┌─────────────────────────────────────────────┐
+│ 第三门控：onNewFeatureData 通知              │
+│ - subscribedInstances.get(key) 有值?        │
+│ - 是 → refreshInstance(instance, data)      │
+│ - 否 → 不通知                                │
+└───────────────────┬─────────────────────────┘
+                    ▼
+              实例收到更新
+```
+
+#### 可建流但未订阅的典型场景
+
+| 场景 | 流是否创建 | 事件是否到达 | 实例是否收到更新 |
+|------|-----------|-------------|-----------------|
+| `init({ streaming: false })`，服务端支持 SSE | ✅ 是 | ✅ 是（回调内丢弃） | ❌ 否（不在 subscribedInstances） |
+| 实例 A `init({ streaming: true })`，实例 B `init({ streaming: false })` | ✅ 是（A 触发创建） | ✅ 是 | A ✅ 是，B ❌ 否 |
+| `backgroundSync=true` 但从未 `streaming=true` | ✅ 是（fetchFeatures 成功后标记 supportsSSE） | ✅ 是 | ❌ 否（无实例订阅） |
+| 先 `init({ streaming: true })` 后 `destroy()` 不 `destroyAllStreams` | ✅ 是（流继续运行） | ✅ 是 | ❌ 否（unsubscribe 后不在集合中） |
+
+> **关键结论**：流是按 `key`（apiHost+clientKey）全局共享的，只要有一个实例触发创建，流就存在。但事件分发严格按 `subscribedInstances` 过滤，未订阅的实例即使流存在也收不到更新。
+
+### 5.10 多实例广播机制
 
 ```typescript
 function onNewFeatureData(
@@ -820,7 +1094,7 @@ function onNewFeatureData(
 }
 ```
 
-### 5.8 实例订阅与取消订阅
+### 5.11 实例订阅与取消订阅
 
 ```typescript
 function subscribe(instance: GrowthBook | GrowthBookClient): void {
@@ -1075,3 +1349,8 @@ function onFeatureUsage(ctx, key, ret): void {
 6. **setURL 不总是触发重渲染**：非 remoteEval 模式下 `setURL` 不调用 `_render()`
 7. **core.ts 评估层有副作用**：会修改传入的 ctx 对象（tracked*、devLogs、stickyBucketAssignmentDocs 等）
 8. **GrowthBook 与 GrowthBookClient 回调归属不同**：单用户 vs 多用户模式导致回调在 Global/User 中的归属不同
+9. **streaming 参数具有粘性**：`init({ streaming: false })` 不会取消之前 `streaming=true` 建立的订阅，除非 `destroy()` 或全局清空
+10. **backgroundSync=false 是全局副作用**：会立即清空所有 SSE 流和所有实例订阅，影响同一运行时内所有实例
+11. **destroyAllStreams 是全局破坏性操作**：会清空所有实例订阅、关闭所有 SSE 流，慎用
+12. **可建流但未订阅不分发**：三重门控机制（流创建 → 事件分发 → 实例刷新），每一层都独立判断，流存在不代表实例能收到更新
+13. **订阅状态跨 init 调用保留**：多次调用 `init()` 时，`streaming` 参数不会主动取消之前的订阅状态
