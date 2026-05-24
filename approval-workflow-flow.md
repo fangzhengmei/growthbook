@@ -1,0 +1,649 @@
+# 变更审批工作流状态流转分析
+
+## 一、核心状态定义与流转全景
+
+### 1.1 状态定义
+
+系统支持两套并行的修订（Revision）模型，状态定义基本一致：
+
+| 状态 | 说明 | 对应模型 |
+|------|------|----------|
+| `draft` | 草稿，正在编辑中 | FeatureRevisionModel / RevisionModel |
+| `pending-review` | 待审核，已提交审批请求 | FeatureRevisionModel / RevisionModel |
+| `changes-requested` | 需要修改，审核人要求变更 | FeatureRevisionModel / RevisionModel |
+| `approved` | 已批准，可以发布 | FeatureRevisionModel / RevisionModel |
+| `published` / `merged` | 已发布/已合并，变更已生效 | FeatureRevisionModel 用 `published`，RevisionModel 用 `merged` |
+| `discarded` | 已废弃，变更被取消 | 两者通用 |
+| `pending-parent` | 等待父修订，用于多步骤发布 | FeatureRevisionModel 特有 |
+
+**状态流转优先级**（决定列表排序，数字越小越靠前）：
+```typescript
+// packages/front-end/pages/approval-requests.tsx:49-56
+const STATUS_PRIORITY: Record<RevisionStatus, number> = {
+  "pending-review": 0,     // 最优先，阻塞审核人
+  "changes-requested": 1,  // 次优先，请求人需要处理
+  "approved": 2,           // 已批准，待发布
+  "draft": 3,              // 草稿
+  "merged": 4,             // 已发布
+  "discarded": 5,          // 已废弃
+};
+```
+
+### 1.2 状态流转全景图
+
+```
+draft ──提交审核──► pending-review ──批准──► approved ──发布──► merged
+  │                     │   ▲                 │
+  │                     │   │                 │
+  │                     ▼   │                 │
+  └────编辑──────────── changes-requested    └──绕过审批(bypass)──┐
+        │                                                ▲        │
+        ▼                                                │        │
+  已批准后再编辑 ──resetReviewOnChange=true──► pending-review    │
+                                                                 │
+  discarded ◄─────废弃───────┴───────────────────────────────────┘
+     │
+     └──────重新打开──────► draft
+```
+
+---
+
+## 二、变更请求的提交（Request Review）
+
+### 2.1 提交流程核心代码
+
+**入口 API**：`POST /feature/:id/:version/request`
+
+**处理文件**：
+- `packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts`
+- `packages/back-end/src/models/FeatureRevisionModel.ts:1055-1092`
+
+### 2.2 提交条件检查
+
+1. **权限检查** - `canManageFeatureDrafts`（管理草稿权限）
+   ```typescript
+   // postFeatureRevisionRequestReview.ts:25-27
+   if (!req.context.permissions.canManageFeatureDrafts(feature)) {
+     req.context.permissions.throwPermissionError();
+   }
+   ```
+   设计意图：贡献者即使没有发布权限，也可以提交审批请求。
+
+2. **状态检查** - 必须是 `draft` 状态
+   ```typescript
+   // postFeatureRevisionRequestReview.ts:38-42
+   if (revision.status !== "draft") {
+     throw new BadRequestError(
+       `Can only request review on a draft (status is "${revision.status}")`
+     );
+   }
+   ```
+
+### 2.3 提交后的状态变更
+
+```typescript
+// FeatureRevisionModel.ts:1055-1092
+export async function markRevisionAsReviewRequested(
+  context, revision, user, comment?
+) {
+  await FeatureRevisionModel.updateOne(
+    { organization, featureId, version },
+    {
+      $set: {
+        status: "pending-review",    // 核心状态变更
+        datePublished: null,        // 清除发布日期
+        dateUpdated: new Date(),
+        comment: comment,
+      },
+    }
+  );
+}
+```
+
+### 2.4 通用修订（非 Feature）提交流程
+
+**入口 API**：`POST /revision/:id/submit`
+
+**处理文件**：`packages/back-end/src/routers/revision/revision.controller.ts:384-424`
+
+```typescript
+// revision.controller.ts:399-404
+if (existingRevision.status !== "draft") {
+  return res.status(400).json({
+    message: "Only draft revisions can be submitted for review",
+  });
+}
+
+// 可以由任何有编辑权限的人提交，不局限于作者
+if (!getAdapter(existingRevision.target.type).canUpdate(...)) {
+  context.permissions.throwPermissionError();
+}
+
+await revisionModel.submitForReview(id, userId);
+```
+
+---
+
+## 三、审批权限与审核逻辑
+
+### 3.1 审核人权限判定
+
+**谁可以审核？**
+
+| 实体类型 | 审核人条件 | 代码位置 |
+|----------|------------|----------|
+| Feature | 1. 不是作者<br>2. 有 `canReviewFeatureDrafts` 权限 | `RequestReviewModal.tsx:101-104` |
+| SavedGroup | 1. 不是作者<br>2. 有 `canUpdateSavedGroup` 权限 | `helpers.ts:157-159` |
+| 通用实体(managedBy=team) | 1. 不是作者<br>2. 是 `ownerTeam` 团队成员 | `helpers.ts:182-188` |
+| 通用实体(managedBy=admin) | 1. 不是作者<br>2. 有 `manageOfficialResources` 权限 | `helpers.ts:190-192` |
+
+**前端审核权限判断**：
+```typescript
+// RequestReviewModal.tsx:101-104
+const canReview =
+  isPendingReview &&
+  createdBy?.id !== user?.id &&
+  permissionsUtil.canReviewFeatureDrafts(feature);
+```
+
+**后端审核权限判断**（通用修订）：
+```typescript
+// helpers.ts:127-195
+export const canUserReviewEntity = ({
+  entityType, revision, entity, userId, teams, userPermissions, canEditEntity
+}) => {
+  // 已合并/废弃的不能审核
+  if (["merged", "discarded"].includes(revision.status)) return false;
+  // 不能审核自己的
+  if (revision.authorId === userId) return false;
+  
+  if (entityType === "saved-group") return !!canEditEntity;
+  // ... 其他实体类型逻辑
+};
+```
+
+### 3.2 禁止自审核（Self-Approval Block）
+
+**基础规则**：作者不能批准自己的变更
+```typescript
+// revision.controller.ts:476-480
+if (existingRevision.authorId === userId && decision !== "comment") {
+  return res.status(403).json({
+    message: "Cannot approve or request changes on your own revision",
+  });
+}
+```
+
+**增强规则**：`blockSelfApproval` 配置（阻止所有贡献者审核）
+```typescript
+// organization.d.ts:72-73
+type RequireReview = {
+  blockSelfApproval?: boolean;  // 当 true 时，所有贡献者都不能审核
+};
+
+// helpers.ts:85-100
+export const isUserBlockedFromApproving = ({
+  approvalFlows, entityType, revision, userId
+}) => {
+  const settings = getApprovalFlowSettings(approvalFlows, entityType);
+  if (!settings?.blockSelfApproval) return false;
+  const contributors = revision.contributors ?? [revision.authorId];
+  return contributors.includes(userId);
+};
+```
+
+**应用位置**：
+```typescript
+// revision.controller.ts:487-500
+if (decision === "approve" && isUserBlockedFromApproving({...})) {
+  return res.status(403).json({
+    message: "You contributed to this revision and cannot approve it. " +
+             "A separate reviewer is required.",
+  });
+}
+```
+
+### 3.3 审核操作与状态变更
+
+**三种审核决策**（`ReviewDecision`）：
+
+| 决策 | 状态变更 | 代码映射 |
+|------|----------|----------|
+| `approve` | `pending-review` → `approved` | `RevisionModel.ts:501` |
+| `request-changes` | `pending-review` → `changes-requested` | `RevisionModel.ts:503-504` |
+| `comment` | 状态不变，仅添加评论 | `RevisionModel.ts:505` |
+
+**审核处理核心逻辑**：
+```typescript
+// RevisionModel.ts:474-521
+async addReview(id, userId, decision, comment) {
+  const review = { id, userId, decision, comment, dateCreated: new Date() };
+  
+  const actionMap = {
+    approve: "approved",
+    "request-changes": "requested-changes",
+    comment: "commented",
+  };
+  
+  const newStatus = decision === "approve" ? "approved"
+    : decision === "request-changes" ? "changes-requested"
+    : existing.status;
+  
+  return this.update(existing, {
+    reviews: [...existing.reviews, review],
+    status: newStatus,
+    activityLog: [...existing.activityLog, {
+      id, userId, action: actionMap[decision], description: comment, dateCreated
+    }],
+  });
+}
+```
+
+### 3.4 审批需求判定（何时需要审批？）
+
+**核心函数**：`checkIfRevisionNeedsReview`
+
+**文件位置**：`packages/shared/src/util/features.ts:1860-1939`
+
+```typescript
+export function checkIfRevisionNeedsReview({
+  feature, baseRevision, revision, allEnvironments, settings,
+  requireApprovalsLicensed = true,
+}) {
+  // 1. 授权检查：需要 require-approvals 高级功能
+  if (!requireApprovalsLicensed) return false;
+  
+  // 2. 配置检查：支持 boolean 或 数组两种配置格式
+  const requireReviews = settings?.requireReviews;
+  if (!Array.isArray(requireReviews)) return !!requireReviews;
+  
+  // 3. 匹配该 feature 的审批配置
+  const reviewSetting = getReviewSetting(requireReviews, feature);
+  if (!reviewSetting?.requireReviewOn) return false;
+  
+  // 4. 计算受影响的环境
+  const affected = getDraftAffectedEnvironments(revision, baseRevision, allEnvironments);
+  
+  // 5. 全局变更 vs 环境级变更
+  if (affected === "all") {
+    // 元数据变更受 featureRequireMetadataReview 控制
+    if (!revisionHasMetadataOnlyGlobalChange(revision, baseRevision))
+      return true;  // 非元数据全局变更始终需要审批
+    return reviewSetting.featureRequireMetadataReview !== false;
+  }
+  
+  // 6. 环境级变更细分
+  const envsWithRuleChanges = affected.filter(env => 规则有变化);
+  const envKillSwitchChanges = affected.filter(env => 启用状态有变化);
+  
+  // 规则/值变更始终需要审批（在指定环境范围内）
+  if (envsWithRuleChanges.some(env => gatedEnvs.includes(env))) return true;
+  
+  // kill switch 变更仅当 featureRequireEnvironmentReview=true 时需要审批
+  if (envKillSwitchChanges.length > 0 && 
+      reviewSetting.featureRequireEnvironmentReview !== false) {
+    if (envKillSwitchChanges.some(env => gatedEnvs.includes(env)))
+      return true;
+  }
+  
+  return false;
+}
+```
+
+**审批配置类型**：
+```typescript
+// organization.d.ts:65-74
+type RequireReview = {
+  requireReviewOn: boolean;                    // 总开关
+  resetReviewOnChange: boolean;               // 变更后重置审批
+  environments: string[];                     // 哪些环境需要审批
+  projects: string[];                         // 哪些项目需要审批
+  featureRequireEnvironmentReview?: boolean;  // 环境启停需要审批
+  featureRequireMetadataReview?: boolean;     // 元数据变更需要审批
+  blockSelfApproval?: boolean;                // 阻止贡献者自审核
+};
+```
+
+---
+
+## 四、最终发布（Publish / Merge）
+
+### 4.1 Feature 发布流程
+
+**入口 API**：`POST /feature/:id/:version/publish`
+
+**处理文件**：
+- `packages/back-end/src/api/features/postFeatureRevisionPublish.ts`
+- `packages/back-end/src/models/FeatureModel.ts`
+
+### 4.2 发布前置检查
+
+**检查顺序**（逐项严格校验，不满足直接抛出）：
+
+1. **编辑权限** - `canUpdateFeature`
+   ```typescript
+   // postFeatureRevisionPublish.ts:37-39
+   if (!req.context.permissions.canUpdateFeature(feature, {})) {
+     req.context.permissions.throwPermissionError();
+   }
+   ```
+
+2. **状态检查** - 不能是 `published` 或 `discarded`
+   ```typescript
+   // postFeatureRevisionPublish.ts:50-54
+   if (["published", "discarded"].includes(revision.status)) {
+     throw new BadRequestError(
+       `Cannot publish a revision with status "${revision.status}"`
+     );
+   }
+   ```
+
+3. **合并冲突检查** - `autoMerge`
+   ```typescript
+   // postFeatureRevisionPublish.ts:67-80
+   const mergeResult = autoMerge(live, base, revision, environmentIds, {});
+   if (!mergeResult.success) {
+     throw new ConflictError(
+       "Merge conflicts exist — rebase before publishing",
+       mergeResult.conflicts,
+     );
+   }
+   ```
+
+4. **审批需求重新评估**（关键！基于合并后状态）
+   ```typescript
+   // postFeatureRevisionPublish.ts:96-104
+   const requiresReview = checkIfRevisionNeedsReview({
+     feature,
+     baseRevision: filledLive,        // 注意：用当前线上版本作为基准
+     revision: effectiveRevision,     // 注意：用合并后的最终状态
+     allEnvironments: environmentIds,
+     settings: req.organization.settings,
+     requireApprovalsLicensed: req.context.hasPremiumFeature("require-approvals"),
+   });
+   ```
+   > **设计要点**：审批判定基于「合并后的最终状态」与「当前线上状态」的差异，
+   > 而不是基于修订创建时的差异。这确保发布时的实际变更符合当前审批策略。
+
+5. **审批状态检查 + 绕过检查**
+   ```typescript
+   // postFeatureRevisionPublish.ts:107-117
+   const canBypass =
+     !!req.organization.settings?.restApiBypassesReviews ||
+     req.context.permissions.canBypassApprovalChecks(feature);
+   
+   if (requiresReview && revision.status !== "approved" && !canBypass) {
+     throw new BadRequestError(
+       `This revision requires approval before publishing (status: "${revision.status}"). ` +
+       "Enable 'REST API always bypasses approval requirements' in organization settings, " +
+       "or use a role/token that grants bypassApprovalChecks on this project."
+     );
+   }
+   ```
+
+6. **发布环境权限检查** - `canPublishFeature`（按环境精细控制）
+   ```typescript
+   // postFeatureRevisionPublish.ts:119-128
+   const envsToCheck = await getMergeResultPublishEnvs(...);
+   if (!req.context.permissions.canPublishFeature(feature, envsToCheck)) {
+     req.context.permissions.throwPermissionError();
+   }
+   ```
+
+### 4.3 发布执行
+
+```typescript
+// FeatureModel.ts 中的 publishRevision
+const updatedFeature = await publishRevision(
+  req.context, feature, revision, mergeResult.result, comment
+);
+```
+
+**内部状态变更**（`markRevisionAsPublished`）：
+```typescript
+// FeatureRevisionModel.ts:998-1053
+export async function markRevisionAsPublished(
+  context, feature, revision, user, comment?
+) {
+  await FeatureRevisionModel.updateOne(
+    { organization, featureId, version },
+    {
+      $set: {
+        status: "published",           // 核心状态变更
+        publishedBy: user,             // 记录发布人
+        datePublished: new Date(),     // 记录发布时间
+        dateUpdated: new Date(),
+        comment: revisionComment,
+      },
+    }
+  );
+  
+  await dispatchRevisionPublishedHook(context, revision);  // 触发后置钩子
+}
+```
+
+### 4.4 通用修订合并流程
+
+**入口 API**：`POST /revision/:id/merge`
+
+**处理文件**：`packages/back-end/src/routers/revision/revision.controller.ts:885-1009`
+
+**核心步骤**：
+
+1. 权限检查（`canUpdate`）
+2. 审批需求检查 + 绕过检查
+3. 构建期望状态（`buildMergeDesiredState`）
+4. 冲突检查（`checkMergeConflicts`）
+5. 变更有效性检查（`hasChanges`）
+6. **两步提交**：
+   ```typescript
+   // revision.controller.ts:987-1007
+   // 第一步：更新实体（先落实际变更）
+   await adapter.applyChanges(context, entity, desiredState);
+   
+   // 第二步：标记修订为已合并（后更新状态）
+   const mergedRevision = await revisionModel.merge(id, userId, {
+     bypass: isBypass,
+   });
+   ```
+   > **设计要点**：两步提交不使用事务。
+   > - 如果第一步失败：修订保持原状态，实体不变，可安全重试
+   > - 如果第一步成功第二步失败：实体已更新但修订仍为 `approved`，下次发布时 `hasChanges` 检查返回 false 成为空操作，可手动标记合并
+   > - 这比先标记合并再更新实体更安全（避免标记了合并但实际变更未生效）
+
+---
+
+## 五、特殊状态流转机制
+
+### 5.1 已批准后变更重置审批
+
+**配置项**：`resetReviewOnChange: boolean`
+
+**触发场景**：修订已 `approved` 后，作者又修改了内容。
+
+**处理逻辑**：
+```typescript
+// RevisionModel.ts:131-152
+private resetApprovalIfNeeded(existing, userId) {
+  if (existing.status !== "approved") return {};
+  const settings = getApprovalFlowSettings(
+    this.context.org.settings?.approvalFlows,
+    existing.target.type,
+  );
+  if (!settings?.resetReviewOnChange) return {};
+  
+  return {
+    status: "pending-review",  // 打回待审核
+    resetEntry: {
+      id, userId, action: "reopened",
+      description: "Approval reset — proposed changes were modified after approval",
+      dateCreated: new Date(),
+    },
+  };
+}
+```
+
+**调用位置**：
+- `updateProposedChanges` - 更新变更内容时
+- `rebase` - 变基到最新版本时
+- `updateRevision` - Feature 修订更新时
+
+**Feature 修订版本**：
+```typescript
+// FeatureRevisionModel.ts:905-907
+if (resetReview && revision.status === "approved") {
+  status = "pending-review";
+}
+```
+
+### 5.2 变更请求后打回修改
+
+**状态流转**：`pending-review` → `changes-requested` → 编辑 → `pending-review`
+
+```typescript
+// FeatureRevisionModel.ts:900-903
+// 当有内容变更且状态为 changes-requested 时，自动打回 pending-review
+if (revision.status === "changes-requested") {
+  status = "pending-review";
+}
+```
+
+### 5.3 审批绕过（Bypass）
+
+**两种绕过方式**：
+
+| 方式 | 配置 | 影响范围 | 代码位置 |
+|------|------|----------|----------|
+| REST API 绕过 | `restApiBypassesReviews: true` | 全局，所有 API 调用 | `postFeatureRevisionPublish.ts:108` |
+| 权限绕过 | `bypassApprovalChecks` 权限 | 按用户/角色/项目 | `permissionsClass.ts:832-839` |
+
+**权限绕过定义**：
+```typescript
+// permissionsClass.ts:832-839
+public canBypassApprovalChecks(feature) {
+  return this.checkProjectFilterPermission(
+    { projects: feature.project ? [feature.project] : [] },
+    "bypassApprovalChecks",
+  );
+}
+```
+
+**前端 UI 表现**：
+```typescript
+// RequestReviewModal.ts:83,449-464
+const canAdminPublish = permissionsUtil.canBypassApprovalChecks(feature);
+
+// 显示复选框让管理员选择是否绕过
+{canAdminPublish && (
+  <Checkbox
+    label="Bypass approval requirement to publish (optional for Admins only)"
+    value={adminPublish}
+    setValue={(val) => setAdminPublish(!!val)}
+  />
+)}
+```
+
+---
+
+## 六、关键权限矩阵
+
+### 6.1 Feature 相关权限
+
+| 权限 | 作用 | 检查位置 |
+|------|------|----------|
+| `manageFeatureDrafts` | 创建/编辑草稿、提交审核请求 | `canManageFeatureDrafts` |
+| `canReview` | 审核变更（批准/要求修改） | `canReviewFeatureDrafts` |
+| `bypassApprovalChecks` | 绕过审批直接发布 | `canBypassApprovalChecks` |
+| `publishFeatures` | 发布到指定环境 | `canPublishFeature(feature, envs)` |
+| `manageFeatures` | 编辑 feature 本身 | `canUpdateFeature` |
+
+### 6.2 权限继承关系
+
+```
+manageFeatures (manageFeatures)
+  ├── 可创建 feature
+  ├── 可编辑 feature 元数据
+  └── 隐含 manageFeatureDrafts（可编辑草稿）
+
+publishFeatures (环境级)
+  └── 可发布到指定环境（需要审批已通过或有 bypass 权限）
+
+canReview (项目级)
+  └── 可审核该项目下的变更请求
+
+bypassApprovalChecks (项目级)
+  └── 可跳过审批直接发布
+```
+
+---
+
+## 七、前端审批交互流程
+
+### 7.1 审批列表页
+
+**文件**：`packages/front-end/pages/approval-requests.tsx`
+
+**三个视图范围**（Scope）：
+- `needs-my-review`：我需要审核的（我有审核权 + 我不是作者 + 状态是 pending-review/changes-requested）
+- `my-requests`：我发起的请求
+- `all`：全部
+
+**默认状态过滤**：`[pending-review, approved, changes-requested]`（不显示 draft 和 已结束状态）
+
+### 7.2 审核弹窗交互流程
+
+**文件**：`packages/front-end/components/Features/RequestReviewModal.tsx`
+
+**按钮文案动态变化**：
+```
+状态 = draft → "Request Review"
+状态 = pending-review + 我可审核 → "Next" → 进入审核表单
+状态 = approved → "Publish"
+状态 = changes-requested + 我是作者 → "Request Review"（重新提交）
+```
+
+**审核表单三个选项**：
+```typescript
+// RequestReviewModal.tsx:697-724
+options = [
+  { value: "Comment", label: "Comment", description: "仅提交反馈" },
+  { value: "Requested Changes", label: "Request Changes", description: "需要修改后才能发布" },
+  { value: "Approved", label: "Approve", description: "批准发布", disabled: isBlockedContributor },
+]
+```
+
+---
+
+## 八、两套修订系统对比
+
+项目中存在**两套并行**的修订系统，理解它们的区别很重要：
+
+| 维度 | FeatureRevisionModel | RevisionModel（通用） |
+|------|---------------------|----------------------|
+| 适用对象 | 仅 Feature | SavedGroup 等通用实体 |
+| 状态值 | published | merged |
+| 变更表示 | 完整快照（rules、defaultValue 等） | JSON Patch (RFC 6902) |
+| 配置位置 | `org.settings.requireReviews` | `org.settings.approvalFlows` |
+| 审核接口 | `/feature/:id/:version/submit-review` | `/revision/:id/review` |
+| 发布接口 | `/feature/:id/:version/publish` | `/revision/:id/merge` |
+| 适配器模式 | 无（硬编码逻辑） | 有（EntityRevisionAdapter） |
+
+**注意**：Feature 的审批配置使用 `requireReviews` 数组，SavedGroup 使用 `approvalFlows` 对象。两套配置不共享，需要分别配置。
+
+---
+
+## 九、核心代码索引
+
+| 功能 | 文件位置 | 关键函数/类 |
+|------|----------|------------|
+| 审批判定 | `packages/shared/src/util/features.ts` | `checkIfRevisionNeedsReview` |
+| 审核人权限 | `packages/shared/src/revisions/helpers.ts` | `canUserReviewEntity`, `isUserBlockedFromApproving` |
+| 审核操作 | `packages/back-end/src/models/RevisionModel.ts` | `addReview`, `submitForReview` |
+| Feature 提交审核 | `packages/back-end/src/api/features/postFeatureRevisionRequestReview.ts` | `requestReview` |
+| Feature 发布 | `packages/back-end/src/api/features/postFeatureRevisionPublish.ts` | `publishFeatureRevision` |
+| 通用修订控制器 | `packages/back-end/src/routers/revision/revision.controller.ts` | `postReview`, `postMerge`, `postSubmit` |
+| 通用修订工具 | `packages/back-end/src/revisions/util.ts` | `buildMergeDesiredState`, `createOrUpdateRevision` |
+| 权限定义 | `packages/shared/src/permissions/permissionsClass.ts` | `Permissions` 类 |
+| 前端审批列表 | `packages/front-end/pages/approval-requests.tsx` | `ApprovalRequests` 组件 |
+| 前端审核弹窗 | `packages/front-end/components/Features/RequestReviewModal.tsx` | `RequestReviewModal` 组件 |
+| 类型定义 | `packages/shared/types/organization.d.ts` | `RequireReview`, `ApprovalFlowConfiguration` |
