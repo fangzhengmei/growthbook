@@ -229,28 +229,28 @@ SDK 请求 → getSdkPayload / getFeaturesPublic / getEvaluatedFeaturesPublic
 
 ### 4.2 `getFeatureDefinitionsWithCache` 的调用方清单
 
-此函数是 SDK payload 生成的核心入口，被以下 7 处调用，分三类场景：
+此函数是 SDK payload 生成的核心入口，**共 8 处调用**，分三类场景：
 
-#### 场景 1：HTTP 端点（3 处）
+#### 场景 1：公共 SDK 端点（2 处）
 
 | 调用方 | 文件 | 端点 | 说明 |
 |--------|------|------|------|
-| `getFeaturesPublic` | `controllers/features.ts:525` | `GET /api/features/:key` | 公共 SDK 端点，带 CDN 缓存 |
+| `getFeaturesPublic` | `controllers/features.ts:525` | `GET /api/features/:key` | 公共 SDK 端点，带 CDN 缓存，URL path 传 SDK key |
 | `getEvaluatedFeaturesPublic` | `controllers/features.ts:605` | `POST /api/eval/:key` | 远程评估端点，仅自托管 |
+
+#### 场景 2：内部 API 端点（2 处）
+
+| 调用方 | 文件 | 端点 | 说明 |
+|--------|------|------|------|
 | `getSdkPayload` | `api/sdk-payload/getSdkPayload.ts:37` | `GET /api/v1/sdk-payload/:key` | API 端点，需 Secret Key 鉴权 |
+| `listFeatures` | `api/features/listFeatures.ts:123` | `GET /api/v1/features` | 管理 API，仅当查询参数 `clientKey` 存在时调用，用于按 SDK payload 过滤 |
 
-#### 场景 2：内部 API（1 处）
-
-| 调用方 | 文件 | 说明 |
-|--------|------|------|
-| `listFeatures` handler | `api/features/listFeatures.ts:123` | 内部 API，用于列出 features |
-
-#### 场景 3：后台 Jobs（3 处）
+#### 场景 3：后台 Jobs（4 处）
 
 | 调用方 | 文件 | 触发时机 |
 |--------|------|---------|
 | `queueProxyUpdate` | `jobs/proxyUpdate.ts:85` | SDK payload 刷新后，更新代理缓存 |
-| `queueWebhooksByConnections` | `jobs/sdkWebhooks.ts:336,363` | SDK payload 刷新后，推送 Webhook |
+| `queueWebhooksByConnections` | `jobs/sdkWebhooks.ts:336,363` | SDK payload 刷新后，推送 Webhook（2 处调用） |
 | `queueLegacySdkWebhooks` | `jobs/webhooks.ts:43` | SDK payload 刷新后，推送旧式 Webhook |
 
 > **注意**：后台 Jobs 调用时，`params` 是直接构造的 `SDKPayloadParams` 对象，不走 `getPayloadParamsFromApiKey` 路径。
@@ -329,13 +329,13 @@ SDK Connection 的 `remoteEvalEnabled` 字段控制着三个公开端点的准�
 
 ### 5.1 三个公开端点的行为差异
 
-| 端点 | 方法 | 完整路由 | 处理函数 | 鉴权方式 | CDN 缓存头 | remoteEval=true 时行为 | remoteEval=false 时行为 |
-|------|------|---------|---------|---------|-----------|-----------------------|------------------------|
-| Features API | GET | `/api/features/:key` | `getFeaturesPublic` | URL path 中的 SDK key | ✅ 设置 | ❌ 抛出错误："Remote evaluation required for this connection" | ✅ 正常返回 payload |
-| Remote Eval API | POST | `/api/eval/:key` (仅自托管) | `getEvaluatedFeaturesPublic` | URL path 中的 SDK key | ❌ `no-store` | ✅ 实时计算 evaluated features | ❌ 抛出错误："Remote evaluation disabled for this connection" |
-| SDK Payload API | GET | `/api/v1/sdk-payload/:key` | `getSdkPayload` | Authorization header Secret API Key | ❌ 不设置 | ✅ **不检查**，正常返回 payload | ✅ 正常返回 payload |
+| 端点 | 方法 | 完整路由 | 处理函数 | 鉴权方式 | 组织边界控制 | CDN 缓存头 | remoteEval=true 时行为 | remoteEval=false 时行为 |
+|------|------|---------|---------|---------|------------|-----------|-----------------------|------------------------|
+| Features API | GET | `/api/features/:key` | `getFeaturesPublic` | URL path 中的 SDK key | Connection 自带 organization 字段 | ✅ 设置 | ❌ 抛出错误："Remote evaluation required for this connection" | ✅ 正常返回 payload |
+| Remote Eval API | POST | `/api/eval/:key` (仅自托管) | `getEvaluatedFeaturesPublic` | URL path 中的 SDK key | Connection 自带 organization 字段 | ❌ `no-store` | ✅ 实时计算 evaluated features | ❌ 抛出错误："Remote evaluation disabled for this connection" |
+| SDK Payload API | GET | `/api/v1/sdk-payload/:key` | `getSdkPayload` | Authorization header Secret API Key + URL path Payload key | BaseModel.applyBaseQuery 自动过滤 | ❌ 不设置 | ✅ **不检查**，正常返回 payload | ✅ 正常返回 payload |
 
-> **重要修正**：`/api/v1/sdk-payload/:key` 端点**不设置** Cache-Control 或 Surrogate-Key 响应头，也**不支持** SDK Connection key 鉴权。它需要 Secret API Key 通过 Authorization header 鉴权。
+> **重要修正**：`/api/v1/sdk-payload/:key` 端点**不设置** Cache-Control 或 Surrogate-Key 响应头。它需要 Secret API Key 通过 Authorization header 鉴权，同时 URL path 的 `:key` 参数用于指定要获取哪个 SDK Connection 的配置。组织边界由 BaseModel 的自动查询过滤保证。
 
 ### 5.2 路径分叉逻辑详解
 
@@ -417,17 +417,23 @@ const defs = await getFeatureDefinitionsWithCache({
   (检查 Authorization: Bearer secret_xxx)
          ↓ 鉴权通过，建立 req.context.org
   getPayloadParamsFromApiKey("sdk-abc123", req)
-  (按 URL path 查找 SDK Connection 配置)
+    └→ findSDKConnectionByKey("sdk-abc123")
+       (BaseModel.applyBaseQuery 自动加 organization 过滤)
          ↓
   getFeatureDefinitionsWithCache()
-  (使用 Connection 的 key 查 MongoDB 缓存)
+    └→ context.models.sdkConnectionCache.getById(params.key)
+       (BaseModel.applyBaseQuery 自动加 organization 过滤)
 ```
 
 **关键要点**：
 
 1. **两个 key 相互独立**：Authorization header 的 Secret API Key 用于"证明你有权访问 API"，URL path 的 key 用于"指定你要哪个配置"。一个 Secret Key 可以访问该组织下任意多个 SDK Connection 的 payload。
 
-2. **跨组织访问控制**：中间件建立的 `req.context.org` 限定了可访问的组织范围，URL path 中的 SDK Connection 必须属于该组织（由 `findSDKConnectionByKey` 内部保证）。
+2. **组织访问边界的控制环节**：
+   - **第一层（鉴权）**：`authenticateApiRequestMiddleware` 建立 `req.context.org.id`，定义了可访问的组织范围
+   - **第二层（数据查询）**：所有 MongoDB 查询通过 `BaseModel.applyBaseQuery` **自动添加** `organization: context.org.id` 过滤条件
+   - **`findSDKConnectionByKey` 本身不做组织检查**，它只是按 key 查找，但它调用的 `SDKConnectionModel.findOne` 会自动应用组织过滤
+   - **缓存查询 `getById` 同理**，`SdkConnectionCacheModel._findOne` 也会自动应用组织过滤
 
 3. **Legacy key 特殊路径**：如果 URL path key 不匹配 `/^sdk-/`，则走 Legacy 路径：
    - 调用 `dangerousLookupOrganizationByApiKey(key)`
@@ -440,12 +446,15 @@ const defs = await getFeatureDefinitionsWithCache({
 | 路由注册位置 | `app.ts` 直接注册 | `api.router.ts` → `allRoutes` |
 | 鉴权中间件 | 无 | `authenticateApiRequestMiddleware` |
 | 鉴权方式 | URL path 中的 key（SDK Connection key） | Authorization header（Secret API Key） |
-| 支持 SDK key | ✅ 是 | ❌ 否（会报错："SDK Endpoint key given instead"） |
-| 支持 Secret key | ❌ 否 | ✅ 是 |
+| 组织边界控制 | `getPayloadParamsFromApiKey` 内无显式检查（但 Connection 只属于一个组织） | BaseModel.applyBaseQuery 自动加 `organization` 过滤 |
+| 支持 SDK key | ✅ 是 | ✅ 是（URL path 的 key） |
+| 支持 Secret key | ❌ 否 | ✅ 是（Authorization header） |
 | CDN 缓存头 | ✅ 完整设置 | ❌ 无 |
 | remoteEval 检查 | ✅ 检查 | ❌ 不检查 |
 
 > **关键边界**：`authenticateApiRequestMiddleware` 在 `api.router.ts:88` 全局生效，所有 `/api/v1/*` 路由都必须经过。它会检查 API key 的 `secret` 字段，SDK Endpoint key（`secret=false`）会被拒绝。
+>
+> **组织边界实现**：对于 `/api/v1/sdk-payload/:key`，组织边界不是由 `findSDKConnectionByKey` 直接控制的，而是由 BaseModel 的 `applyBaseQuery` 方法在所有查询上自动附加 `organization: context.org.id` 过滤条件实现的。
 
 ### 5.4 设计意图
 
@@ -733,6 +742,6 @@ MongoDB 缓存层没有 TTL 索引，完全依赖事件驱动的 upsert 覆盖�
 系统存在两个返回 SDK payload 的端点，设计意图不同：
 
 - **`/api/features/:key`**：面向客户端 SDK，公共端点，URL path 传 SDK key，带 CDN 缓存，检查 `remoteEvalEnabled`
-- **`/api/v1/sdk-payload/:key`**：面向服务端集成，需 Secret API Key 鉴权，无 CDN 缓存，不检查 `remoteEvalEnabled`
+- **`/api/v1/sdk-payload/:key`**：面向服务端集成，需 Secret API Key 鉴权（Authorization header），URL path 的 `:key` 用于指定目标 SDK Connection，无 CDN 缓存，不检查 `remoteEvalEnabled`
 
-> 关键边界：`authenticateApiRequestMiddleware` 是 `/api/v1/*` 路由的强制准入关卡，SDK Endpoint key 无法通过。
+> 关键边界：`authenticateApiRequestMiddleware` 是 `/api/v1/*` 路由的强制准入关卡，SDK Endpoint key 无法通过（要求 `secret=true`）。组织访问边界由 BaseModel 的 `applyBaseQuery` 方法在所有 MongoDB 查询上自动附加 `organization: context.org.id` 过滤条件实现，而非由 `findSDKConnectionByKey` 直接控制。
