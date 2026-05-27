@@ -521,13 +521,391 @@ const holdoutExperiment = {
 - Holdout 使用 `[[0.8, 1.0]]` → 20% 流量
 - 三者互斥，用户最多进入一个
 
-## 五、关键代码位置总结
+## 五、生效门禁与能力开关
+
+### 5.1 Prerequisites Capability 能力开关
+
+**文件：** `packages/back-end/src/util/features.ts:563-590`
+
+Holdout 功能**完全依赖** `prerequisites` capability：
+
+```typescript
+// 判断是否有 prerequisites 能力
+const hasPrerequisites =
+  capabilities === undefined || capabilities.includes("prerequisites");
+
+// 1. Holdout 规则仅在有 prerequisites 能力时生成
+const holdoutRule: FeatureDefinitionRule[] =
+  hasPrerequisites &&
+  feature.holdout &&
+  holdoutsMap &&
+  holdoutsMap.get(feature.holdout.id)?.holdout.environmentSettings?.[environment]?.enabled
+    ? [/* holdout 规则 */]
+    : [];
+
+// 2. 没有 prerequisites 能力时，feature-level prerequisites 也不会生成
+const prerequisiteRules = hasPrerequisites
+  ? (feature.prerequisites ?? [])?.map(/* 转换规则 */)
+  : [];
+
+// 3. 没有 prerequisites 能力时，包含 gates 的 feature 整个被排除
+if (capabilities !== undefined && !hasPrerequisites) {
+  const hasTopLevelPrereqs = !!feature.prerequisites?.length;
+  const hasRuleLevelGates = rules?.some((r) => {
+    if (r.type === "experiment-ref") {
+      const exp = experimentMap.get(r.experimentId);
+      const phase = exp?.phases?.slice(-1)?.[0];
+      return !!phase?.prerequisites?.length;
+    }
+    return !!(r as { prerequisites?: unknown[] }).prerequisites?.length;
+  });
+  if (hasTopLevelPrereqs || hasRuleLevelGates) {
+    return null;  // 整个 feature 被排除
+  }
+}
+```
+
+**能力开关影响总结：**
+
+| 场景 | 有 prerequisites 能力 | 无 prerequisites 能力 |
+|-----|---------------------|---------------------|
+| Holdout 规则 | 生成并插入到规则最前面 | Holdout 规则完全不生成 |
+| Feature-level prerequisites | 转换为 parentConditions 规则 | 不生成，若有则整个 feature 被排除 |
+| Rule-level prerequisites | 转换为 parentConditions | 不生成，若有则整个 feature 被排除 |
+| Experiment-level prerequisites | 转换为 parentConditions | 不生成，若有则整个 feature 被排除 |
+
+### 5.2 项目门禁（Project Gating）
+
+**文件：** `packages/back-end/src/services/features.ts:209-232`
+
+```typescript
+function buildHoldoutsMapForProjects(
+  holdoutsMap: Map<string, { holdout: HoldoutInterface; holdoutExperiment: ExperimentInterface }>,
+  projects: string[],
+): Map<...> {
+  const result = new Map();
+  holdoutsMap.forEach((value, id) => {
+    const { holdout } = value;
+    const allowed =
+      projects.length === 0 ||              // 无项目过滤
+      holdout.projects.length === 0 ||      // holdout 无项目限制
+      holdout.projects.some((p) => projects.includes(p));  // 项目匹配
+    if (allowed) result.set(id, value);
+  });
+  return result;
+}
+```
+
+**项目门禁生效路径：**
+
+```
+SDK Connection (projects: ["p1", "p2"])
+    │
+    ├─ Feature 过滤
+    │   └─ getAllFeatures(context, { projects: ["p1", "p2"] })
+    │       └─ 只返回 project 匹配的 feature
+    │
+    ├─ Experiment 过滤
+    │   └─ getAllPayloadExperiments(context, ["p1", "p2"])
+    │       └─ 只返回 project 匹配的 experiment
+    │
+    └─ Holdout 过滤
+        └─ buildHoldoutsMapForProjects(holdoutsMap, ["p1", "p2"])
+            └─ 只返回 project 匹配的 holdout
+                └─ generateHoldoutsPayload()
+                    └─ 只生成过滤后的 holdout 虚拟 feature
+```
+
+### 5.3 环境门禁（Environment Gating）
+
+**文件：** `packages/back-end/src/models/HoldoutModel.ts:169-217`
+
+```typescript
+public async getAllPayloadHoldouts(environment?: string): Promise<Map<...>> {
+  const holdouts = await this._find({});
+  const filteredHoldouts = holdoutsWithExperiments.filter((h) => {
+    // ... 其他过滤条件
+    
+    // 环境门禁：只返回在该环境启用的 holdout
+    if (environment && !h.holdout.environmentSettings[environment]?.enabled) {
+      return false;
+    }
+    return true;
+  });
+  return new Map(filteredHoldouts.map((h) => [h.holdout.id, h]));
+}
+```
+
+**环境门禁生效点：**
+
+| 组件 | 环境门禁位置 |
+|-----|-------------|
+| Holdout 规则生成 | `getFeatureDefinition()` 中检查 `holdout.environmentSettings[environment]?.enabled` |
+| Holdout 虚拟 Feature | `getAllPayloadHoldouts(environment)` 中过滤 |
+| Feature 规则 | `getRulesForEnvironment()` 根据环境过滤规则 |
+| Experiment 规则 | `applyNamespaceToPayload()` 根据环境应用 |
+
+### 5.4 多级门禁联动效果
+
+```
+用户请求 SDK Payload
+    │
+    ├─ Connection 配置
+    │   ├─ environment: "production"
+    │   ├─ projects: ["p1"]
+    │   └─ capabilities: ["prerequisites", "bucketingV2"]
+    │
+    ├─ Holdout 筛选
+    │   ├─ 步骤 1: getAllPayloadHoldouts("production") → 环境过滤
+    │   ├─ 步骤 2: buildHoldoutsMapForProjects(map, ["p1"]) → 项目过滤
+    │   └─ 步骤 3: 生成虚拟 $holdout:xxx feature
+    │
+    └─ Feature 筛选
+        ├─ 步骤 1: getAllFeatures({ projects: ["p1"] }) → 项目过滤
+        ├─ 步骤 2: getFeatureDefinition()
+        │   ├─ 检查 prerequisites capability
+        │   ├─ 检查 holdout environmentSettings.enabled
+        │   ├─ 生成 holdout 规则（最前面）
+        │   ├─ 生成 prerequisite 规则
+        │   └─ 生成业务规则
+        └─ 步骤 3: 按环境过滤规则
+```
+
+## 六、跨实验互斥的真实保证机制
+
+### 6.1 核心结论：**没有全局强制保证**
+
+**代码证据：** GrowthBook 的 namespace 互斥机制**完全依赖手动配置**，代码中**没有**任何强制验证逻辑来确保同一 namespace 下的实验范围不重叠。
+
+**验证工具函数存在但不用于全局保证：**
+**文件：** `packages/shared/src/util/namespaces.ts:102-127`
+
+```typescript
+export function rangesOverlap(
+  range1: [number, number],
+  range2: [number, number],
+): boolean {
+  return range1[0] < range2[1] && range2[0] < range1[1];
+}
+
+export function validateNonOverlappingRanges(ranges: [number, number][]): {
+  valid: boolean;
+  error?: string;
+} {
+  for (let i = 0; i < ranges.length; i++) {
+    for (let j = i + 1; j < ranges.length; j++) {
+      if (rangesOverlap(ranges[i], ranges[j])) {
+        return {
+          valid: false,
+          error: `Ranges [${ranges[i][0]}, ${ranges[i][1]}] and [${ranges[j][0]}, ${ranges[j][1]}] overlap`,
+        };
+      }
+    }
+  }
+  return { valid: true };
+}
+```
+
+**搜索结果验证：** 全局搜索 `validateNamespaceRanges`、`overlapping.*namespace` 等关键词，**没有找到任何在 SDK payload 生成时进行跨实验范围验证的代码**。
+
+### 6.2 互斥的实现原理（约定而非强制）
+
+**文件：** `packages/back-end/src/util/features.ts:425-476`
+
+```typescript
+export function applyNamespaceToPayload(
+  rule: FeatureDefinitionRule,
+  namespace: NamespaceValue,
+  namespacesMap?: Map<string, { hashAttribute?: string; seed?: string; format?: ... }>,
+): void {
+  const nsDefinition = namespacesMap?.get(namespace.name);
+  
+  // 从组织设置获取统一的 hashAttribute 和 seed
+  const filterAttribute = getNamespaceHashAttribute(
+    namespace,
+    nsDefinition?.hashAttribute || rule.hashAttribute || "id",
+  );
+  const seed = nsDefinition?.seed || namespace.name;
+  
+  // 直接应用到 rule，不做任何范围冲突检查
+  rule.filters = [
+    ...(rule.filters || []),
+    {
+      attribute: filterAttribute,
+      seed,
+      hashVersion: filterHashVersion,
+      ranges,  // 直接使用配置的范围，不检查是否与其他实验重叠
+    },
+  ];
+}
+```
+
+**组织级 Namespace 定义：**
+**文件：** `packages/shared/types/organization.d.ts:156-173`
+
+```typescript
+export interface NamespaceBase {
+  name: string;
+  label: string;
+  description: string;
+  status: "active" | "inactive";
+}
+
+export interface MultiRangeNamespace extends NamespaceBase {
+  format: "multiRange";
+  hashAttribute: string;   // 组织级统一配置
+  seed: string;            // 组织级统一配置
+}
+```
+
+### 6.3 互斥失效的场景
+
+由于缺乏全局强制保证，以下情况会导致互斥失效：
+
+| 场景 | 结果 |
+|-----|------|
+| 同一 namespace 下两个实验配置了重叠范围 | 用户可能同时进入两个实验 |
+| 同一 namespace 下两个实验使用不同的 hashAttribute | 分桶基数不同，完全无法保证互斥 |
+| 同一 namespace 下两个实验使用不同的 hashVersion | hash 结果不同，完全无法保证互斥 |
+| 手动配置错误导致范围重叠 | 用户可能同时进入多个实验 |
+
+### 6.4 互斥的正确使用方式（必须手动保证）
+
+```
+组织级 Namespace 定义（一次性配置）
+    ├─ name: "checkout_flow"
+    ├─ hashAttribute: "user_id"  ← 统一
+    ├─ seed: "checkout_flow"     ← 统一
+    └─ format: "multiRange"
+
+实验 A 配置
+    └─ namespace:
+        ├─ name: "checkout_flow"
+        └─ ranges: [[0, 0.4]]     ← 手动分配，不重叠
+
+实验 B 配置
+    └─ namespace:
+        ├─ name: "checkout_flow"
+        └─ ranges: [[0.4, 0.8]]   ← 手动分配，不重叠
+
+Holdout 配置（注意：holdout 本身没有 namespace！）
+    └─ holdout 实验分桶是全局的
+```
+
+## 七、Holdout 与 Namespace/Filter 的真实关系
+
+### 7.1 核心发现：**Holdout 分桶是全局的，不参与 Namespace 互斥**
+
+**代码证据：** `packages/back-end/src/services/features.ts:234-269`
+
+```typescript
+export function generateHoldoutsPayload({ holdoutsMap }): Record<string, FeatureDefinition> {
+  const holdoutDefs: Record<string, FeatureDefinition> = {};
+  holdoutsMap.forEach((holdoutWithExperiment) => {
+    const exp = holdoutWithExperiment.holdoutExperiment;
+    const holdout = holdoutWithExperiment.holdout;
+    
+    const def: FeatureDefinition = {
+      defaultValue: "genpop",
+      rules: [
+        {
+          id: getHoldoutFeatureDefId(holdout.id),
+          coverage: exp.phases[0].coverage,
+          hashAttribute: exp.hashAttribute,
+          seed: exp.phases[0].seed,
+          hashVersion: 2,
+          variations: ["holdoutcontrol", "holdouttreatment"],
+          weights: [0.5, 0.5],
+          // 注意：这里没有 filters！也没有 namespace！
+          key: exp.trackingKey,
+          phase: `${exp.phases.length - 1}`,
+          meta: [{ key: "0" }, { key: "1" }],
+        },
+      ],
+    };
+    holdoutDefs[getHoldoutFeatureDefId(holdout.id)] = def;
+  });
+  return holdoutDefs;
+}
+```
+
+**对比：普通实验的 namespace 应用**
+**文件：** `packages/back-end/src/util/features.ts:713-719`
+
+```typescript
+if (phase.namespace && phase.namespace.enabled && phase.namespace.name) {
+  applyNamespaceToPayload(rule, phase.namespace, namespacesMap);
+}
+```
+
+### 7.2 Holdout 与普通实验的分桶对比
+
+| 特性 | Holdout 分桶 | 普通实验分桶 |
+|-----|-------------|-------------|
+| Namespace/Filter | ❌ 没有 | ✅ 可配置 |
+| 分桶范围 | 全局 | 可限制在 namespace 内 |
+| 与其他实验互斥 | ❌ 不互斥 | ✅ 通过手动配置 namespace 实现 |
+| 分桶种子 | holdout 实验自己的 seed | 可使用 namespace 统一 seed |
+| hashAttribute | holdout 实验自己的配置 | 可使用 namespace 统一配置 |
+
+### 7.3 Holdout 与 Namespace 协同的正确方式
+
+由于 Holdout 分桶是全局的，要实现 Holdout 与其他实验的互斥，需要：
+
+**方案 1：在业务实验上配置足够大的 coverage 排除**
+```
+Holdout: coverage = 0.2 (全局 20% 用户)
+业务实验 A: namespace = "main", ranges = [[0.2, 1.0]] (剩下的 80%)
+业务实验 B: namespace = "other", ranges = [[0.2, 1.0]] (剩下的 80%)
+```
+
+**方案 2：使用 prerequisites 实现间接互斥**
+```
+Feature A (关联 holdout)
+    └─ holdout 规则作为 prerequisite (最前面)
+        └─ 如果用户在 holdoutcontrol 组，直接返回 holdout 值
+        └─ 否则继续执行后续规则（可能包含 namespace）
+```
+
+### 7.4 Holdout 互斥的实际生效路径
+
+```
+evalFeature("checkout_button")
+    │
+    ├─ 规则 0: Holdout Gate Rule (parentConditions)
+    │   └─ evalFeature("$holdout:hld_main")
+    │       └─ 分桶逻辑：全局的，无 namespace
+    │           ├─ hash(holdout_seed, user_id)
+    │           ├─ coverage = 0.5
+    │           ├─ 50% → "holdoutcontrol"
+    │           └─ 50% → "holdouttreatment" (或 genpop)
+    │
+    ├─ 检查 parentCondition: { value: "holdoutcontrol" }
+    │   ├─ ✅ 匹配 → 执行 force: "off" → 返回，不进入后续实验
+    │   └─ ❌ 不匹配 → continue 到下一条规则
+    │
+    └─ 规则 1: 业务实验规则
+        └─ filters: [{ seed: "checkout_flow", ranges: [[0, 0.5]] }]
+            └─ 分桶逻辑：namespace 内的
+                ├─ hash("checkout_flow", user_id)
+                └─ 在范围内才进入实验
+```
+
+**关键点：**
+- Holdout 分桶和业务实验的 namespace 分桶是**两次独立的 hash 计算**
+- 使用不同的 seed，因此分桶结果是独立的
+- Holdout 是通过 **prerequisite + force** 实现的"软互斥"，而不是 namespace 层面的"硬互斥"
+
+## 八、关键代码位置总结
 
 | 功能模块 | 文件位置 | 关键函数/类型 |
 |---------|---------|-------------|
 | Holdout 验证器 | `packages/shared/src/validators/holdout.ts` | `holdoutValidator` |
 | Holdout 规则生成 | `packages/back-end/src/util/features.ts:592-616` | `getFeatureDefinition()` 中的 holdoutRule |
 | Holdout 虚拟 Feature | `packages/back-end/src/services/features.ts:234-269` | `generateHoldoutsPayload()` |
+| Prerequisites Capability 检查 | `packages/back-end/src/util/features.ts:563-590` | `hasPrerequisites` 变量 |
+| 项目门禁 | `packages/back-end/src/services/features.ts:209-232` | `buildHoldoutsMapForProjects()` |
+| 环境门禁 | `packages/back-end/src/models/HoldoutModel.ts:169-217` | `getAllPayloadHoldouts()` |
 | Feature 定义生成 | `packages/back-end/src/util/features.ts:478-978` | `getFeatureDefinition()` |
 | 分桶排除检查 | `packages/sdk-js/src/core.ts:832-840` | `isFilteredOut()` |
 | 实验运行流程 | `packages/sdk-js/src/core.ts:385-785` | `runExperiment()` |
@@ -535,3 +913,15 @@ const holdoutExperiment = {
 | Namespace 工具 | `packages/shared/src/util/namespaces.ts` | `getNamespaceRanges()`, `rangesOverlap()` |
 | Namespace 应用 | `packages/back-end/src/util/features.ts:425-476` | `applyNamespaceToPayload()` |
 | Filter 类型 | `packages/sdk-js/src/types/growthbook.ts:547-556` | `Filter` 接口 |
+
+## 九、核心结论
+
+1. **Holdout 依赖 prerequisites capability**：没有该能力时，Holdout 规则完全不生成，包含 prerequisites 的 feature 被整个排除
+
+2. **项目/环境门禁是多级联动的**：Feature、Experiment、Holdout 各自有独立的项目和环境过滤逻辑
+
+3. **跨实验互斥没有全局强制保证**：完全依赖手动配置，代码中没有验证机制，配置错误会导致用户同时进入多个实验
+
+4. **Holdout 分桶是全局的**：Holdout 虚拟 feature 没有 namespace/filter，分桶是全局的，与业务实验的分桶是两次独立计算
+
+5. **Holdout 互斥是"软互斥"**：通过 prerequisite + force 规则实现，而不是 namespace 层面的"硬互斥"
