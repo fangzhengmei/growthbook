@@ -148,29 +148,38 @@ export interface QueryInterface {
 - 存储在独立的 `queries` Mongo 集合中
 - `runAtEnd` 是查询创建时写入的永久属性，只能通过数据库读取
 
-#### 2.3.2 queryMap 的数据来源
+#### 2.3.2 queryMap 的数据来源与迭代顺序
 
 `queryMap: Map<string, QueryInterface>` 是连接两者的桥梁，有两种构建路径：
 
 **路径 A — `getQueryMap(pointers, cache)`**（`QueryRunner.ts:77`）：
-```
-this.model.queries (QueryPointer[])
-    ↓ 提取 query id，去重
-getQueriesByIds(context, ids) → QueryInterface[]
-    ↓ 按 pointer.name 建立映射
-Map<name, QueryInterface>
+```typescript
+const map: QueryMap = new Map(cache);  // 先复制缓存（按缓存插入顺序）
+queryDocs.forEach((query) => {
+  const pointer = queries.find((qp) => qp.query === query.id);
+  if (pointer) {
+    map.set(pointer.name, query);  // 按 queryDocs 返回顺序追加
+  }
+});
 ```
 
 **路径 B — `updateQueryPointers()`**（`QueryRunner.ts:945`）：
-```
-同上，获取最新 QueryInterface[]
-    ↓
-1. 同步 pointer.status = query.status
-2. 已成功的查询写入 finishedQueryMapCache
-3. 返回 queryMap + hasChanges 标记
+```typescript
+const queryMap: QueryMap = new Map(this.finishedQueryMapCache);
+queries.forEach((query) => {
+  const pointer = this.model.queries.find((p) => p.query === query.id);
+  if (!pointer) return;
+  queryMap.set(pointer.name, query);  // 按 getQueriesByIds 返回顺序追加
+  // ... 状态同步
+});
 ```
 
-> **关键点**：`queryMap` 的 value 永远是从数据库加载的 **`QueryInterface`** 文档，只有它包含 `runAtEnd` 的真实值。
+**迭代顺序的不确定性：**
+- `queryMap` 的迭代顺序 = **缓存插入顺序 + `getQueriesByIds` 返回顺序**
+- `getQueriesByIds` 内部是 `QueryModel.find({ _id: { $in: ids } })`，MongoDB `$in` 查询**不保证返回顺序与输入数组顺序一致**
+- 这意味着 `queuedQueries = Array.from(queryMap.values()).filter(...)` 的遍历顺序**不一定等于 `this.model.queries` 的数组顺序**
+
+> **关键点**：`queryMap` 的 value 永远是从数据库加载的 **`QueryInterface`** 文档，只有它包含 `runAtEnd` 的真实值。但迭代顺序没有强保证，依赖数据库返回顺序。
 
 #### 2.3.3 `runAtEnd` 的读取位置与判定逻辑
 
@@ -231,26 +240,112 @@ queuedQueries = [普通查询A, 普通查询B, runAtEnd查询C, 普通查询D, r
                已执行   此处触发 return，D 和 E 都被跳过
 ```
 
-**执行顺序保证：**
-- 普通查询：按 `queuedQueries` 数组顺序逐个检查依赖，满足即执行
-- `runAtEnd` 查询：必须等所有普通查询完成，且在队列中靠前的 `runAtEnd` 优先执行
+#### 2.3.5 queueQueryExecution 的抖动重排
 
-#### 2.3.5 收尾查询是否会被提前执行？
+并发受限时，`queueQueryExecution()` 引入随机 jitter 打乱执行顺序（`QueryRunner.ts:637`）：
 
-**答案：不会。** 三道防线确保 `runAtEnd` 查询不会提前执行：
+```typescript
+public queueQueryExecution(
+  query: QueryInterface,
+  timeout: number = INITIAL_CONCURRENCY_TIMEOUT,
+) {
+  // Queue query randomly within the window [timeout, timeout*2) to reduce race conditions
+  const jitter = Math.floor(Math.random() * timeout);
+  this.setTimer(
+    query.id,
+    setTimeout(() => {
+      this.executeQueryWhenReady(query, timeout);
+    }, timeout + jitter),  // 实际延迟 = timeout + [0, timeout) 随机值
+  );
+}
+```
 
-| 防线 | 位置 | 作用 |
-|-----|------|------|
-| 1 | `startQuery()` 创建时 | `runAtEnd: true` 的查询 `running` 永远设为 `false`，初始状态必为 `queued` |
-| 2 | `startReadyQueries()` 依赖检查 | 即使依赖满足，也要过 `runAtEnd` 等待检查 |
-| 3 | `queryMap` 实时读取 | `runAtEnd` 标志从数据库实时读取，不依赖模型中的缓存 |
+**对执行顺序的影响：**
+- 同一轮被并发限制阻塞的查询，**执行顺序完全随机**，与原队列顺序无关
+- 这意味着：
+  1. 普通查询之间的执行顺序在并发场景下没有保证
+  2. 多个 `runAtEnd` 查询之间的执行顺序也没有保证
+  3. 唯一确定的是：`runAtEnd` 查询一定在所有普通查询完成之后才开始排队
 
-**例外场景 — 缓存复用可能导致"看似提前执行"：**
-- 如果历史查询命中缓存且已经成功，`startQuery()` 返回的指针状态直接是 `succeeded`
-- 此时 `runAtEnd` 查询在 `startQueries()` 阶段就已标记为成功，无需等待
-- 但这不是"提前执行"，而是"历史结果复用"，符合缓存设计预期
+**执行顺序的真实保证（修正原结论）：**
+- ✅ `runAtEnd` 查询**不会在普通查询完成前开始执行**
+- ❌ ~~队列中靠前的 `runAtEnd` 优先执行~~ → **不保证**，取决于 jitter 随机值和并发释放时机
+- ❌ ~~普通查询按数组顺序执行~~ → **不保证**，并发场景下 jitter 会重排
 
-#### 2.3.6 并发控制
+#### 2.3.6 缓存命中时的状态继承 — `runAtEnd` 查询会被"提前完成"吗？
+
+`createNewQueryFromCached()` 的状态继承逻辑（`QueryModel.ts:315`）：
+
+```typescript
+export async function createNewQueryFromCached({
+  existing,
+  dependencies,
+  runAtEnd,  // ⚠️ 新参数，不是从 existing 继承
+}: {
+  existing: QueryInterface;
+  dependencies: string[];
+  runAtEnd?: boolean;
+}): Promise<QueryInterface> {
+  const data: QueryInterface = {
+    // ... 继承字段
+    status: existing.status,       // ✅ 继承缓存查询的状态
+    runAtEnd: runAtEnd,            // ⚠️ 使用新传入的标记，不继承
+    // ...
+  };
+  // ...
+}
+```
+
+**关键场景分析：**
+
+| 场景 | existing.status | 新查询 runAtEnd | 新查询 status | 结果 |
+|------|-----------------|-----------------|---------------|------|
+| 1 | `succeeded` | `true` | `succeeded` | **直接成功，跳过等待检查** |
+| 2 | `running` | `true` | `running` | 轮询等待，最终继承 succeeded/failed |
+| 3 | `failed` | `true` | `failed` | 直接失败 |
+
+**场景 1 的问题 — 真的是"提前完成"吗？**
+
+`startQuery()` 中缓存命中的完整流程：
+```typescript
+// QueryRunner.ts:795
+if (existing.status === "succeeded") {
+  const copiedCachedDoc = await createNewQueryFromCached({
+    existing: existing,
+    dependencies: dependencies,
+    runAtEnd: runAtEnd,  // 新查询的 runAtEnd 标记
+  });
+  return {
+    name,
+    query: copiedCachedDoc.id,
+    status: copiedCachedDoc.status,  // = "succeeded"
+  };
+}
+```
+
+此时这个 `runAtEnd: true` 的查询：
+1. **状态直接是 `succeeded`**，不会出现在 `queuedQueries` 中
+2. **永远不会经过 `startReadyQueries()` 的 `runAtEnd` 等待检查**
+3. 即使还有很多普通查询在跑，它也已经"完成"了
+
+**这是设计缺陷还是预期行为？**
+
+从代码意图看，这是**预期行为**，理由：
+- `runAtEnd` 的语义是"在所有非 runAtEnd 查询**执行完成后再执行**"
+- 如果结果已经通过缓存获得，就没有必要"执行"了，直接复用即可
+- 但从语义一致性角度，这确实是一个灰色地带：`runAtEnd` 查询的**执行时序约束**被缓存绕过了
+
+**三道防线的真实有效性（修正原结论）：**
+
+| 防线 | 位置 | 有效性 | 说明 |
+|-----|------|--------|------|
+| 1 | `startQuery()` 创建时 | ❌ 部分失效 | `readyToRun = dependenciesComplete && !runAtEnd && !concurrencyLimitReached` 确保新建的 runAtEnd 查询不立即执行，但缓存命中路径绕过了这一点 |
+| 2 | `startReadyQueries()` 等待检查 | ✅ 有效 | 只要状态是 `queued`，就会经过检查 |
+| 3 | `queryMap` 实时读取 | ✅ 有效 | `runAtEnd` 标志从数据库实时读取 |
+
+> **修正结论**：`runAtEnd` 查询**不会被提前执行**，但**可能被提前完成**（通过缓存复用）。这是"执行"与"完成"两个概念的区别——缓存复用跳过了执行，但状态是完成态。
+
+#### 2.3.7 并发控制
 
 ```typescript
 // back-end/src/queryRunners/QueryRunner.ts:905
@@ -263,7 +358,7 @@ private async concurrencyLimitReached(): Promise<boolean> {
 - 超出并发限制时，通过 `queueQueryExecution()` 进行指数退避重试（250ms → 500ms → ... → 4000ms 封顶）
 - 使用 jitter 避免惊群效应
 
-#### 2.3.7 查询缓存
+#### 2.3.8 查询缓存
 
 - `startQuery()` 首先调用 `getRecentQuery()` 查找相同 SQL 的历史执行
 - 缓存命中时直接复用结果，正在运行的查询通过轮询等待完成
