@@ -118,38 +118,140 @@ ExperimentResultsQueryRunner.startQueries()
 
 `QueryRunner`（`back-end/src/queryRunners/QueryRunner.ts:107`）是查询执行的编排器，核心机制：
 
-**依赖图管理：**
-- 每个查询通过 `dependencies` 字段声明依赖（其他查询的 ID）
-- `startReadyQueries()` 遍历查询，仅当所有依赖状态为 `succeeded` 时才执行
+#### 2.3.1 数据结构：QueryPointer vs QueryInterface
 
-**`runAtEnd` 收尾依赖**（`QueryRunner.ts:431`）：
+理解 `runAtEnd` 的关键在于分清两种数据结构的职责边界：
+
+**QueryPointer**（`shared/src/validators/queries.ts:13`）— 模型层的轻量引用：
+```typescript
+export const queryPointerValidator = z.object({
+  query: z.string(),      // 指向 QueryInterface 的 Mongo _id
+  status: queryStatusValidator,  // 本地缓存的状态快照
+  name: z.string(),       // 业务名称（如 "metric_revenue"）
+}).strict();
+```
+- 存储在模型（如 ExperimentSnapshot）的 `queries` 数组中
+- **不包含 `runAtEnd` 字段**，只存最核心的引用信息
+- 状态字段会被 `updateQueryPointers()` 定期同步更新
+
+**QueryInterface**（`shared/types/query.d.ts:123`）— 查询文档的完整结构：
+```typescript
+export interface QueryInterface {
+  id: string;
+  query: string;           // 实际 SQL
+  status: QueryStatus;     // 真实状态（数据库唯一可信源）
+  dependencies?: string[];
+  runAtEnd?: boolean;      // ⚠️ 仅存在于 QueryInterface 中
+  // ... 其他字段：result, statistics, externalId 等
+}
+```
+- 存储在独立的 `queries` Mongo 集合中
+- `runAtEnd` 是查询创建时写入的永久属性，只能通过数据库读取
+
+#### 2.3.2 queryMap 的数据来源
+
+`queryMap: Map<string, QueryInterface>` 是连接两者的桥梁，有两种构建路径：
+
+**路径 A — `getQueryMap(pointers, cache)`**（`QueryRunner.ts:77`）：
+```
+this.model.queries (QueryPointer[])
+    ↓ 提取 query id，去重
+getQueriesByIds(context, ids) → QueryInterface[]
+    ↓ 按 pointer.name 建立映射
+Map<name, QueryInterface>
+```
+
+**路径 B — `updateQueryPointers()`**（`QueryRunner.ts:945`）：
+```
+同上，获取最新 QueryInterface[]
+    ↓
+1. 同步 pointer.status = query.status
+2. 已成功的查询写入 finishedQueryMapCache
+3. 返回 queryMap + hasChanges 标记
+```
+
+> **关键点**：`queryMap` 的 value 永远是从数据库加载的 **`QueryInterface`** 文档，只有它包含 `runAtEnd` 的真实值。
+
+#### 2.3.3 `runAtEnd` 的读取位置与判定逻辑
+
+`runAtEnd` 的检查位于 `startReadyQueries()` 中（`QueryRunner.ts:431`）：
 
 ```typescript
-if (query.runAtEnd) {
-  const pendingQueries = this.model.queries.filter(
-    (q) =>
-      !queryMap.get(q.name)?.runAtEnd &&          // 排除其他 runAtEnd 查询
-      (q.status === "queued" || q.status === "running"),  // 尚未完成
-  );
-  if (pendingQueries.length) {
-    logger.debug(`${query.id}: "Run at end query" waiting...`);
-    return;  // ⚠️ 直接退出整个 startReadyQueries 方法
+// 遍历 queued 状态的查询
+for (const query of queuedQueries) {  // query 是 QueryInterface
+  // ... 依赖检查 ...
+  
+  // if `runAtEnd = true` run if all queries that are not marked
+  // `runAtEnd` are finished
+  if (query.runAtEnd) {
+    const pendingQueries = this.model.queries.filter(
+      (q) =>
+        !queryMap.get(q.name)?.runAtEnd &&          // 🔍 从 queryMap 读取
+        (q.status === "queued" || q.status === "running"),
+    );
+    if (pendingQueries.length) {
+      logger.debug(`${query.id}: "Run at end query" waiting...`);
+      return;  // ⚠️ 直接退出整个 startReadyQueries 方法
+    }
   }
+  // ... 执行查询 ...
 }
 ```
 
-**等待条件：** 所有**非 `runAtEnd`** 的查询中，没有任何一个处于 `queued` 或 `running` 状态。注意使用 `queryMap.get(q.name)` 来获取 `runAtEnd` 标记（而非 `q.runAtEnd`），因为 `queryMap` 是从数据库加载的最新状态。
+**读取位置详解：**
+- **外层 `if (query.runAtEnd)`**：`query` 来自 `queryMap.values()`，是 `QueryInterface`，直接读其 `runAtEnd` 字段
+- **内层 `queryMap.get(q.name)?.runAtEnd`**：`q` 是 `QueryPointer`，需要通过 `queryMap` 查找对应的 `QueryInterface` 才能拿到 `runAtEnd`
 
-**关键设计 — `return` 而非 `continue`：**
-- 当某个 `runAtEnd` 查询需要等待时，`startReadyQueries()` 方法**立即返回**，跳过当前循环中剩余的所有 queued 查询
-- 这意味着 `runAtEnd` 查询具有"门闩"效应：只要第一个 `runAtEnd` 遇到阻塞，所有后续 queued 查询（包括其他 `runAtEnd` 和普通查询）都被跳过
-- 后续查询的启动只能依赖下一次 `onQueryFinish()` 事件触发新一轮 `startReadyQueries()`
+**等待条件的精确含义：**
+> 所有**非 `runAtEnd`** 的查询中，没有任何一个处于 `queued` 或 `running` 状态。
+
+这意味着：
+1. 其他 `runAtEnd` 查询不构成阻塞（排除了 `runAtEnd: true` 的查询）
+2. 只要有一个普通查询还在跑或在排队，当前 `runAtEnd` 查询就必须等
+3. 失败（`failed`）或成功（`succeeded`）的普通查询不阻塞
+
+#### 2.3.4 关键设计 — `return` 而非 `continue`
+
+```typescript
+if (pendingQueries.length) {
+  logger.debug(`${query.id}: "Run at end query" waiting...`);
+  return;  // ⚠️ 不是 continue！
+}
+```
+
+**`return` 的全局影响：**
+- 当第一个需要等待的 `runAtEnd` 查询出现时，**整个 `startReadyQueries()` 方法立即返回**
+- 当前循环中排在它后面的所有 queued 查询（包括其他 `runAtEnd` 和普通查询）全部被跳过
+- 这些被跳过的查询只能等下一次 `onQueryFinish()` 事件触发新一轮 `startReadyQueries()`
+
+**"门闩效应"的工作原理：**
+```
+queuedQueries = [普通查询A, 普通查询B, runAtEnd查询C, 普通查询D, runAtEnd查询E]
+                     ↑         ↑
+               已执行   此处触发 return，D 和 E 都被跳过
+```
 
 **执行顺序保证：**
-- 普通查询：按 queued 数组中的顺序逐个检查依赖，满足即执行
+- 普通查询：按 `queuedQueries` 数组顺序逐个检查依赖，满足即执行
 - `runAtEnd` 查询：必须等所有普通查询完成，且在队列中靠前的 `runAtEnd` 优先执行
 
-**并发控制：**
+#### 2.3.5 收尾查询是否会被提前执行？
+
+**答案：不会。** 三道防线确保 `runAtEnd` 查询不会提前执行：
+
+| 防线 | 位置 | 作用 |
+|-----|------|------|
+| 1 | `startQuery()` 创建时 | `runAtEnd: true` 的查询 `running` 永远设为 `false`，初始状态必为 `queued` |
+| 2 | `startReadyQueries()` 依赖检查 | 即使依赖满足，也要过 `runAtEnd` 等待检查 |
+| 3 | `queryMap` 实时读取 | `runAtEnd` 标志从数据库实时读取，不依赖模型中的缓存 |
+
+**例外场景 — 缓存复用可能导致"看似提前执行"：**
+- 如果历史查询命中缓存且已经成功，`startQuery()` 返回的指针状态直接是 `succeeded`
+- 此时 `runAtEnd` 查询在 `startQueries()` 阶段就已标记为成功，无需等待
+- 但这不是"提前执行"，而是"历史结果复用"，符合缓存设计预期
+
+#### 2.3.6 并发控制
+
 ```typescript
 // back-end/src/queryRunners/QueryRunner.ts:905
 private async concurrencyLimitReached(): Promise<boolean> {
@@ -161,7 +263,8 @@ private async concurrencyLimitReached(): Promise<boolean> {
 - 超出并发限制时，通过 `queueQueryExecution()` 进行指数退避重试（250ms → 500ms → ... → 4000ms 封顶）
 - 使用 jitter 避免惊群效应
 
-**查询缓存：**
+#### 2.3.7 查询缓存
+
 - `startQuery()` 首先调用 `getRecentQuery()` 查找相同 SQL 的历史执行
 - 缓存命中时直接复用结果，正在运行的查询通过轮询等待完成
 - 缓存 TTL 可通过数据源设置 `queryCacheTTLMins` 配置
