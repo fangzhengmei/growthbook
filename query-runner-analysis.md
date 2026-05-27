@@ -121,7 +121,33 @@ ExperimentResultsQueryRunner.startQueries()
 **依赖图管理：**
 - 每个查询通过 `dependencies` 字段声明依赖（其他查询的 ID）
 - `startReadyQueries()` 遍历查询，仅当所有依赖状态为 `succeeded` 时才执行
-- `runAtEnd` 标记的查询需等待所有非 `runAtEnd` 查询完成
+
+**`runAtEnd` 收尾依赖**（`QueryRunner.ts:431`）：
+
+```typescript
+if (query.runAtEnd) {
+  const pendingQueries = this.model.queries.filter(
+    (q) =>
+      !queryMap.get(q.name)?.runAtEnd &&          // 排除其他 runAtEnd 查询
+      (q.status === "queued" || q.status === "running"),  // 尚未完成
+  );
+  if (pendingQueries.length) {
+    logger.debug(`${query.id}: "Run at end query" waiting...`);
+    return;  // ⚠️ 直接退出整个 startReadyQueries 方法
+  }
+}
+```
+
+**等待条件：** 所有**非 `runAtEnd`** 的查询中，没有任何一个处于 `queued` 或 `running` 状态。注意使用 `queryMap.get(q.name)` 来获取 `runAtEnd` 标记（而非 `q.runAtEnd`），因为 `queryMap` 是从数据库加载的最新状态。
+
+**关键设计 — `return` 而非 `continue`：**
+- 当某个 `runAtEnd` 查询需要等待时，`startReadyQueries()` 方法**立即返回**，跳过当前循环中剩余的所有 queued 查询
+- 这意味着 `runAtEnd` 查询具有"门闩"效应：只要第一个 `runAtEnd` 遇到阻塞，所有后续 queued 查询（包括其他 `runAtEnd` 和普通查询）都被跳过
+- 后续查询的启动只能依赖下一次 `onQueryFinish()` 事件触发新一轮 `startReadyQueries()`
+
+**执行顺序保证：**
+- 普通查询：按 queued 数组中的顺序逐个检查依赖，满足即执行
+- `runAtEnd` 查询：必须等所有普通查询完成，且在队列中靠前的 `runAtEnd` 优先执行
 
 **并发控制：**
 ```typescript
@@ -218,11 +244,38 @@ queued → running → succeeded
          failed
 ```
 
-**状态聚合逻辑**（`QueryRunner.getOverallQueryStatus()`）：
-- 超过半数查询失败 → 整体 `failed`
-- 存在 `running` 或 `queued` 查询 → 整体 `running`
-- 部分失败但未超半数 → `partially-succeeded`
-- 全部成功 → `succeeded`
+**状态聚合逻辑**（`QueryRunner.getOverallQueryStatus()`，`back-end/src/queryRunners/QueryRunner.ts:923`）：
+
+```typescript
+const failed = this.model.queries.filter(q => q.status === "failed");
+const running = this.model.queries.filter(q => q.status === "running");
+const queued = this.model.queries.filter(q => q.status === "queued");
+const total = this.model.queries.length;
+
+if (failed.length >= total / 2) return "failed";
+if (queued.length + running.length > 0) return "running";
+if (failed.length > 0) return "partially-succeeded";
+return "succeeded";
+```
+
+**判定优先级（从高到低）：**
+
+| 优先级 | 条件 | 返回状态 | 说明 |
+|-------|------|---------|------|
+| 1 | `failed.length >= total / 2` | `failed` | **半数（含）以上失败即整体失败**。注意用 `>=` 而非 `>`，total=3 时 2 个失败即触发，total=4 时 2 个失败即触发 |
+| 2 | `queued.length + running.length > 0` | `running` | 只要还有查询在跑或排队中，整体就是 running |
+| 3 | `failed.length > 0` | `partially-succeeded` | **三条件同时成立**：有失败、失败数未达半数、没有 pending 查询 |
+| 4 | 以上均不满足 | `succeeded` | 全部查询成功，无失败、无 pending |
+
+**易忽略的细节：**
+- `partially-succeeded` 的成立依赖优先级。如果失败数刚好 ≥ total/2，会在第 1 步直接返回 `failed`，不会出现 `partially-succeeded`
+- 如果有失败但同时还有 queued/running 查询，会在第 2 步返回 `running`，需要等所有查询收尾后才会重新判定为 `partially-succeeded`
+- `refreshQueryStatuses()` 中只有 `newStatus === "succeeded"` 或 `"partially-succeeded"` 才会触发 `runAnalysis()`，`failed` 状态不会跑分析
+
+**状态流转中的副作用**（`refreshQueryStatuses()`，`QueryRunner.ts:516`）：
+- `running → failed`：记录错误信息，单查询场景会使用查询自身的错误消息
+- `running → succeeded` 或 `running → partially-succeeded`：触发 `runAnalysis()` 执行统计分析
+- `running → running`：不触发任何副作用，等待下次查询完成事件
 
 ---
 
