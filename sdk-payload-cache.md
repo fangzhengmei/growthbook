@@ -227,7 +227,35 @@ SDK 请求 → getSdkPayload / getFeaturesPublic / getEvaluatedFeaturesPublic
 - **缓存损坏容错**：JSON.parse 失败时 warn 并回源，不会返回损坏数据
 - **缓存可关闭**：环境变量 `SDK_PAYLOAD_CACHE=none` 可完全禁用 MongoDB 缓存层
 
-### 4.2 写路径：批量刷新
+### 4.2 `getFeatureDefinitionsWithCache` 的调用方清单
+
+此函数是 SDK payload 生成的核心入口，被以下 7 处调用，分三类场景：
+
+#### 场景 1：HTTP 端点（3 处）
+
+| 调用方 | 文件 | 端点 | 说明 |
+|--------|------|------|------|
+| `getFeaturesPublic` | `controllers/features.ts:525` | `GET /api/features/:key` | 公共 SDK 端点，带 CDN 缓存 |
+| `getEvaluatedFeaturesPublic` | `controllers/features.ts:605` | `POST /api/eval/:key` | 远程评估端点，仅自托管 |
+| `getSdkPayload` | `api/sdk-payload/getSdkPayload.ts:37` | `GET /api/v1/sdk-payload/:key` | API 端点，需 Secret Key 鉴权 |
+
+#### 场景 2：内部 API（1 处）
+
+| 调用方 | 文件 | 说明 |
+|--------|------|------|
+| `listFeatures` handler | `api/features/listFeatures.ts:123` | 内部 API，用于列出 features |
+
+#### 场景 3：后台 Jobs（3 处）
+
+| 调用方 | 文件 | 触发时机 |
+|--------|------|---------|
+| `queueProxyUpdate` | `jobs/proxyUpdate.ts:85` | SDK payload 刷新后，更新代理缓存 |
+| `queueWebhooksByConnections` | `jobs/sdkWebhooks.ts:336,363` | SDK payload 刷新后，推送 Webhook |
+| `queueLegacySdkWebhooks` | `jobs/webhooks.ts:43` | SDK payload 刷新后，推送旧式 Webhook |
+
+> **注意**：后台 Jobs 调用时，`params` 是直接构造的 `SDKPayloadParams` 对象，不走 `getPayloadParamsFromApiKey` 路径。
+
+### 4.3 写路径：批量刷新
 
 入口：`refreshSDKPayloadCache`（`services/features.ts:623-826`）
 
@@ -278,7 +306,7 @@ connection.projects.includes(payloadKey.project) → 连接包含该项目，匹
 其他 → 不受影响
 ```
 
-### 4.3 `SDK_PAYLOAD_CACHE` 环境变量
+### 4.4 `SDK_PAYLOAD_CACHE` 环境变量
 
 ```ts
 export function getSDKPayloadCacheLocation(): "mongo" | "none" {
@@ -370,6 +398,40 @@ const defs = await getFeatureDefinitionsWithCache({
 - **不设置**任何 CDN 缓存头
 - **不检查** `remoteEvalEnabled` 标志，始终返回原始 payload
 - 此端点走 API Router，通过 `createApiRequestHandler` 封装
+
+##### `/api/v1/sdk-payload/:key` 中两个 key 的角色分工
+
+此端点涉及**两个独立的 key**，扮演完全不同的角色：
+
+| Key 来源 | 位置 | 处理模块 | 角色 | 要求 |
+|---------|------|---------|------|------|
+| Secret API Key | `Authorization` header | `authenticateApiRequestMiddleware` | **鉴权**：验证请求者身份与权限 | 必须 `secret=true` |
+| Payload Key | URL path `:key` 参数 | `getPayloadParamsFromApiKey` | **内容定位**：指定要获取哪个 SDK Connection 的配置 | SDK Connection key (`sdk-*`) 或 Legacy Publishable key |
+
+**执行流程**：
+
+```
+请求到达 /api/v1/sdk-payload/sdk-abc123
+         ↓
+  authenticateApiRequestMiddleware
+  (检查 Authorization: Bearer secret_xxx)
+         ↓ 鉴权通过，建立 req.context.org
+  getPayloadParamsFromApiKey("sdk-abc123", req)
+  (按 URL path 查找 SDK Connection 配置)
+         ↓
+  getFeatureDefinitionsWithCache()
+  (使用 Connection 的 key 查 MongoDB 缓存)
+```
+
+**关键要点**：
+
+1. **两个 key 相互独立**：Authorization header 的 Secret API Key 用于"证明你有权访问 API"，URL path 的 key 用于"指定你要哪个配置"。一个 Secret Key 可以访问该组织下任意多个 SDK Connection 的 payload。
+
+2. **跨组织访问控制**：中间件建立的 `req.context.org` 限定了可访问的组织范围，URL path 中的 SDK Connection 必须属于该组织（由 `findSDKConnectionByKey` 内部保证）。
+
+3. **Legacy key 特殊路径**：如果 URL path key 不匹配 `/^sdk-/`，则走 Legacy 路径：
+   - 调用 `dangerousLookupOrganizationByApiKey(key)`
+   - 要求该 key 必须是 Publishable key（`secret=false`），如果是 Secret key 会报错："Must use a Publishable API key to get feature definitions"
 
 ### 5.3 两条 SDK 读路径的鉴权边界对比
 
