@@ -64,13 +64,230 @@ export type GroupMap = Map<
 
 ---
 
-## 二、引用展开机制
+## 二、完整 CRUD 链路
+
+### 2.1 API 接口层
+
+**文件**: `packages/back-end/src/api/saved-groups/saved-groups.router.ts`
+
+提供的 REST API 端点：
+
+| 方法 | 端点 | 描述 |
+|------|------|------|
+| GET | `/saved-groups` | 列出所有分组 |
+| POST | `/saved-groups` | 创建分组 |
+| GET | `/saved-groups/:id` | 获取单个分组 |
+| PUT | `/saved-groups/:id` | 更新分组 |
+| POST | `/saved-groups/:id/archive` | 归档分组 |
+| POST | `/saved-groups/:id/unarchive` | 取消归档 |
+| DELETE | `/saved-groups/:id` | 删除分组 |
+
+同时在 `packages/back-end/src/routers/saved-group/saved-group.controller.ts` 中还有旧版 API：
+- POST `/saved-groups/:id/add-items` - 批量添加列表项
+- POST `/saved-groups/:id/remove-items` - 批量移除列表项
+- GET `/saved-groups/:id/references` - 获取分组被引用的资源
+
+### 2.2 创建流程 (`postSavedGroup`)
+
+**文件**: `packages/back-end/src/api/saved-groups/postSavedGroup.ts:7-96`
+
+```
+调用链:
+POST /saved-groups
+  → 权限检查: canCreateSavedGroup()
+  → 类型推断: 根据入参推断 type 是 condition 还是 list
+  → 类型校验:
+     · condition 类型: 调用 validateCondition() 校验 JSON 合法性
+     · list 类型: 校验 attributeKey 对应的 datatype 属于 ID_LIST_DATATYPES
+  → 调用 models.savedGroups.create() 持久化
+  → 转换为 API 格式并返回
+```
+
+**创建验证要点**:
+- condition 组: 不能指定 attributeKey 或 values，condition 必须非空且有效
+- list 组: 必须指定 attributeKey 和 values，不能指定 condition
+- ID_LIST_DATATYPES = ["number", "string", "secureString"]
+
+### 2.3 更新流程 (`updateSavedGroup`)
+
+**文件**: `packages/back-end/src/api/saved-groups/updateSavedGroup.ts:9-108`
+
+```
+调用链:
+PUT /saved-groups/:id
+  → getById() 获取现有分组
+  → 权限检查: canUpdateSavedGroup()
+  → 类型一致性检查:
+     · condition 组不能修改 values
+     · list 组不能修改 condition
+  → 字段对比: 只更新有变化的字段
+  → 重新验证:
+     · list 组: validateListSize() 检查大小限制
+     · condition 组: 重新 validateCondition()
+  → 调用 models.savedGroups.update() 持久化
+  → 返回更新后的分组
+```
+
+**List 组批量增删接口** (`saved-group.controller.ts`):
+- `postSavedGroupAddItems`: 合并新 items 到现有 values，去重后更新
+- `postSavedGroupRemoveItems`: 从 values 中过滤掉指定 items
+- 两个接口都支持审批流（revision 机制）
+
+### 2.4 归档/取消归档流程
+
+**文件**: `packages/back-end/src/api/saved-groups/archiveSavedGroup.ts:26-85`
+
+```
+归档流程:
+POST /saved-groups/:id/archive
+  → 权限检查
+  → loadSavedGroupReferences() 检查引用
+  → 如果有引用 → 抛出错误 (必须先移除所有引用才能归档)
+  → update() 设置 archived: true
+
+取消归档:
+POST /saved-groups/:id/unarchive
+  → 权限检查
+  → update() 设置 archived: false (无需检查引用)
+```
+
+**引用检查逻辑** (`services/savedGroups.ts:54-118`):
+```typescript
+loadSavedGroupReferences(context, id)
+  → 检查所有 feature 的 rule.condition / rule.savedGroups
+  → 检查所有 experiment 的 phase.condition / phase.savedGroups
+  → 检查其他 saved group 的 condition (一级嵌套)
+  → 返回: { features, experiments, savedGroups } 引用列表
+```
+
+### 2.5 删除流程
+
+**文件**: `packages/back-end/src/api/saved-groups/deleteSavedGroup.ts:4-31`
+
+```
+DELETE /saved-groups/:id
+  → 权限检查: canDeleteSavedGroup()
+  → 必须已归档 (!savedGroup.archived → 错误)
+  → deleteById() 从数据库删除
+```
+
+**设计考量**: 归档是可逆的，删除是不可逆的，所以强制先归档再删除作为撤销窗口。
+
+### 2.6 变更通知机制
+
+**文件**: `packages/back-end/src/services/savedGroups.ts:15-33`
+
+```typescript
+savedGroupUpdated(context)
+  → 刷新所有环境/项目的 SDK payload 缓存
+  → 因为 saved group 可能跨项目嵌套引用
+  → 保守策略: 刷新全部 payload
+```
+
+### 2.7 持久化层
+
+**文件**: `packages/back-end/src/models/SavedGroupModel.ts`
+
+核心数据库操作:
+- `create(props)`: 插入新文档，生成 `grp_` 前缀 ID
+- `getById(id)`: 按 ID 查询
+- `getAll(organization?)`: 获取组织下所有分组
+- `update(savedGroup, updates)`: 更新字段并记录审计日志
+- `deleteById(id)`: 删除文档
+
+---
+
+## 三、match=none 判定差异分析
+
+### 3.1 核心转换函数: `getSavedGroupCondition()`
+
+**文件**: `packages/back-end/src/util/features.ts:102-123`
+
+```typescript
+function getSavedGroupCondition(
+  groupId: string,
+  groupMap: GroupMap,
+  include: boolean,  // true=all/any, false=none
+): null | ConditionInterface {
+  const group = groupMap.get(groupId);
+  if (!group) return null;
+  
+  // condition 类型
+  if (group.type === "condition" && group.condition) {
+    try {
+      const cond = JSON.parse(group.condition);
+      return include ? cond : { $not: cond };  // 关键差异
+    } catch (e) {
+      return null;
+    }
+  }
+  
+  // list 类型
+  if (!group.attributeKey) return null;
+  return {
+    [group.attributeKey]: { 
+      [include ? "$inGroup" : "$notInGroup"]: groupId  // 关键差异
+    },
+  };
+}
+```
+
+### 3.2 两类分组在 match=none 时的展开差异
+
+| 维度 | condition 组 (include=false) | list 组 (include=false) |
+|------|-----------------------------|------------------------|
+| 输出结构 | `{ $not: <group_condition> }` | `{ <attributeKey>: { $notInGroup: groupId } }` |
+| 取反层级 | 对整个条件对象取反 | 对属性成员检查取反 |
+| SDK 处理 | `evalCondition()` 处理 `$not` | `evalOperatorCondition()` 处理 `$notInGroup` |
+| 空值行为 | condition 为空 → 返回 null (跳过该分组) | values 为空且 `useEmptyListGroup=false` → 跳过 |
+
+### 3.3 运行时评估差异
+
+**condition 组 match=none 评估路径**:
+```
+SDK 端 evalCondition(attributes, { $not: { country: "US", role: "admin" } })
+  → 遇到 $not 键
+  → 递归 evalCondition(attributes, { country: "US", role: "admin" })
+  → 返回 true → $not 取反为 false → 不命中规则
+```
+
+**list 组 match=none 评估路径**:
+```
+SDK 端 evalCondition(attributes, { userId: { $notInGroup: "grp_vip" } })
+  → 遇到属性键 "userId"
+  → 调用 evalOperatorCondition("$notInGroup", "user123", "grp_vip", savedGroups)
+  → !isIn("user123", savedGroups["grp_vip"] || [])
+  → 如果不在列表中 → 返回 true → 命中规则
+```
+
+### 3.4 语义差异的边界场景
+
+**场景 1: condition 组条件为 `{}` (空条件)**
+- 空条件 `{}` 在 evalCondition 中返回 true
+- `{ $not: {} }` → `!true` → `false`
+- 结果: match=none 对空 condition 组恒不命中
+
+**场景 2: list 组 values 为空**
+- `useEmptyListGroup=false` → 在 getParsedCondition 中被过滤掉，不参与条件
+- `useEmptyListGroup=true` → `$notInGroup` → `!isIn(val, [])` → `!false` → `true`
+- 结果: match=none 对允许空的 list 组恒命中
+
+**场景 3: condition 组嵌套 OR**
+```
+组条件: { $or: [{ country: "US" }, { country: "CN" }] }
+match=none 展开: { $not: { $or: [{ country: "US" }, { country: "CN" }] } }
+等价于 (德摩根定律): { $nor: [{ country: "US" }, { country: "CN" }] }
+```
+
+---
+
+## 四、引用展开机制
 
 Saved Groups 的展开分为**两个阶段**：**服务端预处理** 和 **SDK运行时处理**。
 
-### 2.1 第一阶段：服务端条件解析与嵌套展开
+### 4.1 第一阶段：服务端条件解析与嵌套展开
 
-#### 2.1.1 引用方式
+#### 4.1.1 引用方式
 
 Feature Rule 或 Experiment Phase 通过两种方式引用 Saved Group：
 
@@ -99,7 +316,7 @@ Feature Rule 或 Experiment Phase 通过两种方式引用 Saved Group：
 }
 ```
 
-#### 2.1.2 解析入口: `getParsedCondition()`
+#### 4.1.2 解析入口: `getParsedCondition()`
 
 **文件**: `packages/back-end/src/util/features.ts:125-208`
 
@@ -117,7 +334,7 @@ getFeatureDefinition()
 - `match: "any"` → 分组条件用 `$or` 包裹后再 `$and`
 - `match: "none"` → 每个分组条件用 `$not` 包裹后 `$and`
 
-#### 2.1.3 嵌套展开: `expandNestedSavedGroups()`
+#### 4.1.3 嵌套展开: `expandNestedSavedGroups()`
 
 **文件**: `packages/shared/src/sdk-versioning/sdk-payload.ts:113-285`
 
@@ -143,7 +360,7 @@ export const SAVED_GROUP_ERROR_INVALID = "__sgInvalid__";
 export const SAVED_GROUP_ERROR_UNKNOWN = "__sgUnknown__";
 ```
 
-### 2.2 第二阶段：服务端值替换 (旧版SDK兼容)
+### 4.2 第二阶段：服务端值替换 (旧版SDK兼容)
 
 **文件**: `packages/shared/src/sdk-versioning/sdk-payload.ts:288-310`
 
@@ -170,7 +387,7 @@ export const replaceSavedGroups = (savedGroups, organization) => ([key, value], 
 - 显式传入了 `savedGroupsMap`
 - 且 `savedGroupReferencesEnabled === false` 或 SDK 不支持 `savedGroupReferences` capability
 
-### 2.3 递归遍历工具: `recursiveWalk()`
+### 4.3 递归遍历工具: `recursiveWalk()`
 
 **文件**: `packages/shared/src/util/index.ts:489-500`
 
@@ -191,9 +408,9 @@ export const recursiveWalk = (object: any, onNode: NodeHandler) => {
 
 ---
 
-## 三、运行时命中评估
+## 五、运行时命中评估
 
-### 3.1 SDK 端数据接收
+### 5.1 SDK 端数据接收
 
 SDK 通过 payload 接收两部分数据：
 
@@ -211,7 +428,7 @@ const gb = new GrowthBook({
 });
 ```
 
-### 3.2 条件评估入口: `evalCondition()`
+### 5.2 条件评估入口: `evalCondition()`
 
 **文件**: `packages/sdk-js/src/mongrule.ts:17-46`
 
@@ -238,7 +455,7 @@ export function evalCondition(
 }
 ```
 
-### 3.3 分组操作符处理: `evalOperatorCondition()`
+### 5.3 分组操作符处理: `evalOperatorCondition()`
 
 **文件**: `packages/sdk-js/src/mongrule.ts:198-279`
 
@@ -272,7 +489,7 @@ function evalOperatorCondition(
 }
 ```
 
-### 3.4 成员检查: `isIn()`
+### 5.4 成员检查: `isIn()`
 
 **文件**: `packages/sdk-js/src/mongrule.ts:152-173`
 
@@ -301,7 +518,7 @@ function isIn(
 }
 ```
 
-### 3.5 Feature 评估流程中的调用链
+### 5.5 Feature 评估流程中的调用链
 
 **文件**: `packages/sdk-js/src/core.ts`
 
@@ -318,9 +535,72 @@ evalFeature(id, ctx)
         5. 分配 variation 或返回 force 值
 ```
 
+### 5.6 实验侧命中路径
+
+**文件**: `packages/sdk-js/src/core.ts:385-580`
+
+```typescript
+export function runExperiment<T>(
+  experiment: Experiment<T>,
+  featureId: string | null,
+  ctx: EvalContext,
+): { result: Result<T>; trackingCall?: Promise<void> }
+```
+
+实验评估的完整调用链:
+
+```
+runExperiment(experiment, ctx)
+  │
+  ├─ 1. 基础检查 (<2 variations, disabled, draft/inactive) → 不命中
+  │
+  ├─ 2. URL 匹配检查 (urlPatterns)
+  │
+  ├─ 3. Querystring 强制分配 (qsOverride)
+  │
+  ├─ 4. DevTools 强制分配 (forcedVariations)
+  │
+  ├─ 5. 获取 hash 属性 (hashAttribute → hashValue)
+  │   → 如果 hashValue 为空 → 不命中
+  │
+  ├─ 6. 粘性桶检查 (sticky bucketing)
+  │   → 如果已有分配 → 使用已有 variation
+  │
+  ├─ 7. 过滤器/命名空间检查 (filters / namespace)
+  │   → isFilteredOut() → 不命中
+  │
+  ├─ 8. 自定义 include 函数检查
+  │
+  ├─ 9. 条件检查 (experiment.condition)  ← Saved Group 在这里评估
+  │   └─ conditionPasses(experiment.condition, ctx)
+  │       └─ evalCondition(attributes, condition, ctx.global.savedGroups)
+  │           ├─ $and / $or / $not 递归处理
+  │           └─ evalOperatorCondition()
+  │               ├─ $inGroup → isIn(attr, savedGroups[groupId])
+  │               └─ $notInGroup → !isIn(attr, savedGroups[groupId])
+  │
+  ├─ 10. 前置条件检查 (parentConditions)
+  │
+  ├─ 11. 哈希分配 (hash(hashValue + experiment.key) % 1000 < coverage * 1000)
+  │
+  └─ 12. 返回分配结果 (variationId, inExperiment=true)
+```
+
+**实验中 Saved Group 引用的两种方式**:
+
+1. **通过 `experiment.condition` 字段**: 与 Feature Rule 相同，condition JSON 中可以包含 `$inGroup` 操作符
+
+2. **通过 `experiment.phases[].savedGroups` 字段**: 在服务端生成 SDK payload 时，`phases[i].savedGroups` 会被 `getParsedCondition()` 转换为 condition 片段并合并到 `experiment.condition` 中
+
+**实验侧与 Feature 侧的关键差异**:
+- 实验的 condition 评估发生在**哈希分配之前**，是准入门槛
+- Feature 的 condition 评估发生在**规则遍历中**，每个 rule 独立评估
+- 实验支持 `parentConditions`（依赖其他 Feature 的状态）
+- 实验有更复杂的分配流程（粘性桶、URL 强制、QS 强制等）
+
 ---
 
-## 四、完整流程图
+## 六、完整流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -382,28 +662,78 @@ evalFeature(id, ctx)
 
 ---
 
-## 五、关键代码位置汇总
+## 七、关键代码位置汇总
+
+### 7.1 CRUD 接口层
+
+| 功能模块 | 文件路径 | 关键函数 |
+|---------|---------|---------|
+| 路由注册 | `packages/back-end/src/api/saved-groups/saved-groups.router.ts` | `savedGroupsRoutes` |
+| 创建分组 | `packages/back-end/src/api/saved-groups/postSavedGroup.ts` | `postSavedGroup` |
+| 更新分组 | `packages/back-end/src/api/saved-groups/updateSavedGroup.ts` | `updateSavedGroup` |
+| 归档/取消归档 | `packages/back-end/src/api/saved-groups/archiveSavedGroup.ts` | `archiveSavedGroup`, `unarchiveSavedGroup` |
+| 删除分组 | `packages/back-end/src/api/saved-groups/deleteSavedGroup.ts` | `deleteSavedGroup` |
+| 列表项增删 | `packages/back-end/src/routers/saved-group/saved-group.controller.ts` | `postSavedGroupAddItems`, `postSavedGroupRemoveItems` |
+| 引用检查 | `packages/back-end/src/services/savedGroups.ts` | `loadSavedGroupReferences` |
+| 变更通知 | `packages/back-end/src/services/savedGroups.ts` | `savedGroupUpdated` |
+
+### 7.2 核心逻辑层
 
 | 功能模块 | 文件路径 | 关键函数 |
 |---------|---------|---------|
 | 类型定义 | `packages/shared/types/saved-group.d.ts` | `SavedGroupInterface` |
 | 数据验证 | `packages/shared/src/validators/saved-group.ts` | `savedGroupValidator` |
+| 条件解析 | `packages/back-end/src/util/features.ts` | `getParsedCondition`, `getSavedGroupCondition` |
 | 嵌套展开 | `packages/shared/src/sdk-versioning/sdk-payload.ts` | `expandNestedSavedGroups` |
-| 值替换 | `packages/shared/src/sdk-versioning/sdk-payload.ts` | `replaceSavedGroups` |
-| 条件解析 | `packages/back-end/src/util/features.ts` | `getParsedCondition` |
-| Feature定义生成 | `packages/back-end/src/util/features.ts` | `getFeatureDefinition` |
+| 值替换 (旧SDK兼容) | `packages/shared/src/sdk-versioning/sdk-payload.ts` | `replaceSavedGroups` |
 | 递归遍历工具 | `packages/shared/src/util/index.ts` | `recursiveWalk` |
-| SDK条件评估 | `packages/sdk-js/src/mongrule.ts` | `evalCondition`, `evalOperatorCondition` |
-| SDK Feature评估 | `packages/sdk-js/src/core.ts` | `evalFeature`, `conditionPasses` |
+| 值类型转换 | `packages/shared/src/util/saved-groups.ts` | `getTypedSavedGroupValues`, `getSavedGroupValueType` |
+| 引用检测 | `packages/shared/src/util/index.ts` | `featuresReferencingSavedGroups`, `experimentsReferencingSavedGroups` |
+
+### 7.3 SDK 运行时层
+
+| 功能模块 | 文件路径 | 关键函数 |
+|---------|---------|---------|
+| 条件评估入口 | `packages/sdk-js/src/mongrule.ts` | `evalCondition` |
+| 操作符处理 | `packages/sdk-js/src/mongrule.ts` | `evalOperatorCondition` |
+| 成员检查 | `packages/sdk-js/src/mongrule.ts` | `isIn` |
+| Feature 评估 | `packages/sdk-js/src/core.ts` | `evalFeature`, `conditionPasses` |
+| 实验评估 | `packages/sdk-js/src/core.ts` | `runExperiment` |
 | 数据模型 | `packages/back-end/src/models/SavedGroupModel.ts` | `SavedGroupModel` |
 
 ---
 
-## 六、设计要点总结
+## 八、设计要点总结
 
-1. **两级展开策略**: 服务端负责嵌套引用展开，SDK 负责最终成员检查，平衡了 payload 大小和灵活性
-2. **循环/深度防护**: 通过 `visited` Set 和 `MAX_SAVED_GROUP_DEPTH=10` 防止无限递归
-3. **错误降级**: 无效引用通过注入 always-false 条件实现优雅降级（不命中该分组）
-4. **向后兼容**: 通过 SDK capability 检测决定是展开值还是保留操作符
-5. **原地修改**: `recursiveWalk` 的原地修改特性使得嵌套展开可以单遍完成
-6. **类型感知**: list 类型分组会根据 `attributeKey` 的数据类型进行值转换（string/number）
+### 8.1 CRUD 链路设计
+
+1. **归档前置删除**: 强制先归档再删除，提供撤销窗口，防止误删
+2. **引用完整性**: 归档前强制检查所有引用（features/experiments/嵌套savedGroups），保证 archived 状态的分组不会被使用
+3. **审批流集成**: list 组的批量增删操作走 revision 机制，支持审批流程
+4. **保守刷新策略**: saved group 变更时刷新全部 SDK payload 缓存，因为可能存在跨项目的嵌套引用
+5. **幂等设计**: 归档/取消归档操作在已处于目标状态时直接返回，避免重复写入
+
+### 8.2 match=none 判定设计
+
+6. **结构差异**: condition 组用 `{ $not: cond }` 整体取反，list 组用 `$notInGroup` 属性级取反，符合各自的语义场景
+7. **空值处理差异**: 
+   - 空 condition → 跳过该分组（不参与条件）
+   - 空 list（`useEmptyListGroup=false`）→ 跳过
+   - 空 list（`useEmptyListGroup=true`）→ `$notInGroup` 恒为 true
+8. **德摩根定律隐式应用**: `$not` 包裹 `$or` 条件时等价于 `$nor`，但由 SDK 端 `evalCondition` 递归处理，无需服务端转换
+
+### 8.3 实验侧命中设计
+
+9. **分层准入**: Saved Group 条件检查发生在哈希分配之前，作为准入门槛，避免不必要的哈希计算
+10. **统一评估逻辑**: 实验与 Feature 共享相同的 `evalCondition` 和 `evalOperatorCondition` 逻辑，确保判定一致性
+11. **双路径引用**: 既支持 `experiment.condition` 内嵌 `$inGroup`，也支持 `phase.savedGroups` 声明式引用，给用户灵活选择
+12. **前置条件依赖**: 实验的 `parentConditions` 支持依赖其他 Feature 的状态，可构建复杂的准入规则
+
+### 8.4 通用设计原则
+
+13. **两级展开策略**: 服务端负责嵌套引用展开，SDK 负责最终成员检查，平衡了 payload 大小和灵活性
+14. **循环/深度防护**: 通过 `visited` Set 和 `MAX_SAVED_GROUP_DEPTH=10` 防止无限递归
+15. **错误降级**: 无效引用通过注入 always-false 条件实现优雅降级（不命中该分组）
+16. **向后兼容**: 通过 SDK capability 检测决定是展开值还是保留操作符
+17. **原地修改**: `recursiveWalk` 的原地修改特性使得嵌套展开可以单遍完成
+18. **类型感知**: list 类型分组会根据 `attributeKey` 的数据类型进行值转换（string/number）
