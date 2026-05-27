@@ -7,10 +7,12 @@
 3. [缓存键设计与 TTL 策略](#3-缓存键设计与-ttl-策略)
 4. [查询运行器类型决策](#4-查询运行器类型决策)
 5. [增量模式：首次构建 vs 后续更新](#5-增量模式首次构建-vs-后续更新)
-6. [探索性场景的缓存策略分叉](#6-探索性场景的缓存策略分叉)
+6. [仪表盘探索性快照的两条缓存路径](#6-仪表盘探索性快照的两条缓存路径)
 7. [增量兼容性门槛](#7-增量兼容性门槛)
-8. [缓存 vs 重跑完整决策流](#8-缓存-vs-重跑完整决策流)
-9. [核心代码位置](#9-核心代码位置)
+8. [触发入口、运行器与数据新鲜度关联表](#8-触发入口运行器与数据新鲜度关联表)
+9. [缓存 vs 重跑完整决策流](#9-缓存-vs-重跑完整决策流)
+10. [故障排除指南](#10-故障排除指南)
+11. [核心代码位置](#11-核心代码位置)
 
 ---
 
@@ -18,12 +20,13 @@
 
 | 术语 | 定义 |
 |------|------|
-| `useCache` | 顶层缓存开关，控制是否允许查询级缓存复用 |
+| `useCache` | 顶层缓存开关，控制查询级缓存是否允许复用 |
 | `fullRefresh` | 增量模式下的全量刷新标志，控制是否重建单位表 |
 | `incrementalRefreshModel` | 增量刷新状态文档，记录单位表位置、配置 hash 等 |
 | `unitsTableFullName` | 物化单位表的完整名称，是增量模式就绪的标志 |
 | `runnerKind` | 查询运行器类型：`results` / `incremental` / `incremental-exploratory` |
 | `snapshotType` | 快照类型：`standard` / `exploratory` / `report` |
+| `triggeredBy` | 触发来源：`manual` / `schedule` / `manual-dashboard` / `update-dashboards` 等 |
 
 ---
 
@@ -34,26 +37,28 @@
 **`createExperimentSnapshot()`** — 对外主入口
 - 位置：`services/experiments.ts:1718`
 - `useCache` 默认值：**`true`**
-- 典型调用方：API、仪表盘、Holdout 导入
+- 调用方：API、仪表盘手动刷新、Holdout 导入
 
 **`createSnapshot()`** — 内部调用入口
 - 位置：`services/experiments.ts:1627`
 - `useCache` 默认值：**`false`**
-- 典型调用方：定时任务
+- 调用方：定时任务、仪表盘自动更新
 
 ### 2.2 各触发入口的实际 useCache 值
 
-| 触发入口 | 调用函数 | 实际 useCache | 代码位置 |
-|----------|----------|--------------|----------|
-| 手动刷新 API | `createExperimentSnapshot()` | **`true`**（硬编码） | `postExperimentSnapshot.ts:63` |
-| 定时自动刷新 | `createSnapshot()` | **`true`**（显式传入） | `updateExperimentResults.ts:189` |
-| 仪表盘维度快照 | `createExperimentSnapshot()` | **`false`**（显式传入） | `dashboards.controller.ts:254` |
-| Holdout 自动刷新 | `createExperimentSnapshot()` | **`true`**（显式传入） | `holdout.controller.ts:269` |
-| Demo 项目创建 | `createSnapshot()` | **`true`**（显式传入） | `demo-datasource-project.controller.ts:519` |
+| 触发入口 | 调用函数 | 实际 useCache | triggeredBy | snapshotType | 代码位置 |
+|----------|----------|--------------|-------------|-------------|----------|
+| 手动刷新 API | `createExperimentSnapshot()` | **`true`**（硬编码） | `manual` | `standard` | `postExperimentSnapshot.ts:63` |
+| 定时自动刷新 | `createSnapshot()` | **`true`**（显式传入） | `schedule` | `standard` | `updateExperimentResults.ts:189` |
+| 仪表盘手动刷新（标准快照） | `planExperimentSnapshot()` + `createExperimentSnapshotFromPlan()` | **`false`**（显式传入） | `manual-dashboard` | `standard` | `dashboards.controller.ts:202` |
+| 仪表盘手动刷新（维度快照） | `createExperimentSnapshot()` | **`false`**（显式传入） | `manual-dashboard` | `exploratory` | `dashboards.controller.ts:254` |
+| 仪表盘自动更新 | `createSnapshot()` | **`true`**（显式传入） | `update-dashboards` | `exploratory` | `enterprise/services/dashboards.ts:206` |
+| Holdout 自动刷新 | `createExperimentSnapshot()` | **`true`**（显式传入） | — | — | `holdout.controller.ts:269` |
+| Demo 项目创建 | `createSnapshot()` | **`true`**（显式传入） | `manual` | `standard` | `demo-datasource-project.controller.ts:519` |
 
 ### 2.3 useCache 在规划阶段的作用
 
-**`planSnapshot()`** (`experiments.ts:1297`):
+**`planSnapshot()`** (`experiments.ts:1335-1348`):
 
 ```typescript
 // 只有 useCache=true 时才会查询增量刷新状态
@@ -124,7 +129,7 @@ const latest = await QueryModel.find({
   .limit(1);
 ```
 
-### 3.2 TTL 默认值（重点修正！）
+### 3.2 TTL 默认值
 
 **真实默认值：60 分钟**，不是 24 小时
 
@@ -289,61 +294,165 @@ const incrementalRefreshModel = params.fullRefresh
 
 ---
 
-## 6. 探索性场景的缓存策略分叉
+## 6. 仪表盘探索性快照的两条缓存路径
 
-### 6.1 探索性快照的定义
+### 6.1 两条路径概览
 
-- `snapshotType = "exploratory"`
-- 通常带有维度（`dimension` 非空）
-- 用于仪表盘、维度分析等临时查询
+仪表盘探索性快照有两条完全独立的生成路径，它们的 `useCache` 配置**相反**：
 
-### 6.2 运行器选择分叉
+| 维度 | 路径 A：手动刷新 | 路径 B：自动更新 |
+|------|------------------|-----------------|
+| 触发方式 | 用户点击仪表盘"刷新"按钮 | 标准快照完成后后台自动触发 |
+| 调用函数 | `refreshDashboardData()` | `updateExperimentDashboards()` |
+| 调用入口 | `routers/dashboards/dashboards.controller.ts:180` | `enterprise/services/dashboards.ts:82` |
+| 触发时机 | 用户主动操作 | 标准快照（`type="standard"`）完成后，且 `triggeredBy !== "manual-dashboard"` |
+| triggeredBy | `manual-dashboard` | `update-dashboards` |
+| 快照类型 | `exploratory` | `exploratory` |
 
-| 场景 | 条件 | 运行器类型 | useCache |
-|------|------|-----------|----------|
-| 无维度探索性 + 有单位表 | `snapshotType="exploratory"` + `!hasSnapshotDimensions` + `hasMaterializedUnitsTable` | `incremental` | `false`（硬编码） |
-| 无维度探索性 + 无单位表 | `snapshotType="exploratory"` + `!hasSnapshotDimensions` + `!hasMaterializedUnitsTable` | `results` | 调用方传入 |
-| 有维度探索性 | `snapshotType="exploratory"` + `hasSnapshotDimensions` | `incremental-exploratory` | `false`（硬编码） |
+### 6.2 路径 A：手动刷新（`refreshDashboardData()`）
 
-### 6.3 仪表盘快照的特殊处理
+**代码位置**：`routers/dashboards/dashboards.controller.ts:180-263`
 
-**代码位置**：`dashboards.controller.ts:247-257`
+**完整流程**：
+
+```
+用户点击仪表盘刷新
+    ↓
+1. 创建标准快照（无维度）
+   ├─→ planExperimentSnapshot(useCache=false, type="standard", triggeredBy="manual-dashboard")
+   ├─→ createExperimentSnapshotFromPlan() 执行
+   └─→ 这是 manual-dashboard 的 standard 快照
+    ↓
+2. 遍历仪表盘 blocks
+   ├─→ 判断 block 是否可被标准快照满足（snapshotSatisfiesBlock）
+   │   ├─→ 是 → 复用标准快照的 snapshotId
+   │   └─→ 否 → 需要创建探索性快照
+    ↓
+3. 对需要维度的 blocks，按维度分组
+   └─→ 每组维度创建一个探索性快照
+       ├─→ createExperimentSnapshot(useCache=false, type="exploratory", triggeredBy="manual-dashboard")
+       └─→ 强制重跑，不使用缓存
+```
+
+**useCache 配置**：**全部为 `false`**（显式传入）
+
+**为什么手动刷新禁用缓存**：
+- 用户主动刷新仪表盘期望看到最新数据
+- 保证数据新鲜度优先于性能
+- 每个维度快照都强制重跑，不复用历史查询
+
+### 6.3 路径 B：自动更新（`updateExperimentDashboards()`）
+
+**代码位置**：`enterprise/services/dashboards.ts:82-233`
+
+**触发时机**：`createSnapshotFromPlan()` 末尾 (`experiments.ts:1573-1597`)
 
 ```typescript
-for (const [dimensionId, blockIds] of Object.entries(dimensionsByBlocks)) {
-  const { snapshot } = await createExperimentSnapshot({
+// 当标准快照刷新时，后台异步更新关联仪表盘
+if (
+  runningSnapshot.type === "standard" &&
+  runningSnapshot.triggeredBy !== "manual-dashboard"
+) {
+  updateExperimentDashboards({
     context,
     experiment,
-    dimension: dimensionId,
-    datasource,
-    phase: experiment.phases.length - 1,
-    useCache: false,  // 硬编码禁用缓存
-    triggeredBy: "manual-dashboard",
-    type: "exploratory",
+    mainSnapshot: runningSnapshot,
+    ...
   });
 }
 ```
 
-**为什么仪表盘禁用缓存**：
-- 类型为 `exploratory`，带维度
-- 需要确保每次刷新仪表盘时强制重跑
-- 保证数据最新性优先于性能
+**触发条件**：
+- `runningSnapshot.type === "standard"` — 标准快照
+- `runningSnapshot.triggeredBy !== "manual-dashboard"` — 排除手动仪表盘刷新（避免循环）
 
-### 6.4 探索性增量查询的注释
+**完整流程**：
 
-**代码位置**：`experiments.ts:1505-1510`
-
-```typescript
-case "incremental-exploratory":
-  queryRunner = new ExperimentIncrementalRefreshExploratoryQueryRunner(
-    context,
-    snapshot,
-    integration,
-    false, // TODO(incremental-refresh): allow cache + cache override for exploratory queries
-  );
+```
+标准快照完成（triggeredBy ≠ manual-dashboard）
+    ↓
+1. 查找所有关联仪表盘（enableAutoUpdates=true）
+    ↓
+2. 遍历所有 blocks
+   ├─→ 过滤出有 snapshotId 且属于当前实验的 blocks
+   ├─→ 判断 block 是否可被主快照满足
+   │   ├─→ 是 → 跳过（主快照已覆盖）
+   │   └─→ 否 → 需要创建探索性快照
+    ↓
+3. 收集需要创建快照的 blocks
+   ├─→ 提取之前的 snapshotId，加载历史快照
+   ├─→ 从历史快照中提取分析设置
+   └─→ 按快照设置去重（相同设置的 blocks 只跑一次）
+    ↓
+4. 为每组唯一设置创建探索性快照
+   └─→ createSnapshot(useCache=true, type="exploratory", triggeredBy="update-dashboards")
+       └─→ 允许使用缓存，优先复用 60 分钟内的相同查询
 ```
 
-当前硬编码为 `false`，未来可能支持缓存覆盖。
+**useCache 配置**：**`true`**（显式传入）
+
+**为什么自动更新启用缓存**：
+- 自动更新由定时任务或 API 触发，可能频繁执行
+- 60 分钟内的数据对于仪表盘通常足够新
+- 性能优先，减少数据源负载
+
+### 6.4 主快照复用逻辑（两条路径共享）
+
+**`snapshotSatisfiesBlock()`** (`shared/enterprise/dashboards/utils.ts:123-137`):
+
+```typescript
+export function snapshotSatisfiesBlock(
+  snapshot: ExperimentSnapshotInterface,
+  block: DashboardBlockInterfaceOrData<DashboardBlockInterface>,
+) {
+  const blockSettings = getBlockSnapshotSettings(block);
+  // 如果快照有维度，必须匹配 block 的维度
+  if (snapshot.dimension) {
+    return snapshot.dimension === blockSettings.dimensionId;
+  }
+  if (!blockSettings.dimensionId) return true;
+  // 如果快照没有维度，检查请求的维度是否在预计算维度中
+  return snapshot.settings.dimensions.some(
+    ({ id }) => blockSettings.dimensionId === id,
+  );
+}
+```
+
+**复用规则**：
+- 无维度的标准快照可以满足：无维度的 block，或维度在预计算维度列表中的 block
+- 有维度的快照只能满足：相同维度的 block
+- 不满足的 block 需要创建独立的探索性快照
+
+### 6.5 两条路径的关键差异对比
+
+| 对比维度 | 路径 A：手动刷新 | 路径 B：自动更新 |
+|----------|-----------------|-----------------|
+| useCache | `false`（强制重跑） | `true`（允许缓存） |
+| 数据新鲜度 | 最新（强制重跑所有查询） | 60 分钟内可接受 |
+| 触发方式 | 用户主动 | 系统自动 |
+| 执行时机 | 同步等待 | 异步后台 |
+| 运行器 | 取决于增量兼容性 | 取决于增量兼容性 |
+| 适用场景 | 用户需要最新数据 | 定期维护仪表盘 |
+
+### 6.6 仪表盘产品分析探索块的缓存
+
+**代码位置**：`enterprise/services/dashboards.ts:348-377`
+
+仪表盘的产品分析探索块（`metric-exploration` / `fact-table-exploration` / `data-source-exploration`）使用独立的缓存策略：
+
+```typescript
+// updateDashboardExplorations()
+for (const block of explorationBlocks) {
+  const exploration = await runProductAnalyticsExploration(
+    context,
+    block.config,
+    { cache: "never" },  // 总是强制重跑
+  );
+  block.explorerAnalysisId = exploration.id;
+}
+```
+
+**配置**：`cache: "never"` — 每次刷新仪表盘时强制重跑产品分析探索查询
 
 ---
 
@@ -402,9 +511,39 @@ if (analysisType === "main-update" && incrementalRefreshModel) {
 
 ---
 
-## 8. 缓存 vs 重跑完整决策流
+## 8. 触发入口、运行器与数据新鲜度关联表
 
-### 8.1 顶层决策流程图
+### 8.1 完整决策矩阵
+
+| triggeredBy | 调用函数 | useCache | runnerKind | fullRefresh | 数据新鲜度 | 说明 |
+|-------------|----------|----------|------------|-------------|-----------|------|
+| `manual` | `createExperimentSnapshot()` | `true` | `results` 或 `incremental` | 取决于状态 | 60 分钟内可缓存 | 用户主动刷新实验结果 |
+| `schedule` | `createSnapshot()` | `true` | `results` 或 `incremental` | 取决于状态 | 60 分钟内可缓存 | 定时自动刷新 |
+| `manual-dashboard` | `createExperimentSnapshot()` | `false` | `results` 或 `incremental` | 取决于状态 | **最新**（强制重跑） | 用户手动刷新仪表盘 |
+| `update-dashboards` | `createSnapshot()` | `true` | `results` 或 `incremental` | 取决于状态 | 60 分钟内可缓存 | 标准快照后自动更新仪表盘 |
+
+### 8.2 运行器与缓存的关系
+
+| runnerKind | useCache（运行器内） | 查询级缓存 | 增量刷新 | 数据新鲜度 |
+|------------|---------------------|-----------|---------|-----------|
+| `results` | 传入值（可 `true` 可 `false`） | 取决于传入值 | 不支持 | 取决于 useCache |
+| `incremental` | **`false`（硬编码）** | 不使用查询缓存 | 支持（`fullRefresh` 控制首次/后续） | 增量模式保证最新 |
+| `incremental-exploratory` | **`false`（硬编码）** | 不使用查询缓存 | 支持（只读模式） | 增量模式保证最新 |
+
+### 8.3 数据新鲜度层级
+
+| 新鲜度层级 | 触发方式 | 说明 |
+|-----------|---------|------|
+| **最新（强制重跑）** | `manual-dashboard` | 每次都跑所有新查询，数据绝对最新 |
+| **增量最新** | `manual` + `incremental` 运行器 | 从上次增量位置更新，数据接近实时 |
+| **60 分钟内** | `manual`/`schedule`/`update-dashboards` + `results` 运行器 | 60 分钟内的查询可被复用 |
+| **增量缓存** | `schedule` + `incremental` 运行器 | 增量模式下不使用查询缓存，但增量更新保证数据较新 |
+
+---
+
+## 9. 缓存 vs 重跑完整决策流
+
+### 9.1 顶层决策流程图
 
 ```
 触发快照生成
@@ -433,9 +572,13 @@ createSnapshotFromPlan():
     │   ├─→ 命中 → 复用/等待
     │   └─→ 未命中 → 执行新查询
     └─→ useCache=false → 所有查询强制重跑
+    ↓
+如果 triggeredBy ≠ manual-dashboard 且 snapshotType=standard:
+    └─→ 异步触发 updateExperimentDashboards()
+        └─→ 为仪表盘创建 exploratory 快照（useCache=true）
 ```
 
-### 8.2 关键决策点速查表
+### 9.2 关键决策点速查表
 
 | 决策点 | 影响因素 | 结果 |
 |--------|---------|------|
@@ -448,9 +591,49 @@ createSnapshotFromPlan():
 
 ---
 
-## 9. 核心代码位置
+## 10. 故障排除指南
 
-### 9.1 快照生成与规划
+### 10.1 快照数据不更新
+
+| 现象 | 可能原因 | 排查步骤 |
+|------|---------|---------|
+| 手动刷新后数据没变 | 仪表盘手动刷新走 `useCache=true`？不可能，`manual-dashboard` 是 `false` | 检查 triggeredBy 是否为 `manual-dashboard` |
+| 定时刷新后数据没变 | TTL=60 分钟，1 小时内的查询可能被缓存 | 检查查询是否在 60 分钟内已执行过 |
+| 增量模式数据不更新 | 增量刷新锁被占用 | 检查 `incrementalrefresh` 集合中 `currentExecutionSnapshotId` |
+| 增量模式数据不更新 | 配置 hash 不匹配 | 检查 `experimentSettingsHash` 和 `metricSources[].settingsHash` |
+
+### 10.2 仪表盘探索性快照问题
+
+| 现象 | 可能原因 | 排查步骤 |
+|------|---------|---------|
+| 仪表盘数据延迟 | 自动更新走 `useCache=true`，60 分钟内的查询被复用 | 检查 triggeredBy 是否为 `update-dashboards` |
+| 仪表盘刷新慢 | 手动刷新走 `useCache=false`，所有查询强制重跑 | 正常行为，手动刷新保证最新 |
+| 仪表盘数据与实验页面不一致 | 仪表盘有独立的探索性快照，可能使用缓存 | 对比快照的 `triggeredBy` 字段 |
+| 仪表盘只更新了部分 blocks | 主快照复用跳过部分 blocks | 检查 `snapshotSatisfiesBlock()` 逻辑 |
+
+### 10.3 增量模式问题
+
+| 现象 | 可能原因 | 排查步骤 |
+|------|---------|---------|
+| 增量刷新报错 | 兼容性检查失败 | 查看 `validateIncrementalPipeline()` 抛出的错误信息 |
+| 增量刷新报错 | 配置 hash 不匹配 | 触发一次手动全量刷新（设置 `useCache=false`） |
+| 增量刷新报错 | 数据源不支持增量刷新 | 检查 `integration.getSourceProperties().hasIncrementalRefresh` |
+| 单位表不更新 | 锁未被正确释放 | 检查 `currentExecutionSnapshotId`，如超过 1 小时可认为是脏锁 |
+
+### 10.4 查询缓存问题
+
+| 现象 | 可能原因 | 排查步骤 |
+|------|---------|---------|
+| 查询被意外缓存 | TTL=60 分钟内的相同 SQL | 检查 SQL 文本是否完全一致 |
+| 查询未被缓存 | SQL 文本有微小差异（空格、别名等） | 对比两次的完整 SQL |
+| 查询未被缓存 | 查询失败（status ≠ succeeded/running） | 检查查询状态 |
+| 查询未被缓存 | 从缓存复制的查询（`cachedQueryUsed` 存在）不会再次被复用 | 设计如此，防止级联复用 |
+
+---
+
+## 11. 核心代码位置
+
+### 11.1 快照生成与规划
 
 | 功能 | 文件 | 关键函数 |
 |------|------|----------|
@@ -461,7 +644,7 @@ createSnapshotFromPlan():
 | 手动刷新 API | `api/experiments/postExperimentSnapshot.ts` | `postExperimentSnapshot` |
 | 定时刷新任务 | `jobs/updateExperimentResults.ts:179` | `updateSingleExperiment()` |
 
-### 9.2 缓存机制
+### 11.2 缓存机制
 
 | 功能 | 文件 | 关键函数 |
 |------|------|----------|
@@ -471,7 +654,7 @@ createSnapshotFromPlan():
 | 查询运行器基类 | `queryRunners/QueryRunner.ts` | `startQuery()` |
 | 结果查询运行器 | `queryRunners/ExperimentResultsQueryRunner.ts` | `startQueries()` |
 
-### 9.3 增量刷新
+### 11.3 增量刷新
 
 | 功能 | 文件 | 关键函数 |
 |------|------|----------|
@@ -481,9 +664,11 @@ createSnapshotFromPlan():
 | 增量刷新运行器 | `queryRunners/ExperimentIncrementalRefreshQueryRunner.ts` | `startQueries()` |
 | 增量刷新锁与状态 | `models/IncrementalRefreshModel.ts` | `acquireLock()`, `releaseLock()` |
 
-### 9.4 探索性场景
+### 11.4 仪表盘路径
 
 | 功能 | 文件 | 关键函数 |
 |------|------|----------|
-| 仪表盘维度快照 | `routers/dashboards/dashboards.controller.ts:247-257` | 循环调用 `createExperimentSnapshot()` |
-| 探索性增量运行器 | `queryRunners/ExperimentIncrementalRefreshExploratoryQueryRunner.ts` | `startQueries()` |
+| 仪表盘手动刷新 | `routers/dashboards/dashboards.controller.ts:180` | `refreshDashboardData()` |
+| 仪表盘自动更新 | `enterprise/services/dashboards.ts:82` | `updateExperimentDashboards()` |
+| 主快照复用判断 | `shared/enterprise/dashboards/utils.ts:123` | `snapshotSatisfiesBlock()` |
+| 仪表盘产品分析探索 | `enterprise/services/dashboards.ts:348` | `updateDashboardExplorations()` |
