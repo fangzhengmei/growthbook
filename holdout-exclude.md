@@ -212,18 +212,20 @@ export function generateHoldoutsPayload({
 
 ### 2.2 Filters 排除机制
 
-**文件：** `packages/sdk-js/src/core.ts`
+**文件：** `packages/sdk-js/src/core.ts:832-840`
 
 ```typescript
 function isFilteredOut(filters: Filter[], ctx: EvalContext): boolean {
   return filters.some((filter) => {
     const { hashValue } = getHashAttribute(ctx, filter.attribute);
-    if (!hashValue) return true;
+    if (!hashValue) return true;  // 缺失 hashValue → 该 filter 排除
 
     const n = hash(filter.seed, hashValue, filter.hashVersion || 2);
-    if (n === null) return true;
+    if (n === null) return true;  // hash 失败 → 该 filter 排除
 
     return !filter.ranges.some((r) => inRange(n, r));
+    // 任一范围匹配 → 该 filter 不排除（返回 false）
+    // 所有范围都不匹配 → 该 filter 排除（返回 true）
   });
 }
 ```
@@ -239,10 +241,57 @@ export interface Filter {
 }
 ```
 
-**关键特性：**
-1. **独立分桶**：Filter 使用独立的 `seed` 和 `attribute`，与实验本身的分桶计算分离
-2. **多范围支持**：支持多个不连续的范围 `[[0, 0.2], [0.5, 0.7]]`
-3. **多 Filter 逻辑**：多个 Filter 为 **OR** 关系（`filters.some`），任一 filter 排除即排除
+**`inRange` 精确语义（左闭右开区间）：**
+**文件：** `packages/sdk-js/src/util.ts:54-56`
+
+```typescript
+export function inRange(n: number, range: VariationRange): boolean {
+  return n >= range[0] && n < range[1];
+}
+```
+
+> **关键：** 左端点包含，右端点不包含。`n ∈ [0, 1)` 时，范围 `[0.5, 1.0]` 实际是 `[0.5, 1.0)`。
+
+---
+
+#### 多 Filter 的精确排除语义
+
+| 层级 | 逻辑 | 语义 | 代码表达式 |
+|-----|------|------|-----------|
+| **单个 Filter 内部** | OR（`ranges.some`） | 任一范围匹配 → 通过该 filter | `!filter.ranges.some(r => inRange(n, r))` |
+| **多个 Filter 之间** | OR（`filters.some`） | 任一 filter 排除 → 整体排除 | `filters.some(filter => isFilteredOutByOne(filter))` |
+
+**真值表示例（2 个 filters，每个 1 个范围）：**
+
+| 用户在 Filter 1 范围内 | 用户在 Filter 2 范围内 | `isFilteredOut` 返回值 | 最终结果 |
+|----------------------|----------------------|----------------------|---------|
+| ✅ 是 | ✅ 是 | `false` | 入组 |
+| ✅ 是 | ❌ 否 | `false` | 入组 |
+| ❌ 否 | ✅ 是 | `false` | 入组 |
+| ❌ 否 | ❌ 否 | `true` | 排除 |
+
+> **结论：多 Filter 是 OR 关系，只需通过任一 Filter 即可入组。**
+> 这意味着：**Filter 越多，入组概率越高**（OR 语义，不是 AND）。
+
+---
+
+#### 多范围的入组语义
+
+单个 Filter 内的多范围也是 OR 关系：
+
+```
+Filter: { seed: "ns1", ranges: [[0, 0.2], [0.5, 0.7]] }
+
+hash(n) = 0.15 → 在 [0, 0.2] 内 → ✅ 通过
+hash(n) = 0.60 → 在 [0.5, 0.7] 内 → ✅ 通过
+hash(n) = 0.30 → 不在任何范围内 → ❌ 排除
+```
+
+**多范围的典型用途：**
+1. **增量放量**：`[[0, 0.1], [0.1, 0.2]]` → 先 10% 验证，再扩展到 20%，保留原有用户
+2. **多段分配**：`[[0, 0.4], [0.6, 1.0]]` → 给其他实验留出中间 20%
+
+---
 
 ### 2.3 旧版 Namespace 机制
 
@@ -263,7 +312,181 @@ export function inNamespace(
 
 **重要：** Filters/Namespace 排除发生在 **实际分桶计算之前**。
 
-**Sticky Bucket 优化：** 如果用户已有 sticky bucket 分配，**跳过** filters/namespace/condition/group/include/prerequisites 检查，但仍然会检查 URL 目标、QA 模式、实验停止状态等。
+---
+
+### 2.5 Sticky Bucket 对分桶复用与检查顺序的影响
+
+**文件：** `packages/sdk-js/src/core.ts:499-663`
+
+Sticky Bucket（粘性分桶）对检查顺序有**重大影响**：如果用户已有 sticky bucket 分配，会**跳过大部分前置检查**，直接复用已有的分桶结果。
+
+**`runExperiment` 中的关键代码：**
+
+```typescript
+let assigned = -1;
+let foundStickyBucket = false;
+let stickyBucketVersionIsBlocked = false;
+
+if (ctx.user.saveStickyBucketAssignmentDoc && !experiment.disableStickyBucketing) {
+  const { variation, versionIsBlocked } = getStickyBucketVariation({
+    ctx,
+    expKey: experiment.key,
+    expBucketVersion: experiment.bucketVersion,
+    expHashAttribute: experiment.hashAttribute,
+    expFallbackAttribute: experiment.fallbackAttribute,
+    expMinBucketVersion: experiment.minBucketVersion,
+    expMeta: experiment.meta,
+  });
+  foundStickyBucket = variation >= 0;
+  assigned = variation;
+  stickyBucketVersionIsBlocked = !!versionIsBlocked;
+}
+
+// ⚠️ 关键：只有没找到 sticky bucket 时才执行这些检查
+if (!foundStickyBucket) {
+  // 检查 1: Filters / Namespace 排除
+  if (experiment.filters && isFilteredOut(experiment.filters, ctx)) {
+    return { result: getExperimentResult(...) };  // 排除
+  }
+
+  // 检查 2: include 函数
+  if (experiment.include && !isIncluded(experiment.include)) {
+    return { result: getExperimentResult(...) };  // 排除
+  }
+
+  // 检查 3: Condition 条件
+  if (experiment.condition && !conditionPasses(experiment.condition, ctx)) {
+    return { result: getExperimentResult(...) };  // 排除
+  }
+
+  // 检查 4: Parent Conditions / Prerequisites
+  if (experiment.parentConditions) {
+    // ... 递归评估 parentConditions ...
+  }
+
+  // 检查 5: Group 组检查
+  if (experiment.groups && !inGroups(experiment.groups, ctx)) {
+    return { result: getExperimentResult(...) };  // 排除
+  }
+}
+
+// ⚠️ 这些检查即使有 sticky bucket 也会执行
+// 检查 6: URL 目标检查（旧版）
+if (experiment.url && !urlIsValid(experiment.url as RegExp, ctx)) {
+  return { result: getExperimentResult(...) };  // 排除
+}
+
+// 检查 7: 计算 hash 值（无论是否 sticky 都要计算）
+const n = hash(experiment.seed || key, hashValue, experiment.hashVersion || 1);
+
+// ⚠️ 只有没找到 sticky bucket 时才重新分桶
+if (!foundStickyBucket) {
+  const ranges = experiment.ranges || getBucketRanges(...);
+  assigned = chooseVariation(n, ranges);
+}
+
+// ⚠️ Sticky bucket 版本阻塞检查（即使有 sticky bucket 也执行）
+if (stickyBucketVersionIsBlocked) {
+  return { result: getExperimentResult(..., true) };  // 排除
+}
+```
+
+---
+
+#### Sticky Bucket 对 Holdout 分桶的影响
+
+**Holdout 虚拟 feature 的实验规则也支持 sticky bucket**，因为它就是一个普通的实验规则。
+
+**Sticky Bucket 跳过的检查（Holdout 实验）：**
+
+| 检查项 | 有 Sticky Bucket 时 | 无 Sticky Bucket 时 |
+|-------|-------------------|-------------------|
+| Filters / Namespace | ❌ **跳过** | ✅ 执行 |
+| `experiment.include` 函数 | ❌ **跳过** | ✅ 执行 |
+| Condition 条件 | ❌ **跳过** | ✅ 执行 |
+| Parent Conditions | ❌ **跳过** | ✅ 执行 |
+| Group 组检查 | ❌ **跳过** | ✅ 执行 |
+| URL 检查 | ✅ 仍执行 | ✅ 执行 |
+| Sticky Bucket 版本阻塞 | ✅ 仍执行 | ✅ 执行 |
+
+**Holdout 特有的影响：**
+
+由于 Holdout 虚拟 feature 的实验规则**没有 filters/namespace**（代码证据见 4.3 节），sticky bucket 对 Holdout 的主要影响是：
+
+1. **分桶复用**：用户一旦被分入 `holdoutcontrol` 或 `holdouttreatment`，后续会一直保持这个分配，不受后续 coverage 变化影响
+2. **coverage 变化不影响已有用户**：如果 Holdout 的 coverage 从 0.5 调整到 0.2，已经在 sticky bucket 中的用户不会被踢出
+3. **但版本阻塞会生效**：如果 `minBucketVersion` 提高，旧版本的 sticky bucket 会被阻塞，用户会重新分桶
+
+---
+
+#### evalFeature 中 force 规则与 sticky bucket 的关系
+
+**文件：** `packages/sdk-js/src/core.ts:251-294`
+
+对于 Holdout 规则（force rule + parentConditions），**sticky bucket 影响的是递归评估的 `$holdout:xxx` 虚拟 feature**，而不是当前 feature 的 force 规则本身：
+
+```typescript
+// evalFeature 中的规则评估顺序
+rules: for (const rule of feature.rules) {
+  // 1. 评估 parentConditions（递归调用 evalFeature）
+  //    这里会触发 $holdout:xxx 虚拟 feature 的评估
+  //    $holdout:xxx 的实验规则可能命中 sticky bucket
+  if (rule.parentConditions) {
+    for (const parentCondition of rule.parentConditions) {
+      const parentResult = evalFeature(parentCondition.id, ctx);
+      // ... 检查条件 ...
+      if (!evaled) {
+        if (parentCondition.gate) return getFeatureResult(...);
+        continue rules;  // Holdout 规则走这里
+      }
+    }
+  }
+
+  // 2. Filters 检查（evalFeature 层面的 rule.filters）
+  if (rule.filters && isFilteredOut(rule.filters, ctx)) continue;
+
+  // 3. Force 规则的条件检查（rule.condition）
+  if ("force" in rule) {
+    if (rule.condition && !conditionPasses(rule.condition, ctx)) continue;
+
+    // 4. Force 规则的 rollout 检查（isIncludedInRollout）
+    //    注意：这里也可能命中 sticky bucket（如果 force 规则有 hashAttribute）
+    if (!isIncludedInRollout(ctx, ...)) continue;
+
+    // 5. 返回 force 值
+    return getFeatureResult(ctx, id, rule.force, "force", rule.id);
+  }
+}
+```
+
+**Holdout 的完整检查顺序（含 sticky bucket）：**
+
+```
+evalFeature("my_feature")
+    │
+    └─ 规则 0: Holdout Gate Rule
+        ├─ parentConditions: [{ id: "$holdout:hld_123", condition: { value: "holdoutcontrol" } }]
+        │   └─ evalFeature("$holdout:hld_123")
+        │       └─ 评估 $holdout:hld_123 的实验规则
+        │           ├─ 🔍 查找 sticky bucket
+        │           │   ├─ ✅ 找到 → 跳过 filters/include/condition/group/prerequisites
+        │           │   │   └─ 直接复用已有的变体
+        │           │   └─ ❌ 未找到 → 执行所有检查 → 计算 hash → 分桶
+        │           └─ 返回变体值（"holdoutcontrol" / "holdouttreatment" / "genpop"）
+        │
+        ├─ 检查条件: evalCondition({ value: result }, { value: "holdoutcontrol" })
+        │   ├─ ✅ 匹配 → 执行 force → 返回 holdout 值
+        │   └─ ❌ 不匹配 → continue rules → 继续下一条规则
+        │
+        ├─ rule.filters 检查（Holdout 规则通常没有）
+        ├─ rule.condition 检查（Holdout 规则通常没有）
+        └─ isIncludedInRollout 检查（Holdout 规则通常没有）
+```
+
+**关键点：**
+- **Sticky bucket 作用于 `$holdout:xxx` 虚拟 feature**，不是作用于业务 feature
+- 一旦用户在 Holdout 中有了 sticky bucket，其 `holdoutcontrol` / `holdouttreatment` 状态会被**永久锁定**（除非版本阻塞）
+- Sticky bucket 跳过的是 Holdout 实验本身的前置检查，**不跳过** Holdout 规则的 parentCondition 评估
 
 ## 三、跨实验互斥（Mutual Exclusion）
 
@@ -614,24 +837,80 @@ function buildHoldoutsMapForProjects(
 }
 ```
 
-### 5.3 环境门禁（Environment Gating）
+### 5.3 Holdout 进入 Payload 的完整过滤条件
 
-**文件：** `packages/back-end/src/models/HoldoutModel.ts`
+**文件：** `packages/back-end/src/models/HoldoutModel.ts:169-217`
+
+`getAllPayloadHoldouts` 是 Holdout 进入 payload 的第一道也是最关键的一道门，包含 **5 个过滤条件**，**全部满足**才会进入后续流程：
 
 ```typescript
 public async getAllPayloadHoldouts(environment?: string): Promise<Map<...>> {
   const holdouts = await this._find({});
-  const filteredHoldouts = holdoutsWithExperiments.filter((h) => {
-    if (environment && !h.holdout.environmentSettings[environment]?.enabled) {
-      return false;
-    }
-    return true;
-  });
+  const holdoutsWithExperiments = await Promise.all(
+    holdouts.map(async (h) => {
+      const holdoutExperiment = await getExperimentById(
+        this.context,
+        h.experimentId,
+      );
+      return { holdout: h, holdoutExperiment };
+    }),
+  );
+
+  const filteredHoldouts = holdoutsWithExperiments.filter(
+    (h): h is { holdout: HoldoutInterface; holdoutExperiment: ExperimentInterface } => {
+      // 条件 1：关联的实验必须存在
+      if (!h.holdoutExperiment) return false;
+
+      // 条件 2：关联的实验未被归档
+      if (h.holdoutExperiment.archived) return false;
+
+      // 条件 3：关联的实验状态必须是 running
+      if (h.holdoutExperiment.status !== "running") return false;
+
+      // 条件 4：必须有至少一个关联的实验或 feature
+      // （既没有 linkedExperiments 也没有 linkedFeatures 的 holdout 不会进入 payload）
+      if (
+        Object.keys(h.holdout.linkedExperiments).length === 0 &&
+        Object.keys(h.holdout.linkedFeatures).length === 0
+      )
+        return false;
+
+      // 条件 5：在指定环境中必须启用
+      if (
+        environment &&
+        !h.holdout.environmentSettings[environment]?.enabled
+      ) {
+        return false;
+      }
+
+      return true;
+    },
+  );
   return new Map(filteredHoldouts.map((h) => [h.holdout.id, h]));
 }
 ```
 
-环境门禁在两个位置检查：
+**Holdout 进入 payload 的完整条件链（AND 关系）：**
+
+```
+getAllPayloadHoldouts()
+    │
+    ├─ 1. holdoutExperiment 存在 ✅
+    ├─ 2. holdoutExperiment.archived = false ✅
+    ├─ 3. holdoutExperiment.status = "running" ✅
+    ├─ 4. linkedExperiments.length > 0 OR linkedFeatures.length > 0 ✅
+    ├─ 5. environmentSettings[env].enabled = true ✅
+    │
+    ├─ buildHoldoutsMapForProjects()  → 项目过滤
+    │   └─ holdout.projects 与 connection.projects 匹配 ✅
+    │
+    ├─ generateHoldoutsPayload()      → 生成虚拟 $holdout:xxx feature
+    │
+    └─ pruneUnreferencedHoldouts()    → 裁剪未被引用的
+        └─ 被至少一个 feature 规则的第一条 parentCondition 引用 ✅
+```
+
+**环境门禁的双重检查：**
 1. `getAllPayloadHoldouts(environment)` — 虚拟 feature 生成前过滤
 2. `getFeatureDefinition()` 中 `holdout.environmentSettings[environment]?.enabled` — 规则生成时再次检查
 
