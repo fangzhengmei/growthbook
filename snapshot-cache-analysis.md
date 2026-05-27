@@ -175,7 +175,7 @@ earliestDate.setMinutes(earliestDate.getMinutes() - ttl);
 
 ## 4. 查询运行器类型决策
 
-### 4.1 决策函数
+### 4.1 决策函数与完整分支
 
 **`getSnapshotQueryRunnerKind()`** (`experiments.ts:1189-1226`):
 
@@ -201,7 +201,26 @@ if (
 return "results";
 ```
 
-### 4.2 前置条件检查
+### 4.2 Exploratory 场景的完整分支
+
+exploratory 快照根据 **维度** 和 **单位表状态** 可能落到三种运行器：
+
+| snapshotType | hasSnapshotDimensions | hasMaterializedUnitsTable | runnerKind | 说明 |
+|--------------|----------------------|---------------------------|------------|------|
+| `exploratory` | `false`（无维度） | `true`（有单位表） | `incremental` | 复用增量运行器（只读模式） |
+| `exploratory` | `false`（无维度） | `false`（无单位表） | `results` | 回退到传统运行器 |
+| `exploratory` | `true`（有维度） | 任意 | `incremental-exploratory` | 专用探索性增量运行器 |
+| `exploratory` | 任意 | 任意 | `results` | 增量不兼容时的回退 |
+
+### 4.3 三种运行器的关键差异
+
+| runnerKind | 接收 fullRefresh | useCache | 增量刷新模式 | 适用快照类型 |
+|------------|------------------|----------|-------------|-------------|
+| `results` | 否 | 跟随传入值 | 不支持 | `standard` / `exploratory` |
+| `incremental` | 是（但需与 `type="standard"` 相与） | `false`（硬编码） | 支持全量/增量 | `standard` / `exploratory`（无维度） |
+| `incremental-exploratory` | 否 | `false`（硬编码） | 只读增量（总是读取最新） | `exploratory`（有维度） |
+
+### 4.4 前置条件检查
 
 **`planSnapshotQueryRunner()`** (`experiments.ts:1228-1287`):
 
@@ -223,6 +242,10 @@ try {
   isExperimentCompatibleWithIncrementalRefresh = false;
 }
 ```
+
+**关键参数来源**：
+- `hasSnapshotDimensions = snapshotSettings.dimensions.length > 0`
+- `hasMaterializedUnitsTable = !!incrementalRefreshModel?.unitsTableFullName`
 
 ---
 
@@ -298,7 +321,7 @@ const incrementalRefreshModel = params.fullRefresh
 
 ### 6.1 两条路径概览
 
-仪表盘探索性快照有两条完全独立的生成路径，它们的 `useCache` 配置**相反**：
+仪表盘探索性快照有两条完全独立的生成路径，它们的 `useCache` 配置**相反**。每条路径创建的 exploratory 快照可能落到三种运行器（`results` / `incremental` / `incremental-exploratory`），具体取决于维度和单位表状态（见第 4.2 节）。
 
 | 维度 | 路径 A：手动刷新 | 路径 B：自动更新 |
 |------|------------------|-----------------|
@@ -308,6 +331,9 @@ const incrementalRefreshModel = params.fullRefresh
 | 触发时机 | 用户主动操作 | 标准快照（`type="standard"`）完成后，且 `triggeredBy !== "manual-dashboard"` |
 | triggeredBy | `manual-dashboard` | `update-dashboards` |
 | 快照类型 | `exploratory` | `exploratory` |
+| useCache | `false`（硬编码） | `true`（硬编码） |
+| 可能的 runnerKind | `results` / `incremental` / `incremental-exploratory` | `results` / `incremental` / `incremental-exploratory` |
+| 数据新鲜度 | 最新（强制重跑） | 60 分钟内可接受 |
 
 ### 6.2 路径 A：手动刷新（`refreshDashboardData()`）
 
@@ -513,37 +539,38 @@ if (analysisType === "main-update" && incrementalRefreshModel) {
 
 ## 8. 触发入口、运行器与数据新鲜度关联表
 
-### 8.1 完整决策矩阵
+### 8.1 完整决策矩阵（含 Exploratory 场景）
 
-| triggeredBy | 调用函数 | useCache | runnerKind | fullRefresh | 数据新鲜度 | 说明 |
-|-------------|----------|----------|------------|-------------|-----------|------|
-| `manual` | `createExperimentSnapshot()` | `true` | `results` 或 `incremental` | 取决于状态 | 60 分钟内可缓存 | 用户主动刷新实验结果 |
-| `schedule` | `createSnapshot()` | `true` | `results` 或 `incremental` | 取决于状态 | 60 分钟内可缓存 | 定时自动刷新 |
-| `manual-dashboard` | `createExperimentSnapshot()` | `false` | `results` 或 `incremental` | 取决于状态 | **最新**（强制重跑） | 用户手动刷新仪表盘 |
-| `update-dashboards` | `createSnapshot()` | `true` | `results` 或 `incremental` | 取决于状态 | 60 分钟内可缓存 | 标准快照后自动更新仪表盘 |
+| triggeredBy | 调用函数 | snapshotType | useCache | runnerKind | fullRefresh | 数据新鲜度 | 说明 |
+|-------------|----------|-------------|----------|------------|-------------|-----------|------|
+| `manual` | `createExperimentSnapshot()` | `standard` | `true` | `results` 或 `incremental` | 取决于状态 | 60 分钟内可缓存 | 用户主动刷新实验结果 |
+| `schedule` | `createSnapshot()` | `standard` | `true` | `results` 或 `incremental` | 取决于状态 | 60 分钟内可缓存 | 定时自动刷新 |
+| `manual-dashboard`（标准） | `planExperimentSnapshot()` | `standard` | `false` | `results` 或 `incremental` | 取决于状态 | **最新**（强制重跑） | 仪表盘手动刷新-主快照 |
+| `manual-dashboard`（探索） | `createExperimentSnapshot()` | `exploratory` | `false` | `results` / `incremental` / `incremental-exploratory` | 取决于运行器 | **最新**（强制重跑） | 仪表盘手动刷新-维度快照 |
+| `update-dashboards` | `createSnapshot()` | `exploratory` | `true` | `results` / `incremental` / `incremental-exploratory` | 取决于运行器 | 60 分钟内可缓存 | 标准快照后自动更新仪表盘 |
 
-### 8.2 运行器与缓存的关系
+### 8.2 运行器与缓存的完整关系
 
-| runnerKind | useCache（运行器内） | 查询级缓存 | 增量刷新 | 数据新鲜度 |
-|------------|---------------------|-----------|---------|-----------|
-| `results` | 传入值（可 `true` 可 `false`） | 取决于传入值 | 不支持 | 取决于 useCache |
-| `incremental` | **`false`（硬编码）** | 不使用查询缓存 | 支持（`fullRefresh` 控制首次/后续） | 增量模式保证最新 |
-| `incremental-exploratory` | **`false`（硬编码）** | 不使用查询缓存 | 支持（只读模式） | 增量模式保证最新 |
+| runnerKind | 接收 fullRefresh | useCache（运行器内） | 查询级缓存 | 增量刷新模式 | 适用 snapshotType |
+|------------|------------------|---------------------|-----------|-------------|------------------|
+| `results` | 否 | 传入值（可 `true` 可 `false`） | 取决于传入值 | 不支持 | `standard` / `exploratory` |
+| `incremental` | 是（但需与 `type="standard"` 相与） | **`false`（硬编码）** | 不使用 | 支持全量/增量 | `standard` / `exploratory`（无维度） |
+| `incremental-exploratory` | 否 | **`false`（硬编码）** | 不使用 | 只读增量（总是读取最新） | `exploratory`（有维度） |
 
 ### 8.3 数据新鲜度层级
 
-| 新鲜度层级 | 触发方式 | 说明 |
-|-----------|---------|------|
-| **最新（强制重跑）** | `manual-dashboard` | 每次都跑所有新查询，数据绝对最新 |
-| **增量最新** | `manual` + `incremental` 运行器 | 从上次增量位置更新，数据接近实时 |
-| **60 分钟内** | `manual`/`schedule`/`update-dashboards` + `results` 运行器 | 60 分钟内的查询可被复用 |
-| **增量缓存** | `schedule` + `incremental` 运行器 | 增量模式下不使用查询缓存，但增量更新保证数据较新 |
+| 新鲜度层级 | 触发方式 + 运行器组合 | 说明 |
+|-----------|---------------------|------|
+| **最新（强制重跑）** | `manual-dashboard` + 任意运行器 | `useCache=false`，每次都跑所有新查询 |
+| **增量最新** | 任意触发 + `incremental` 运行器 | 从上次增量位置更新，数据接近实时 |
+| **增量最新** | 任意触发 + `incremental-exploratory` 运行器 | 只读增量模式，总是从最新的单位表读取 |
+| **60 分钟内** | `manual`/`schedule`/`update-dashboards` + `results` 运行器 | `useCache=true`，60 分钟内的查询可被复用 |
 
 ---
 
 ## 9. 缓存 vs 重跑完整决策流
 
-### 9.1 顶层决策流程图
+### 9.1 顶层决策流程图（含 Exploratory 分支）
 
 ```
 触发快照生成
@@ -559,13 +586,19 @@ planSnapshot():
 planSnapshotQueryRunner():
     ├─→ 调用 validateIncrementalPipeline() 检查兼容性
     └─→ 调用 getSnapshotQueryRunnerKind() 选择运行器
+        └─→ exploratory 场景分叉：
+            ├─→ 无维度 + 有单位表 → incremental
+            ├─→ 无维度 + 无单位表 → results
+            ├─→ 有维度 → incremental-exploratory
+            └─→ 不兼容 → results
     ↓
 createSnapshotFromPlan():
     ├─→ 根据 runnerKind 创建运行器
     │   ├─→ incremental → useCache=false（硬编码）
     │   ├─→ incremental-exploratory → useCache=false（硬编码）
     │   └─→ results → useCache=传入值
-    └─→ 传入 startAnalysis() 的 fullRefresh 需与 snapshot.type="standard" 相与
+    ├─→ incremental 运行器：fullRefresh = plan.fullRefresh && type="standard"
+    └─→ incremental-exploratory 运行器：不接收 fullRefresh，总是只读
     ↓
 运行器执行查询：
     ├─→ useCache=true → 对每个查询尝试缓存复用（TTL=60分钟）
@@ -580,14 +613,23 @@ createSnapshotFromPlan():
 
 ### 9.2 关键决策点速查表
 
-| 决策点 | 影响因素 | 结果 |
-|--------|---------|------|
+| 决策点 | 影响因素 | 可能结果 |
+|--------|---------|---------|
 | useCache 初始值 | 调用入口（见 2.2 节） | `true` 或 `false` |
 | fullRefresh 计算 | useCache + incrementalRefreshModel + unitsTableFullName | `true` 或 `false` |
-| runnerKind 选择 | 数据源设置 + 实验兼容性 + 快照类型 + 维度 | `results` / `incremental` / `incremental-exploratory` |
+| runnerKind 选择 | 数据源设置 + 实验兼容性 + snapshotType + 维度 | `results` / `incremental` / `incremental-exploratory` |
 | 运行器 useCache | runnerKind | 增量运行器恒为 `false`，传统运行器跟随传入值 |
-| 实际 fullRefresh | plan.fullRefresh + snapshot.type="standard" | 仅 standard 快照可能全量刷新 |
+| 实际 fullRefresh | plan.fullRefresh + snapshot.type="standard" + runnerKind="incremental" | 仅 standard 快照 + incremental 运行器才可能全量刷新 |
 | 查询级缓存 | 运行器 useCache + SQL精确匹配 + TTL（60分钟） | 命中或未命中 |
+
+### 9.3 Exploratory 场景决策速查表
+
+| 维度 | 单位表 | 增量兼容 | runnerKind | useCache | fullRefresh |
+|------|--------|---------|------------|----------|-------------|
+| 无 | 有 | 是 | `incremental` | `false` | 忽略（snapshotType≠standard） |
+| 无 | 无 | 是 | `results` | 跟随传入值 | 不适用 |
+| 有 | 任意 | 是 | `incremental-exploratory` | `false` | 不接收 |
+| 任意 | 任意 | 否 | `results` | 跟随传入值 | 不适用 |
 
 ---
 
@@ -608,8 +650,11 @@ createSnapshotFromPlan():
 |------|---------|---------|
 | 仪表盘数据延迟 | 自动更新走 `useCache=true`，60 分钟内的查询被复用 | 检查 triggeredBy 是否为 `update-dashboards` |
 | 仪表盘刷新慢 | 手动刷新走 `useCache=false`，所有查询强制重跑 | 正常行为，手动刷新保证最新 |
-| 仪表盘数据与实验页面不一致 | 仪表盘有独立的探索性快照，可能使用缓存 | 对比快照的 `triggeredBy` 字段 |
+| 仪表盘数据与实验页面不一致 | 仪表盘有独立的探索性快照，可能使用缓存 | 对比快照的 `triggeredBy` 和 `runnerKind` 字段 |
 | 仪表盘只更新了部分 blocks | 主快照复用跳过部分 blocks | 检查 `snapshotSatisfiesBlock()` 逻辑 |
+| 维度快照使用了增量模式 | 无维度探索性快照 + 有单位表 → `incremental` 运行器 | 检查 `hasSnapshotDimensions` 和 `unitsTableFullName` |
+| 维度快照使用了探索性增量模式 | 有维度探索性快照 → `incremental-exploratory` 运行器 | 检查 `hasSnapshotDimensions` 是否为 true |
+| 维度快照回退到传统模式 | 增量不兼容 → `results` 运行器 | 查看 `validateIncrementalPipeline()` 抛出的错误信息 |
 
 ### 10.3 增量模式问题
 
