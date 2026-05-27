@@ -194,6 +194,8 @@ CDN purge 的 surrogate key 策略分两种情况（见第 6 节详细分析）�
 
 入口：`getFeatureDefinitionsWithCache`（`controllers/features.ts:415-501`）
 
+> **重要修正**：此函数被两个端点调用，但只有 `/api/features/:key` 公共端点设置 CDN 缓存头。`/api/v1/sdk-payload/:key` 端点不设置任何缓存头。
+
 ```
 SDK 请求 → getSdkPayload / getFeaturesPublic / getEvaluatedFeaturesPublic
           ↓
@@ -299,11 +301,13 @@ SDK Connection 的 `remoteEvalEnabled` 字段控制着三个公开端点的准�
 
 ### 5.1 三个公开端点的行为差异
 
-| 端点 | 方法 | 路由 | 处理函数 | remoteEvalEnabled=true 时行为 | remoteEvalEnabled=false 时行为 |
-|------|------|------|---------|-----------------------------|-----------------------------|
-| Features API | GET | `/api/features/:key` | `getFeaturesPublic` | ❌ 抛出错误："Remote evaluation required for this connection" | ✅ 正常返回 payload，带 CDN 缓存头 |
-| Remote Eval API | POST | `/api/eval/:key` (仅自托管) | `getEvaluatedFeaturesPublic` | ✅ 实时计算并返回 evaluated features，`Cache-control: no-store` | ❌ 抛出错误："Remote evaluation disabled for this connection" |
-| SDK Payload API | GET | `/api/sdk-payload/:key` | `getSdkPayload` | ✅ **不检查**，正常返回 payload | ✅ 正常返回 payload |
+| 端点 | 方法 | 完整路由 | 处理函数 | 鉴权方式 | CDN 缓存头 | remoteEval=true 时行为 | remoteEval=false 时行为 |
+|------|------|---------|---------|---------|-----------|-----------------------|------------------------|
+| Features API | GET | `/api/features/:key` | `getFeaturesPublic` | URL path 中的 SDK key | ✅ 设置 | ❌ 抛出错误："Remote evaluation required for this connection" | ✅ 正常返回 payload |
+| Remote Eval API | POST | `/api/eval/:key` (仅自托管) | `getEvaluatedFeaturesPublic` | URL path 中的 SDK key | ❌ `no-store` | ✅ 实时计算 evaluated features | ❌ 抛出错误："Remote evaluation disabled for this connection" |
+| SDK Payload API | GET | `/api/v1/sdk-payload/:key` | `getSdkPayload` | Authorization header Secret API Key | ❌ 不设置 | ✅ **不检查**，正常返回 payload | ✅ 正常返回 payload |
+
+> **重要修正**：`/api/v1/sdk-payload/:key` 端点**不设置** Cache-Control 或 Surrogate-Key 响应头，也**不支持** SDK Connection key 鉴权。它需要 Secret API Key 通过 Authorization header 鉴权。
 
 ### 5.2 路径分叉逻辑详解
 
@@ -318,9 +322,15 @@ if (params.remoteEvalEnabled) {
 }
 ```
 
+- **鉴权**：通过 URL path 中的 `key` 参数（SDK Connection key），无 Authorization header 要求
+- **路由位置**：`app.ts:297-304` 直接注册，**不经过** `authenticateApiRequestMiddleware`
+- **缓存头**：完整设置
+  ```
+  Cache-control: public, max-age=30, stale-while-revalidate=3600, stale-if-error=36000
+  Surrogate-Key: {orgId} {connection.key} {orgId}_{envId}
+  ```
 - 当 Connection 开启 `remoteEvalEnabled` 时，拒绝通过此端点获取原始 payload
 - 响应头设置 `x-unrecoverable: 1`，CDN 可据此对 400 错误应用缓存规则
-- 正常响应时设置 Surrogate-Key：`[orgId, key, envId]`
 
 #### 路径 B：`POST /api/eval/:key` → `getEvaluatedFeaturesPublic`
 
@@ -333,16 +343,19 @@ if (!params.remoteEvalEnabled) {
 }
 ```
 
-- **仅自托管版本可用**（`app.ts:315-335`：`if (!IS_CLOUD)`）
+- **鉴权**：通过 URL path 中的 `key` 参数（SDK Connection key）
+- **路由位置**：`app.ts:318-325` 直接注册，**不经过** `authenticateApiRequestMiddleware`
+- **仅自托管版本可用**（`app.ts:315`：`if (!IS_CLOUD)`）
 - 云端环境必须使用独立的远程评估基础设施
 - 此端点完全绕过 CDN 缓存：`Cache-control: no-store`
 - 虽然内部仍调用 `getFeatureDefinitionsWithCache` 复用 MongoDB 缓存，但最终结果是实时计算的 evaluated features
 
-#### 路径 C：`GET /api/sdk-payload/:key` → `getSdkPayload`
+#### 路径 C：`GET /api/v1/sdk-payload/:key` → `getSdkPayload`
 
 ```ts
 // api/sdk-payload/getSdkPayload.ts:28-46
 // 无 remoteEvalEnabled 检查
+// 无 Cache-Control / Surrogate-Key 设置
 const params = await getPayloadParamsFromApiKey(key, req);
 const defs = await getFeatureDefinitionsWithCache({
   context: req.context,
@@ -350,17 +363,36 @@ const defs = await getFeatureDefinitionsWithCache({
 });
 ```
 
+- **鉴权**：需要 `Authorization: Bearer <Secret API Key>` header，**不能用 SDK Connection key**
+- **路由位置**：通过 `api.router.ts` 注册，**经过** `authenticateApiRequestMiddleware`
+  - 中间件要求 Secret API Key，若传入 SDK Endpoint key（`secret=false`）会抛出错误："Must use a Secret API Key for this request, SDK Endpoint key given instead."
+- **完整路径**：`/api/v1/sdk-payload/:key`（apiRouter 挂载在 `/api`，路由自动加 `/v1` 前缀）
+- **不设置**任何 CDN 缓存头
 - **不检查** `remoteEvalEnabled` 标志，始终返回原始 payload
 - 此端点走 API Router，通过 `createApiRequestHandler` 封装
-- 由 SDK 客户端内部使用，用于拉取 bucketing 配置
 
-### 5.3 设计意图
+### 5.3 两条 SDK 读路径的鉴权边界对比
+
+| 维度 | `/api/features/:key` (公共) | `/api/v1/sdk-payload/:key` (API) |
+|------|----------------------------|---------------------------------|
+| 路由注册位置 | `app.ts` 直接注册 | `api.router.ts` → `allRoutes` |
+| 鉴权中间件 | 无 | `authenticateApiRequestMiddleware` |
+| 鉴权方式 | URL path 中的 key（SDK Connection key） | Authorization header（Secret API Key） |
+| 支持 SDK key | ✅ 是 | ❌ 否（会报错："SDK Endpoint key given instead"） |
+| 支持 Secret key | ❌ 否 | ✅ 是 |
+| CDN 缓存头 | ✅ 完整设置 | ❌ 无 |
+| remoteEval 检查 | ✅ 检查 | ❌ 不检查 |
+
+> **关键边界**：`authenticateApiRequestMiddleware` 在 `api.router.ts:88` 全局生效，所有 `/api/v1/*` 路由都必须经过。它会检查 API key 的 `secret` 字段，SDK Endpoint key（`secret=false`）会被拒绝。
+
+### 5.4 设计意图
 
 这三条路径的分叉实现了权限控制：
 
-1. **客户端 SDK** → 通过 `/api/sdk-payload/:key` 拉取配置进行本地 bucketing
+1. **客户端 SDK** → 通过 `/api/features/:key`（公共 SDK 端点）拉取配置进行本地 bucketing
 2. **浏览器端** → 当需要远程评估时，服务端通过 `/api/eval/:key` 计算后返回结果
 3. **安全隔离** → 开启 `remoteEvalEnabled` 时，禁止通过公开的 `/api/features/:key` 端点暴露原始实验配置
+4. **服务端集成** → `/api/v1/sdk-payload/:key` 用于需要 Secret API Key 鉴权的服务端场景
 
 ---
 
@@ -559,44 +591,45 @@ legacy:{apiKey}:staging:p1
                                             └───────────────┘
 
 
-          ┌─────────────────────────────────────────────────────┐
-          │               SDK 读取路径                             │
-          │                                                      │
-          │  ┌─────────────────┐    ┌─────────────────────┐     │
-          │  │ GET /features   │    │ POST /eval (自托管) │     │
-          │  │ getFeaturesPublic │  │ getEvaluatedFeaturesPublic │
-          │  └────────┬────────┘    └──────────┬──────────┘     │
-          │           │                        │                 │
-          │     remoteEval=true?          remoteEval=false?      │
-          │         ↓ 是 ↓否                    ↓ 是 ↓否          │
-          │      错误   正常返回               正常计算  错误      │
-          │       │        │                     │               │
-          │       │        └──────────┬──────────┘               │
-          │       │                   │                          │
-          │       │        GET /sdk-payload (不检查)              │
-          │       │        getSdkPayload                           │
-          │       │                   │                          │
-          │       └───────────────────┼──────────────────────────┘
-          │                           │
+          ┌─────────────────────────────────────────────────────────┐
+          │                   SDK 读取路径                             │
+          │                                                          │
+          │  ┌──────────────────────┐    ┌─────────────────────────┐ │
+          │  │ GET /api/features    │    │ POST /api/eval (自托管)  │ │
+          │  │ getFeaturesPublic    │    │ getEvaluatedFeaturesPublic │ │
+          │  └─────────┬────────────┘    └────────────┬────────────┘ │
+          │            │                              │              │
+          │      remoteEval=true?                remoteEval=false?    │
+          │         ↓ 是 ↓否                          ↓ 是 ↓否        │
+          │      错误   正常返回                     正常计算  错误     │
+          │       │        │                           │             │
+          │       │        └───────────────┬───────────┘             │
+          │       │                        │                         │
+          │       │     GET /api/v1/sdk-payload (Secret Key 鉴权)    │
+          │       │     getSdkPayload - 无缓存头, 不检查 remoteEval    │
+          │       │                        │                         │
+          │       └────────────────────────┼─────────────────────────┘
+          │                                │
           │           getFeatureDefinitionsWithCache()
-          │                           │
-          │                ┌──────────┴──────────┐
-          │                │ MongoDB Cache       │
-          │                └──────────┬──────────┘
-          │                           │
-          │                ┌──────────┴──────────┐
-          │                │ 命中    │    未命中  │
-          │                └───┬─────┘     ┌────┴───┐
-          │                    │           │        │
+          │                                │
+          │                ┌───────────────┴───────────────┐
+          │                │ MongoDB Cache (两层: Mongo + CDN) │
+          │                └───────────────┬───────────────┘
+          │                                │
+          │                ┌───────────────┴───────────────┐
+          │                │ 命中      │      未命中        │
+          │                └───┬─────────┘     ┌─────┴─────┐
+          │                    │               │          │
           │                返回缓存   getFeatureDefs()
-          │                                │        │
-          │                            返回给 SDK   │
-          │                                ↓        │
+          │                                │          │
+          │                            返回给 SDK     │
+          │                                ↓          │
           │                          upsert (异步写回)
-          │                                                      │
-          │  Cache-Control: max-age=30 (features/sdk-payload)   │
-          │  Cache-Control: no-store (eval)                      │
-          └─────────────────────────────────────────────────────┘
+          │                                                          │
+          │  Cache-Control: max-age=30 (仅 /api/features 设置)       │
+          │  Cache-Control: no-store (/api/eval)                     │
+          │  无缓存头 (/api/v1/sdk-payload)                           │
+          └─────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -626,9 +659,18 @@ MongoDB 缓存层没有 TTL 索引，完全依赖事件驱动的 upsert 覆盖�
 
 批量刷新时，所有 Connection 共享同一份 `rawData`（features、experimentMap 等），`buildSDKPayloadForConnection` 内部通过 `cloneDeep` 保证不修改共享数据。测试（`sdk-payload-lifecycle.test.ts:311-363`）专门验证了这一点。
 
-### 9.6 CDN Purge 的双模式设计
+### 9.7 CDN Purge 的双模式设计
 
 `payloadKeys` 空/非空触发不同的 purge 策略，在效率和精确性之间取得平衡：
 
 - Feature 等数据变更 → 按环境批量 purge（高效）
 - Connection/Environment 元数据变更 → 按 key 逐个 purge（精确）
+
+### 9.8 双端点设计：公共 SDK 端点 vs 内部 API 端点
+
+系统存在两个返回 SDK payload 的端点，设计意图不同：
+
+- **`/api/features/:key`**：面向客户端 SDK，公共端点，URL path 传 SDK key，带 CDN 缓存，检查 `remoteEvalEnabled`
+- **`/api/v1/sdk-payload/:key`**：面向服务端集成，需 Secret API Key 鉴权，无 CDN 缓存，不检查 `remoteEvalEnabled`
+
+> 关键边界：`authenticateApiRequestMiddleware` 是 `/api/v1/*` 路由的强制准入关卡，SDK Endpoint key 无法通过。
