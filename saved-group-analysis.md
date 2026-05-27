@@ -66,37 +66,92 @@ export type GroupMap = Map<
 
 ## 二、完整 CRUD 链路
 
-### 2.1 API 接口层
+### 2.1 两套 API 路由系统
+
+GrowthBook 中存在**两套并行**的 Saved Group API 路由系统：
+
+#### 2.1.1 新版 OpenAPI 路由
+
+**挂载空间**: `/api/v1/saved-groups/...` 或 `/api/v2/saved-groups/...`
 
 **文件**: `packages/back-end/src/api/saved-groups/saved-groups.router.ts`
 
-提供的 REST API 端点：
+**挂载方式**:
+```
+app.ts:375  → app.use(apiRouter)  // 挂载 /api
+api.router.ts:158  → allRoutes.push(...savedGroupsRoutes)
+api.router.ts:203  → const versionedPath = `/v1${route.path}`  // 添加版本前缀
+```
 
-| 方法 | 端点 | 描述 |
-|------|------|------|
-| GET | `/saved-groups` | 列出所有分组 |
-| POST | `/saved-groups` | 创建分组 |
-| GET | `/saved-groups/:id` | 获取单个分组 |
-| POST | `/saved-groups/:id` | 更新分组 (⚠️ 注意: 是 POST 不是 PUT) |
-| POST | `/saved-groups/:id/archive` | 归档分组 |
-| POST | `/saved-groups/:id/unarchive` | 取消归档 |
-| DELETE | `/saved-groups/:id` | 删除分组 |
+**端点列表**:
+
+| 方法 | 完整路径 | 描述 |
+|------|---------|------|
+| GET | `/api/v1/saved-groups` | 列出所有分组 |
+| POST | `/api/v1/saved-groups` | 创建分组 |
+| GET | `/api/v1/saved-groups/:id` | 获取单个分组 |
+| POST | `/api/v1/saved-groups/:id` | 部分更新 (无审批流) |
+| POST | `/api/v1/saved-groups/:id/archive` | 归档分组 |
+| POST | `/api/v1/saved-groups/:id/unarchive` | 取消归档 |
+| DELETE | `/api/v1/saved-groups/:id` | 删除分组 |
 
 **验证器定义** (`packages/shared/src/validators/saved-group.ts:212-230`):
 ```typescript
 export const updateSavedGroupValidator = {
-  method: "post" as const,  // 真实请求方法是 POST
+  method: "post" as const,
   path: "/saved-groups/:id",
   bodySchema: updateSavedGroupBody,  // 部分字段更新: name, condition, values, owner, projects
   // ...
 };
 ```
 
-同时在 `packages/back-end/src/routers/saved-group/saved-group.controller.ts` 中还有旧版 API：
-- POST `/saved-groups/:id/add-items` - 批量添加列表项
-- POST `/saved-groups/:id/remove-items` - 批量移除列表项
-- GET `/saved-groups/:id/references` - 获取分组被引用的资源
-- PUT `/saved-groups/:id` - 旧版完整更新接口（支持 revision 审批流）
+#### 2.1.2 旧版 Express 路由
+
+**挂载空间**: `/saved-groups/...` (无版本前缀)
+
+**文件**: `packages/back-end/src/routers/saved-group/saved-group.router.ts`
+
+**挂载方式**:
+```
+app.ts:576  → app.use("/saved-groups", savedGroupRouter)
+```
+
+**端点列表**:
+
+| 方法 | 完整路径 | 描述 |
+|------|---------|------|
+| POST | `/saved-groups` | 创建分组 (带审批流) |
+| GET | `/saved-groups/:id` | 获取单个分组 |
+| GET | `/saved-groups/:id/references` | 获取被引用资源 |
+| POST | `/saved-groups/:id/add-items` | 批量添加列表项 (带审批流) |
+| POST | `/saved-groups/:id/remove-items` | 批量移除列表项 (带审批流) |
+| PUT | `/saved-groups/:id` | 完整更新 (带审批流) |
+| DELETE | `/saved-groups/:id` | 删除分组 |
+
+**路由定义** (`saved-group.router.ts:11-102`):
+```typescript
+const router = express.Router();
+
+router.get("/:id/references", savedGroupController.getSavedGroupReferences);
+router.get("/:id", savedGroupController.getSavedGroup);
+router.post("/", savedGroupController.postSavedGroup);
+router.post("/:id/add-items", savedGroupController.postSavedGroupAddItems);
+router.post("/:id/remove-items", savedGroupController.postSavedGroupRemoveItems);
+router.put("/:id", savedGroupController.putSavedGroup);
+router.delete("/:id", savedGroupController.deleteSavedGroup);
+```
+
+#### 2.1.3 两套系统的关键差异
+
+| 维度 | 新版 API | 旧版路由 |
+|------|---------|---------|
+| 基础路径 | `/api/v1/saved-groups` | `/saved-groups` |
+| 更新方法 | **POST** (部分更新) | **PUT** (完整更新) |
+| 审批流 | 无 (即时生效) | 有 (revision 机制) |
+| 列表端点 | 有 | 无 |
+| 归档端点 | 有 (archive/unarchive) | 无 (通过 PUT 修改 archived 字段) |
+| 列表项增删 | 无 | 有 (add-items/remove-items) |
+| 引用查询 | 无 | 有 (references) |
 
 ### 2.2 读取链路详解
 
@@ -128,14 +183,17 @@ export const listSavedGroups = createApiRequestHandler(listSavedGroupsValidator)
 
 **调用链**:
 ```
-GET /saved-groups
+GET /api/v1/saved-groups
   → models.savedGroups.getAll()
-     → BaseModel._find({})  // 空查询条件
-        · applyBaseQuery()  // 注入 organization 过滤
+     → BaseModel.getByIds()? No → BaseModel._find({})
+        · applyBaseQuery({})  // 注入 organization = this.context.org.id
+          → { ...baseQuery, organization: orgId }
         · MongoDB find({ organization: orgId })
         · 内存迁移: migrate()  // 处理旧版数据格式
         · 权限过滤: filterByReadPermissions()  // 按项目权限过滤
-        · 字段清理: sanitize()
+          → 调用 SavedGroupModel.canRead(doc)
+          → canReadMultiProjectResource(doc.projects)
+        · 字段清理: sanitize()  // 默认返回原文档
   → 内存排序: 按 id 字典序排序
   → applyPagination()  // 处理 limit/offset
   → 转换: toApiInterface()  // 数据库字段 → API 字段
@@ -167,14 +225,15 @@ export const getSavedGroup = createApiRequestHandler(getSavedGroupValidator)(
 
 **调用链**:
 ```
-GET /saved-groups/:id
+GET /api/v1/saved-groups/:id
   → models.savedGroups.getById(id)
      → BaseModel._findOne({ id })
-        · applyBaseQuery()  // 注入 organization 过滤
+        · applyBaseQuery({ id })  // 强制注入 organization
+          → { id, organization: orgId }
         · MongoDB findOne({ id, organization: orgId })
         · 内存迁移: migrate()
         · populateForeignRefs()  // 填充外键引用
-        · 权限检查: canRead()  // 检查项目读取权限
+        · 权限检查: canRead()  // 不通过返回 null (404 效果)
         · 字段清理: sanitize()
   → 转换: toApiInterface()
   → resolveOwnerEmail()
@@ -183,15 +242,37 @@ GET /saved-groups/:id
 
 #### 2.2.3 模型层读取实现
 
-**文件**: `packages/back-end/src/models/BaseModel.ts:656-750`
+**文件**: `packages/back-end/src/models/BaseModel.ts:679-750`
 
-**_find() 方法核心流程**:
+**`applyBaseQuery()` 核心实现** (`BaseModel.ts:1241-1253`):
+```typescript
+private applyBaseQuery(
+  filter: object,
+  dangerousCrossOrganization: boolean = false,
+): FilterQuery<z.infer<T>> {
+  const fullQuery: FilterQuery<z.infer<T>> = {
+    ...this.getBaseQuery(),  // 从 config.baseQuery 合并
+    ...filter,              // 合并传入的查询条件
+  };
+  // 强制注入 organization 过滤 (除非显式允许跨组织查询)
+  if (!dangerousCrossOrganization) {
+    fullQuery.organization = this.context.org.id;
+  }
+  return fullQuery;
+}
+```
+
+**关键发现**: `applyBaseQuery` 会**强制覆盖** `organization` 字段，确保所有查询都限制在当前组织内。即使传入的 filter 包含 `organization` 字段，也会被 `this.context.org.id` 覆盖。
+
+**`_find()` 方法核心流程**:
 ```typescript
 protected async _find(query = {}, options = {}) {
   const fullQuery = this.applyBaseQuery(query);  // 注入 organization
   
-  // 1. 执行查询
-  const rawDocs = await this._dangerousGetCollection().find(fullQuery).toArray();
+  // 1. 执行查询 (支持配置文件模式)
+  const rawDocs = this.useConfigFile()
+    ? this.getConfigDocuments().filter(doc => evalCondition(doc, fullQuery))
+    : await this._dangerousGetCollection().find(fullQuery).toArray();
   
   // 2. 数据迁移 (处理 legacy 格式)
   const migrated = rawDocs.map(d => this.migrate(this._removeMongooseFields(d)));
@@ -201,19 +282,22 @@ protected async _find(query = {}, options = {}) {
     ? migrated 
     : await this.filterByReadPermissions(migrated);
   
-  // 4. 分页
-  const paged = filtered.slice(skip || 0, limit ? (skip || 0) + limit : undefined);
+  // 4. 分页 + 排序
+  const sorted = sort ? applySort(filtered, sort) : filtered;
+  const paged = sorted.slice(skip || 0, limit ? (skip || 0) + limit : undefined);
   
   // 5. 字段清理
   return paged.map(doc => this.sanitize(doc));
 }
 ```
 
-**_findOne() 方法核心流程**:
+**`_findOne()` 方法核心流程**:
 ```typescript
 protected async _findOne(query, options = {}) {
-  const fullQuery = this.applyBaseQuery(query);
-  const doc = await this._dangerousGetCollection().findOne(fullQuery);
+  const fullQuery = this.applyBaseQuery(query);  // { id, organization: orgId }
+  const doc = this.useConfigFile()
+    ? this.getConfigDocuments().find(doc => evalCondition(doc, fullQuery))
+    : await this._dangerousGetCollection().findOne(fullQuery);
   if (!doc) return null;
   
   const migrated = this.migrate(this._removeMongooseFields(doc));
@@ -223,6 +307,18 @@ protected async _findOne(query, options = {}) {
   if (!this.canRead(migrated)) return null;
   
   return this.sanitize(migrated);
+}
+```
+
+**`getAll()` 和 `getById()` 真实签名**:
+```typescript
+// 不需要传 organization 参数，applyBaseQuery 会自动注入
+public async getAll(options = {}): Promise<SavedGroupInterface[]> {
+  return this._find({}, options);
+}
+
+public async getById(id: string): Promise<SavedGroupInterface | null> {
+  return this._findOne({ id });
 }
 ```
 
@@ -994,17 +1090,25 @@ runExperiment(experiment, ctx)
 
 ### 7.1 CRUD 接口层
 
-| 功能模块 | 文件路径 | 关键函数 |
-|---------|---------|---------|
-| 路由注册 | `packages/back-end/src/api/saved-groups/saved-groups.router.ts` | `savedGroupsRoutes` |
-| 创建分组 | `packages/back-end/src/api/saved-groups/postSavedGroup.ts` | `postSavedGroup` |
+| 功能模块 | 文件路径 | 关键函数/端点 |
+|---------|---------|-------------|
+| 新版路由注册 | `packages/back-end/src/api/saved-groups/saved-groups.router.ts` | `savedGroupsRoutes` |
+| 旧版路由注册 | `packages/back-end/src/routers/saved-group/saved-group.router.ts` | `savedGroupRouter` |
+| 路由挂载 (新版) | `packages/back-end/src/app.ts:375` + `api.router.ts:158` | `/api/v1/saved-groups` |
+| 路由挂载 (旧版) | `packages/back-end/src/app.ts:576` | `/saved-groups` |
+| 新版创建 | `packages/back-end/src/api/saved-groups/postSavedGroup.ts` | `postSavedGroup` |
+| 旧版创建 | `packages/back-end/src/routers/saved-group/saved-group.controller.ts:55-152` | `postSavedGroup` |
 | 列表查询 | `packages/back-end/src/api/saved-groups/listSavedGroups.ts` | `listSavedGroups` |
-| 单条查询 | `packages/back-end/src/api/saved-groups/getSavedGroup.ts` | `getSavedGroup` |
-| 更新分组 (新版, POST) | `packages/back-end/src/api/saved-groups/updateSavedGroup.ts` | `updateSavedGroup` |
+| 单条查询 (新版) | `packages/back-end/src/api/saved-groups/getSavedGroup.ts` | `getSavedGroup` |
+| 单条查询 (旧版) | `packages/back-end/src/routers/saved-group/saved-group.controller.ts:171-192` | `getSavedGroup` |
+| 新版更新 (POST) | `packages/back-end/src/api/saved-groups/updateSavedGroup.ts` | `updateSavedGroup` |
+| 旧版更新 (PUT) | `packages/back-end/src/routers/saved-group/saved-group.controller.ts:513-798` | `putSavedGroup` |
 | 归档/取消归档 | `packages/back-end/src/api/saved-groups/archiveSavedGroup.ts` | `archiveSavedGroup`, `unarchiveSavedGroup` |
-| 删除分组 | `packages/back-end/src/api/saved-groups/deleteSavedGroup.ts` | `deleteSavedGroup` |
+| 新版删除 | `packages/back-end/src/api/saved-groups/deleteSavedGroup.ts` | `deleteSavedGroup` |
+| 旧版删除 | `packages/back-end/src/routers/saved-group/saved-group.controller.ts:823-870` | `deleteSavedGroup` |
 | 列表项增删 | `packages/back-end/src/routers/saved-group/saved-group.controller.ts` | `postSavedGroupAddItems`, `postSavedGroupRemoveItems` |
-| 引用检查 | `packages/back-end/src/services/savedGroups.ts` | `loadSavedGroupReferences` |
+| 引用查询 | `packages/back-end/src/routers/saved-group/saved-group.controller.ts:896-913` | `getSavedGroupReferences` |
+| 引用检查服务 | `packages/back-end/src/services/savedGroups.ts` | `loadSavedGroupReferences` |
 | 变更通知 | `packages/back-end/src/services/savedGroups.ts` | `savedGroupUpdated` |
 | 所有者邮箱解析 | `packages/back-end/src/services/owner.ts` | `resolveOwnerEmail`, `resolveOwnerEmails` |
 
@@ -1040,10 +1144,13 @@ runExperiment(experiment, ctx)
 |---------|---------|---------|
 | 数据模型 | `packages/back-end/src/models/SavedGroupModel.ts` | `SavedGroupModel` |
 | 基础模型查询 | `packages/back-end/src/models/BaseModel.ts` | `_find`, `_findOne`, `getById`, `getAll` |
+| 组织过滤注入 | `packages/back-end/src/models/BaseModel.ts:1241-1253` | `applyBaseQuery` |
+| 基础查询配置 | `packages/back-end/src/models/BaseModel.ts:1237-1239` | `getBaseQuery` |
 | 权限类 | `packages/shared/src/permissions/permissionsClass.ts` | `Permissions` |
 | 读权限检查 | `packages/shared/src/permissions/permissionsClass.ts` | `canReadMultiProjectResource` |
 | 写权限检查 | `packages/shared/src/permissions/permissionsClass.ts` | `checkProjectFilterPermission`, `checkProjectFilterUpdatePermission` |
 | 权限矩阵定义 | `packages/shared/src/permissions/permissions.constants.ts` | `POLICY_PERMISSION_MAP`, `DEFAULT_ROLES` |
+| 配置文件模式 | `packages/back-end/src/models/BaseModel.ts` | `useConfigFile`, `getConfigDocuments` |
 
 ---
 
@@ -1051,54 +1158,67 @@ runExperiment(experiment, ctx)
 
 ### 8.1 读取链路设计
 
-1. **两级权限过滤**:
+1. **双路径查询**:
+   - 数据库模式: `MongoDB find({ organization: orgId })`
+   - 配置文件模式: `getConfigDocuments().filter(doc => evalCondition(doc, query))`
+2. **强制组织过滤**: `applyBaseQuery()` 通过 `fullQuery.organization = this.context.org.id` 强制注入，确保多租户隔离
+3. **两级权限过滤**:
    - 列表查询: 先全量查询再内存过滤权限（`filterByReadPermissions`）
    - 单条查询: 查询后权限检查，不通过返回 `null`（404 效果）
-2. **读取宽松策略**: 读权限用 `some()` 逻辑，只要在任一关联项目有权限即可读取
-3. **字段重命名**: `groupName` → `name`，`dateCreated/dateUpdated` Date → ISO string
-4. **性能优化点**: 内存分页 TODO 移到数据库层，目前先拉全量再过滤分页
-5. **投影优化**: 提供 `getAllWithoutValues()` 避免拉取大量 values 数据
+4. **读取宽松策略**: 读权限用 `some()` 逻辑，只要在任一关联项目有权限即可读取
+5. **字段重命名**: `groupName` → `name`，`dateCreated/dateUpdated` Date → ISO string
+6. **性能优化点**: 内存分页 TODO 移到数据库层，目前先拉全量再过滤分页
+7. **投影优化**: 提供 `getAllWithoutValues()` 避免拉取大量 values 数据
 
-### 8.2 CRUD 链路设计
+### 8.2 双路由系统设计
 
-6. **方法选择**: 更新接口用 **POST** 做部分更新（非 REST 标准的 PUT），符合实际语义
-7. **类型不可变**: 创建后 `type` 和 `attributeKey` 不可修改，防止数据不一致
-8. **归档前置删除**: 强制先归档再删除，提供撤销窗口，防止误删
-9. **引用完整性**: 归档前强制检查所有引用（features/experiments/嵌套savedGroups）
-10. **审批流集成**: list 组的批量增删操作走 revision 机制，支持审批流程
-11. **保守刷新策略**: values/condition/projects 变更时刷新全部 SDK payload 缓存，archived 变更不刷新（因为归档必须先解除引用）
-12. **幂等设计**: 归档/取消归档操作在已处于目标状态时直接返回
+8. **新旧并行**: 新版 `/api/v1/saved-groups` 和旧版 `/saved-groups` 同时存在
+9. **功能互补**:
+   - 新版提供: 列表查询、归档/取消归档
+   - 旧版提供: 列表项增删、引用查询
+10. **审批流差异**: 新版更新无审批流（即时生效），旧版走 revision 审批流
+11. **方法选择**: 新版用 POST 做部分更新，旧版用 PUT 做完整更新
+12. **版本化路径**: 新版通过 `/api/v1/` 前缀支持版本演进，旧版无版本前缀
 
-### 8.3 权限设计
+### 8.3 CRUD 链路设计
 
-13. **读写权限分离**:
+13. **类型不可变**: 创建后 `type` 和 `attributeKey` 不可修改，防止数据不一致
+14. **归档前置删除**: 强制先归档再删除，提供撤销窗口，防止误删
+15. **引用完整性**: 归档前强制检查所有引用（features/experiments/嵌套savedGroups）
+16. **审批流集成**: list 组的批量增删操作和旧版更新走 revision 机制
+17. **保守刷新策略**: values/condition/projects 变更时刷新全部 SDK payload 缓存，archived 变更不刷新
+18. **幂等设计**: 归档/取消归档操作在已处于目标状态时直接返回
+
+### 8.4 权限设计
+
+19. **读写权限分离**:
     - 读: `readData` + `some()` 逻辑（任一项目即可）
     - 写: `manageSavedGroups` + `every()` 逻辑（所有项目都需要）
-14. **更新双检查**: 更新时同时检查**现有**和**更新后**的项目权限
-15. **全局项目表示**: 空 `projects` 数组用 `""` 字符串表示全局权限
-16. **权限继承**: `engineer`、`experimenter`、`admin`、`projectAdmin` 角色默认包含 `SavedGroupsFullAccess` 策略
+20. **更新双检查**: 更新时同时检查**现有**和**更新后**的项目权限
+21. **全局项目表示**: 空 `projects` 数组用 `""` 字符串表示全局权限
+22. **权限继承**: `engineer`、`experimenter`、`admin`、`projectAdmin` 角色默认包含 `SavedGroupsFullAccess` 策略
 
-### 8.4 match=none 判定设计
+### 8.5 match=none 判定设计
 
-17. **结构差异**: condition 组用 `{ $not: cond }` 整体取反，list 组用 `$notInGroup` 属性级取反，符合各自的语义场景
-18. **空值处理差异**: 
+23. **结构差异**: condition 组用 `{ $not: cond }` 整体取反，list 组用 `$notInGroup` 属性级取反，符合各自的语义场景
+24. **空值处理差异**: 
     - 空 condition → 跳过该分组（不参与条件）
     - 空 list（`useEmptyListGroup=false`）→ 跳过
     - 空 list（`useEmptyListGroup=true`）→ `$notInGroup` 恒为 true
-19. **德摩根定律隐式应用**: `$not` 包裹 `$or` 条件时等价于 `$nor`，但由 SDK 端 `evalCondition` 递归处理，无需服务端转换
+25. **德摩根定律隐式应用**: `$not` 包裹 `$or` 条件时等价于 `$nor`，但由 SDK 端 `evalCondition` 递归处理，无需服务端转换
 
-### 8.5 实验侧命中设计
+### 8.6 实验侧命中设计
 
-20. **分层准入**: Saved Group 条件检查发生在哈希分配之前，作为准入门槛，避免不必要的哈希计算
-21. **统一评估逻辑**: 实验与 Feature 共享相同的 `evalCondition` 和 `evalOperatorCondition` 逻辑，确保判定一致性
-22. **双路径引用**: 既支持 `experiment.condition` 内嵌 `$inGroup`，也支持 `phase.savedGroups` 声明式引用，给用户灵活选择
-23. **前置条件依赖**: 实验的 `parentConditions` 支持依赖其他 Feature 的状态，可构建复杂的准入规则
+26. **分层准入**: Saved Group 条件检查发生在哈希分配之前，作为准入门槛，避免不必要的哈希计算
+27. **统一评估逻辑**: 实验与 Feature 共享相同的 `evalCondition` 和 `evalOperatorCondition` 逻辑，确保判定一致性
+28. **双路径引用**: 既支持 `experiment.condition` 内嵌 `$inGroup`，也支持 `phase.savedGroups` 声明式引用，给用户灵活选择
+29. **前置条件依赖**: 实验的 `parentConditions` 支持依赖其他 Feature 的状态，可构建复杂的准入规则
 
-### 8.6 通用设计原则
+### 8.7 通用设计原则
 
-24. **两级展开策略**: 服务端负责嵌套引用展开，SDK 负责最终成员检查，平衡了 payload 大小和灵活性
-25. **循环/深度防护**: 通过 `visited` Set 和 `MAX_SAVED_GROUP_DEPTH=10` 防止无限递归
-26. **错误降级**: 无效引用通过注入 always-false 条件实现优雅降级（不命中该分组）
-27. **向后兼容**: 通过 SDK capability 检测决定是展开值还是保留操作符
-28. **原地修改**: `recursiveWalk` 的原地修改特性使得嵌套展开可以单遍完成
-29. **类型感知**: list 类型分组会根据 `attributeKey` 的数据类型进行值转换（string/number）
+30. **两级展开策略**: 服务端负责嵌套引用展开，SDK 负责最终成员检查，平衡了 payload 大小和灵活性
+31. **循环/深度防护**: 通过 `visited` Set 和 `MAX_SAVED_GROUP_DEPTH=10` 防止无限递归
+32. **错误降级**: 无效引用通过注入 always-false 条件实现优雅降级（不命中该分组）
+33. **向后兼容**: 通过 SDK capability 检测决定是展开值还是保留操作符
+34. **原地修改**: `recursiveWalk` 的原地修改特性使得嵌套展开可以单遍完成
+35. **类型感知**: list 类型分组会根据 `attributeKey` 的数据类型进行值转换（string/number）
