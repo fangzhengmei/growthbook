@@ -77,17 +77,228 @@ export type GroupMap = Map<
 | GET | `/saved-groups` | 列出所有分组 |
 | POST | `/saved-groups` | 创建分组 |
 | GET | `/saved-groups/:id` | 获取单个分组 |
-| PUT | `/saved-groups/:id` | 更新分组 |
+| POST | `/saved-groups/:id` | 更新分组 (⚠️ 注意: 是 POST 不是 PUT) |
 | POST | `/saved-groups/:id/archive` | 归档分组 |
 | POST | `/saved-groups/:id/unarchive` | 取消归档 |
 | DELETE | `/saved-groups/:id` | 删除分组 |
+
+**验证器定义** (`packages/shared/src/validators/saved-group.ts:212-230`):
+```typescript
+export const updateSavedGroupValidator = {
+  method: "post" as const,  // 真实请求方法是 POST
+  path: "/saved-groups/:id",
+  bodySchema: updateSavedGroupBody,  // 部分字段更新: name, condition, values, owner, projects
+  // ...
+};
+```
 
 同时在 `packages/back-end/src/routers/saved-group/saved-group.controller.ts` 中还有旧版 API：
 - POST `/saved-groups/:id/add-items` - 批量添加列表项
 - POST `/saved-groups/:id/remove-items` - 批量移除列表项
 - GET `/saved-groups/:id/references` - 获取分组被引用的资源
+- PUT `/saved-groups/:id` - 旧版完整更新接口（支持 revision 审批流）
 
-### 2.2 创建流程 (`postSavedGroup`)
+### 2.2 读取链路详解
+
+#### 2.2.1 列表查询 (`listSavedGroups`)
+
+**文件**: `packages/back-end/src/api/saved-groups/listSavedGroups.ts:8-28`
+
+```typescript
+export const listSavedGroups = createApiRequestHandler(listSavedGroupsValidator)(
+  async (req) => {
+    const savedGroups = await req.context.models.savedGroups.getAll();
+    
+    // 内存分页 (TODO: 移到数据库层)
+    const { filtered, returnFields } = applyPagination(
+      savedGroups.sort((a, b) => a.id.localeCompare(b.id)),
+      req.query,
+    );
+
+    return {
+      savedGroups: await resolveOwnerEmails(
+        filtered.map((sg) => req.context.models.savedGroups.toApiInterface(sg)),
+        req.context,
+      ),
+      ...returnFields,
+    };
+  },
+);
+```
+
+**调用链**:
+```
+GET /saved-groups
+  → models.savedGroups.getAll()
+     → BaseModel._find({})  // 空查询条件
+        · applyBaseQuery()  // 注入 organization 过滤
+        · MongoDB find({ organization: orgId })
+        · 内存迁移: migrate()  // 处理旧版数据格式
+        · 权限过滤: filterByReadPermissions()  // 按项目权限过滤
+        · 字段清理: sanitize()
+  → 内存排序: 按 id 字典序排序
+  → applyPagination()  // 处理 limit/offset
+  → 转换: toApiInterface()  // 数据库字段 → API 字段
+  → resolveOwnerEmails()  // 填充 owner 邮箱
+  → 返回结果
+```
+
+#### 2.2.2 单条查询 (`getSavedGroup`)
+
+**文件**: `packages/back-end/src/api/saved-groups/getSavedGroup.ts:5-21`
+
+```typescript
+export const getSavedGroup = createApiRequestHandler(getSavedGroupValidator)(
+  async (req) => {
+    const savedGroup = await req.context.models.savedGroups.getById(req.params.id);
+    if (!savedGroup) {
+      throw new Error("Could not find savedGroup with that id");
+    }
+
+    return {
+      savedGroup: await resolveOwnerEmail(
+        req.context.models.savedGroups.toApiInterface(savedGroup),
+        req.context,
+      ),
+    };
+  },
+);
+```
+
+**调用链**:
+```
+GET /saved-groups/:id
+  → models.savedGroups.getById(id)
+     → BaseModel._findOne({ id })
+        · applyBaseQuery()  // 注入 organization 过滤
+        · MongoDB findOne({ id, organization: orgId })
+        · 内存迁移: migrate()
+        · populateForeignRefs()  // 填充外键引用
+        · 权限检查: canRead()  // 检查项目读取权限
+        · 字段清理: sanitize()
+  → 转换: toApiInterface()
+  → resolveOwnerEmail()
+  → 返回结果
+```
+
+#### 2.2.3 模型层读取实现
+
+**文件**: `packages/back-end/src/models/BaseModel.ts:656-750`
+
+**_find() 方法核心流程**:
+```typescript
+protected async _find(query = {}, options = {}) {
+  const fullQuery = this.applyBaseQuery(query);  // 注入 organization
+  
+  // 1. 执行查询
+  const rawDocs = await this._dangerousGetCollection().find(fullQuery).toArray();
+  
+  // 2. 数据迁移 (处理 legacy 格式)
+  const migrated = rawDocs.map(d => this.migrate(this._removeMongooseFields(d)));
+  
+  // 3. 读取权限过滤 (SavedGroupModel.canRead)
+  const filtered = bypassReadPermissionChecks 
+    ? migrated 
+    : await this.filterByReadPermissions(migrated);
+  
+  // 4. 分页
+  const paged = filtered.slice(skip || 0, limit ? (skip || 0) + limit : undefined);
+  
+  // 5. 字段清理
+  return paged.map(doc => this.sanitize(doc));
+}
+```
+
+**_findOne() 方法核心流程**:
+```typescript
+protected async _findOne(query, options = {}) {
+  const fullQuery = this.applyBaseQuery(query);
+  const doc = await this._dangerousGetCollection().findOne(fullQuery);
+  if (!doc) return null;
+  
+  const migrated = this.migrate(this._removeMongooseFields(doc));
+  await this.populateForeignRefs([migrated]);
+  
+  // 单条查询权限检查: 不通过返回 null (404 效果)
+  if (!this.canRead(migrated)) return null;
+  
+  return this.sanitize(migrated);
+}
+```
+
+#### 2.2.4 权限检查: `canRead()`
+
+**文件**: `packages/back-end/src/models/SavedGroupModel.ts:26-28`
+
+```typescript
+protected canRead(doc: SavedGroupInterface): boolean {
+  return this.context.permissions.canReadMultiProjectResource(doc.projects);
+}
+```
+
+**文件**: `packages/shared/src/permissions/permissionsClass.ts:1347-1363`
+
+```typescript
+public canReadMultiProjectResource = (projects: string[] | undefined): boolean => {
+  // 无 projects = 全局资源, 检查全局或任意项目权限
+  if (!projects || !projects.length) {
+    const projectsToCheck = [
+      "",  // 空字符串代表全局
+      ...Object.keys(this.userPermissions.projects),
+    ];
+    return projectsToCheck.some(p => this.hasPermission("readData", p));
+  }
+  
+  // 有 projects = 仅需在任一关联项目有权限
+  return projects.some(p => this.hasPermission("readData", p));
+};
+```
+
+#### 2.2.5 返回结构转换: `toApiInterface()`
+
+**文件**: `packages/back-end/src/models/SavedGroupModel.ts:120-135`
+
+```typescript
+public toApiInterface(savedGroup: SavedGroupInterface): ApiSavedGroup {
+  return {
+    id: savedGroup.id,
+    type: savedGroup.type,
+    values: savedGroup.values || [],
+    condition: savedGroup.condition || "",
+    name: savedGroup.groupName,              // 字段重命名: groupName → name
+    attributeKey: savedGroup.attributeKey || "",
+    dateCreated: savedGroup.dateCreated.toISOString(),  // Date → ISO string
+    dateUpdated: savedGroup.dateUpdated.toISOString(),
+    owner: savedGroup.owner || "",
+    description: savedGroup.description,
+    projects: savedGroup.projects || [],
+    archived: !!savedGroup.archived,  // undefined → false
+  };
+}
+```
+
+**数据库字段 → API 字段映射**:
+| 数据库字段 | API 字段 | 转换说明 |
+|-----------|----------|---------|
+| `groupName` | `name` | 字段重命名 |
+| `dateCreated` | `dateCreated` | Date 对象 → ISO 8601 字符串 |
+| `dateUpdated` | `dateUpdated` | Date 对象 → ISO 8601 字符串 |
+| `archived` | `archived` | `undefined` → `false` |
+| `values` | `values` | `undefined` → `[]` |
+| `condition` | `condition` | `undefined` → `""` |
+
+#### 2.2.6 特殊查询方法
+
+**无 values 查询** (`getAllWithoutValues()`):
+```typescript
+// 用于列表预览等不需要大量 values 数据的场景
+public async getAllWithoutValues(): Promise<SavedGroupWithoutValues[]> {
+  const groups = await this._find({}, { projection: { values: 0 } });
+  return groups as SavedGroupWithoutValues[];
+}
+```
+
+### 2.3 创建流程 (`postSavedGroup`)
 
 **文件**: `packages/back-end/src/api/saved-groups/postSavedGroup.ts:7-96`
 
@@ -114,24 +325,31 @@ POST /saved-groups
 
 ```
 调用链:
-PUT /saved-groups/:id
+POST /saved-groups/:id  (⚠️ 注意: 新版 API 用 POST 做部分更新)
   → getById() 获取现有分组
   → 权限检查: canUpdateSavedGroup()
   → 类型一致性检查:
      · condition 组不能修改 values
      · list 组不能修改 condition
-  → 字段对比: 只更新有变化的字段
+  → 字段对比: 只更新有变化的字段 (lodash isEqual)
   → 重新验证:
      · list 组: validateListSize() 检查大小限制
-     · condition 组: 重新 validateCondition()
+     · condition 组: 重新 validateCondition() (包含循环引用检查)
   → 调用 models.savedGroups.update() 持久化
-  → 返回更新后的分组
+  → 返回更新后的分组 (merged: { ...savedGroup, ...updated })
 ```
 
+**新版 POST /saved-groups/:id 行为**:
+- 部分更新: 只更新 body 中传入的字段
+- 支持更新: `name`, `owner`, `values`, `condition`, `projects`
+- 不支持修改: `id`, `type`, `organization`, `attributeKey` (类型不可变)
+- 无审批流: 即时生效（旧版 PUT 接口走 revision 审批流）
+
 **List 组批量增删接口** (`saved-group.controller.ts`):
-- `postSavedGroupAddItems`: 合并新 items 到现有 values，去重后更新
-- `postSavedGroupRemoveItems`: 从 values 中过滤掉指定 items
+- `POST /saved-groups/:id/add-items`: 合并新 items 到现有 values，去重后更新
+- `POST /saved-groups/:id/remove-items`: 从 values 中过滤掉指定 items
 - 两个接口都支持审批流（revision 机制）
+- 当 `approvalRequired` 时返回 202 Accepted，否则 200 OK
 
 ### 2.4 归档/取消归档流程
 
@@ -194,6 +412,116 @@ savedGroupUpdated(context)
 - `getAll(organization?)`: 获取组织下所有分组
 - `update(savedGroup, updates)`: 更新字段并记录审计日志
 - `deleteById(id)`: 删除文档
+
+### 2.8 权限检查机制
+
+#### 2.8.1 模型层权限钩子
+
+**文件**: `packages/back-end/src/models/SavedGroupModel.ts:26-44`
+
+```typescript
+// 读取权限
+protected canRead(doc: SavedGroupInterface): boolean {
+  return this.context.permissions.canReadMultiProjectResource(doc.projects);
+}
+
+// 创建权限
+protected canCreate(doc: SavedGroupInterface): boolean {
+  return this.context.permissions.canCreateSavedGroup(doc);
+}
+
+// 更新权限 (同时检查现有和更新后的项目)
+protected canUpdate(
+  existing: SavedGroupInterface,
+  _updates: UpdateProps<SavedGroupInterface>,
+  newDoc: SavedGroupInterface,
+): boolean {
+  return this.context.permissions.canUpdateSavedGroup(existing, newDoc);
+}
+
+// 删除权限
+protected canDelete(doc: SavedGroupInterface): boolean {
+  return this.context.permissions.canDeleteSavedGroup(doc);
+}
+```
+
+#### 2.8.2 权限类实现
+
+**文件**: `packages/shared/src/permissions/permissionsClass.ts:1195-1223`
+
+```typescript
+public canCreateSavedGroup = (
+  savedGroup: Pick<SavedGroupInterface, "projects">,
+): boolean => {
+  return this.checkProjectFilterPermission(savedGroup, "manageSavedGroups");
+};
+
+public canUpdateSavedGroup = (
+  existing: Pick<SavedGroupInterface, "projects">,
+  updates: Pick<SavedGroupInterface, "projects">,
+): boolean => {
+  return this.checkProjectFilterUpdatePermission(
+    existing,
+    updates,
+    "manageSavedGroups",
+  );
+};
+
+public canDeleteSavedGroup = (
+  savedGroup: Pick<SavedGroupInterface, "projects">,
+): boolean => {
+  return this.checkProjectFilterPermission(savedGroup, "manageSavedGroups");
+};
+```
+
+#### 2.8.3 核心权限检查逻辑
+
+**文件**: `packages/shared/src/permissions/permissionsClass.ts:1373-1413`
+
+```typescript
+// 非只读权限: 需要在 ALL 关联项目都有权限
+private checkProjectFilterPermission(
+  obj: { projects?: string[] },
+  permission: ProjectScopedPermission,
+): boolean {
+  const projects = obj.projects?.length ? obj.projects : [""];  // "" 代表全局
+  
+  if (READ_ONLY_PERMISSIONS.includes(permission)) {
+    return projects.some(p => this.hasPermission(permission, p));  // 只读: 任一即可
+  }
+  return projects.every(p => this.hasPermission(permission, p));  // 写权限: 全部需要
+}
+
+// 更新权限: 同时检查现有和更新后的项目
+private checkProjectFilterUpdatePermission(
+  existing: { projects?: string[] },
+  updates: { projects?: string[] } | undefined,
+  permission: ProjectScopedPermission,
+): boolean {
+  // 1. 检查现有项目的权限
+  if (!this.checkProjectFilterPermission(existing, permission)) return false;
+  
+  // 2. 如果更新包含 projects，也检查新项目的权限
+  if (updates?.projects && !this.checkProjectFilterPermission(updates, permission)) {
+    return false;
+  }
+  return true;
+}
+```
+
+#### 2.8.4 权限矩阵
+
+| 操作 | 权限要求 | 检查范围 |
+|------|---------|---------|
+| 读取 (list/get) | `readData` | 任一关联项目有权限即可 |
+| 创建 | `manageSavedGroups` | **所有**关联项目都需要权限 |
+| 更新 | `manageSavedGroups` | **所有**现有和更新后的项目都需要权限 |
+| 删除 | `manageSavedGroups` | **所有**关联项目都需要权限 |
+
+**关键设计**:
+- 读权限宽松（OR 逻辑）: 只要能看到任一关联项目就能读取
+- 写权限严格（AND 逻辑）: 必须在所有关联项目都有权限才能修改
+- 空 projects 数组 = 全局资源，检查全局权限 (`""` 项目)
 
 ---
 
@@ -670,25 +998,31 @@ runExperiment(experiment, ctx)
 |---------|---------|---------|
 | 路由注册 | `packages/back-end/src/api/saved-groups/saved-groups.router.ts` | `savedGroupsRoutes` |
 | 创建分组 | `packages/back-end/src/api/saved-groups/postSavedGroup.ts` | `postSavedGroup` |
-| 更新分组 | `packages/back-end/src/api/saved-groups/updateSavedGroup.ts` | `updateSavedGroup` |
+| 列表查询 | `packages/back-end/src/api/saved-groups/listSavedGroups.ts` | `listSavedGroups` |
+| 单条查询 | `packages/back-end/src/api/saved-groups/getSavedGroup.ts` | `getSavedGroup` |
+| 更新分组 (新版, POST) | `packages/back-end/src/api/saved-groups/updateSavedGroup.ts` | `updateSavedGroup` |
 | 归档/取消归档 | `packages/back-end/src/api/saved-groups/archiveSavedGroup.ts` | `archiveSavedGroup`, `unarchiveSavedGroup` |
 | 删除分组 | `packages/back-end/src/api/saved-groups/deleteSavedGroup.ts` | `deleteSavedGroup` |
 | 列表项增删 | `packages/back-end/src/routers/saved-group/saved-group.controller.ts` | `postSavedGroupAddItems`, `postSavedGroupRemoveItems` |
 | 引用检查 | `packages/back-end/src/services/savedGroups.ts` | `loadSavedGroupReferences` |
 | 变更通知 | `packages/back-end/src/services/savedGroups.ts` | `savedGroupUpdated` |
+| 所有者邮箱解析 | `packages/back-end/src/services/owner.ts` | `resolveOwnerEmail`, `resolveOwnerEmails` |
 
 ### 7.2 核心逻辑层
 
 | 功能模块 | 文件路径 | 关键函数 |
 |---------|---------|---------|
 | 类型定义 | `packages/shared/types/saved-group.d.ts` | `SavedGroupInterface` |
-| 数据验证 | `packages/shared/src/validators/saved-group.ts` | `savedGroupValidator` |
+| 数据验证 | `packages/shared/src/validators/saved-group.ts` | `savedGroupValidator`, `postSavedGroupValidator`, `updateSavedGroupValidator` |
 | 条件解析 | `packages/back-end/src/util/features.ts` | `getParsedCondition`, `getSavedGroupCondition` |
 | 嵌套展开 | `packages/shared/src/sdk-versioning/sdk-payload.ts` | `expandNestedSavedGroups` |
 | 值替换 (旧SDK兼容) | `packages/shared/src/sdk-versioning/sdk-payload.ts` | `replaceSavedGroups` |
 | 递归遍历工具 | `packages/shared/src/util/index.ts` | `recursiveWalk` |
 | 值类型转换 | `packages/shared/src/util/saved-groups.ts` | `getTypedSavedGroupValues`, `getSavedGroupValueType` |
 | 引用检测 | `packages/shared/src/util/index.ts` | `featuresReferencingSavedGroups`, `experimentsReferencingSavedGroups` |
+| API结构转换 | `packages/back-end/src/models/SavedGroupModel.ts` | `toApiInterface` |
+| 旧版数据迁移 | `packages/back-end/src/models/SavedGroupModel.ts` | `migrateSavedGroup` |
+| 变更后刷新 | `packages/back-end/src/models/SavedGroupModel.ts` | `afterUpdate` |
 
 ### 7.3 SDK 运行时层
 
@@ -699,41 +1033,72 @@ runExperiment(experiment, ctx)
 | 成员检查 | `packages/sdk-js/src/mongrule.ts` | `isIn` |
 | Feature 评估 | `packages/sdk-js/src/core.ts` | `evalFeature`, `conditionPasses` |
 | 实验评估 | `packages/sdk-js/src/core.ts` | `runExperiment` |
+
+### 7.4 权限与模型层
+
+| 功能模块 | 文件路径 | 关键函数 |
+|---------|---------|---------|
 | 数据模型 | `packages/back-end/src/models/SavedGroupModel.ts` | `SavedGroupModel` |
+| 基础模型查询 | `packages/back-end/src/models/BaseModel.ts` | `_find`, `_findOne`, `getById`, `getAll` |
+| 权限类 | `packages/shared/src/permissions/permissionsClass.ts` | `Permissions` |
+| 读权限检查 | `packages/shared/src/permissions/permissionsClass.ts` | `canReadMultiProjectResource` |
+| 写权限检查 | `packages/shared/src/permissions/permissionsClass.ts` | `checkProjectFilterPermission`, `checkProjectFilterUpdatePermission` |
+| 权限矩阵定义 | `packages/shared/src/permissions/permissions.constants.ts` | `POLICY_PERMISSION_MAP`, `DEFAULT_ROLES` |
 
 ---
 
 ## 八、设计要点总结
 
-### 8.1 CRUD 链路设计
+### 8.1 读取链路设计
 
-1. **归档前置删除**: 强制先归档再删除，提供撤销窗口，防止误删
-2. **引用完整性**: 归档前强制检查所有引用（features/experiments/嵌套savedGroups），保证 archived 状态的分组不会被使用
-3. **审批流集成**: list 组的批量增删操作走 revision 机制，支持审批流程
-4. **保守刷新策略**: saved group 变更时刷新全部 SDK payload 缓存，因为可能存在跨项目的嵌套引用
-5. **幂等设计**: 归档/取消归档操作在已处于目标状态时直接返回，避免重复写入
+1. **两级权限过滤**:
+   - 列表查询: 先全量查询再内存过滤权限（`filterByReadPermissions`）
+   - 单条查询: 查询后权限检查，不通过返回 `null`（404 效果）
+2. **读取宽松策略**: 读权限用 `some()` 逻辑，只要在任一关联项目有权限即可读取
+3. **字段重命名**: `groupName` → `name`，`dateCreated/dateUpdated` Date → ISO string
+4. **性能优化点**: 内存分页 TODO 移到数据库层，目前先拉全量再过滤分页
+5. **投影优化**: 提供 `getAllWithoutValues()` 避免拉取大量 values 数据
 
-### 8.2 match=none 判定设计
+### 8.2 CRUD 链路设计
 
-6. **结构差异**: condition 组用 `{ $not: cond }` 整体取反，list 组用 `$notInGroup` 属性级取反，符合各自的语义场景
-7. **空值处理差异**: 
-   - 空 condition → 跳过该分组（不参与条件）
-   - 空 list（`useEmptyListGroup=false`）→ 跳过
-   - 空 list（`useEmptyListGroup=true`）→ `$notInGroup` 恒为 true
-8. **德摩根定律隐式应用**: `$not` 包裹 `$or` 条件时等价于 `$nor`，但由 SDK 端 `evalCondition` 递归处理，无需服务端转换
+6. **方法选择**: 更新接口用 **POST** 做部分更新（非 REST 标准的 PUT），符合实际语义
+7. **类型不可变**: 创建后 `type` 和 `attributeKey` 不可修改，防止数据不一致
+8. **归档前置删除**: 强制先归档再删除，提供撤销窗口，防止误删
+9. **引用完整性**: 归档前强制检查所有引用（features/experiments/嵌套savedGroups）
+10. **审批流集成**: list 组的批量增删操作走 revision 机制，支持审批流程
+11. **保守刷新策略**: values/condition/projects 变更时刷新全部 SDK payload 缓存，archived 变更不刷新（因为归档必须先解除引用）
+12. **幂等设计**: 归档/取消归档操作在已处于目标状态时直接返回
 
-### 8.3 实验侧命中设计
+### 8.3 权限设计
 
-9. **分层准入**: Saved Group 条件检查发生在哈希分配之前，作为准入门槛，避免不必要的哈希计算
-10. **统一评估逻辑**: 实验与 Feature 共享相同的 `evalCondition` 和 `evalOperatorCondition` 逻辑，确保判定一致性
-11. **双路径引用**: 既支持 `experiment.condition` 内嵌 `$inGroup`，也支持 `phase.savedGroups` 声明式引用，给用户灵活选择
-12. **前置条件依赖**: 实验的 `parentConditions` 支持依赖其他 Feature 的状态，可构建复杂的准入规则
+13. **读写权限分离**:
+    - 读: `readData` + `some()` 逻辑（任一项目即可）
+    - 写: `manageSavedGroups` + `every()` 逻辑（所有项目都需要）
+14. **更新双检查**: 更新时同时检查**现有**和**更新后**的项目权限
+15. **全局项目表示**: 空 `projects` 数组用 `""` 字符串表示全局权限
+16. **权限继承**: `engineer`、`experimenter`、`admin`、`projectAdmin` 角色默认包含 `SavedGroupsFullAccess` 策略
 
-### 8.4 通用设计原则
+### 8.4 match=none 判定设计
 
-13. **两级展开策略**: 服务端负责嵌套引用展开，SDK 负责最终成员检查，平衡了 payload 大小和灵活性
-14. **循环/深度防护**: 通过 `visited` Set 和 `MAX_SAVED_GROUP_DEPTH=10` 防止无限递归
-15. **错误降级**: 无效引用通过注入 always-false 条件实现优雅降级（不命中该分组）
-16. **向后兼容**: 通过 SDK capability 检测决定是展开值还是保留操作符
-17. **原地修改**: `recursiveWalk` 的原地修改特性使得嵌套展开可以单遍完成
-18. **类型感知**: list 类型分组会根据 `attributeKey` 的数据类型进行值转换（string/number）
+17. **结构差异**: condition 组用 `{ $not: cond }` 整体取反，list 组用 `$notInGroup` 属性级取反，符合各自的语义场景
+18. **空值处理差异**: 
+    - 空 condition → 跳过该分组（不参与条件）
+    - 空 list（`useEmptyListGroup=false`）→ 跳过
+    - 空 list（`useEmptyListGroup=true`）→ `$notInGroup` 恒为 true
+19. **德摩根定律隐式应用**: `$not` 包裹 `$or` 条件时等价于 `$nor`，但由 SDK 端 `evalCondition` 递归处理，无需服务端转换
+
+### 8.5 实验侧命中设计
+
+20. **分层准入**: Saved Group 条件检查发生在哈希分配之前，作为准入门槛，避免不必要的哈希计算
+21. **统一评估逻辑**: 实验与 Feature 共享相同的 `evalCondition` 和 `evalOperatorCondition` 逻辑，确保判定一致性
+22. **双路径引用**: 既支持 `experiment.condition` 内嵌 `$inGroup`，也支持 `phase.savedGroups` 声明式引用，给用户灵活选择
+23. **前置条件依赖**: 实验的 `parentConditions` 支持依赖其他 Feature 的状态，可构建复杂的准入规则
+
+### 8.6 通用设计原则
+
+24. **两级展开策略**: 服务端负责嵌套引用展开，SDK 负责最终成员检查，平衡了 payload 大小和灵活性
+25. **循环/深度防护**: 通过 `visited` Set 和 `MAX_SAVED_GROUP_DEPTH=10` 防止无限递归
+26. **错误降级**: 无效引用通过注入 always-false 条件实现优雅降级（不命中该分组）
+27. **向后兼容**: 通过 SDK capability 检测决定是展开值还是保留操作符
+28. **原地修改**: `recursiveWalk` 的原地修改特性使得嵌套展开可以单遍完成
+29. **类型感知**: list 类型分组会根据 `attributeKey` 的数据类型进行值转换（string/number）
