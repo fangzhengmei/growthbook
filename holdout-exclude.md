@@ -848,7 +848,73 @@ if (phase.namespace && phase.namespace.enabled && phase.namespace.name) {
 | 分桶种子 | holdout 实验自己的 seed | 可使用 namespace 统一 seed |
 | hashAttribute | holdout 实验自己的配置 | 可使用 namespace 统一配置 |
 
-### 7.3 Holdout 与 Namespace 协同的正确方式
+### 7.3 Holdout 与 Namespace 的真实关系：代码级证据
+
+**关键发现：Holdout 虚拟 feature 没有 namespace/filter，但 Holdout 实验本身可以配置 namespace！**
+
+**代码证据对比：**
+
+| 组件 | 处理代码 | 是否应用 namespace |
+|-----|---------|-------------------|
+| Holdout 虚拟 feature | `generateHoldoutsPayload()` (234-269 行) | ❌ **不应用** |
+| Feature 规则中的 experiment-ref | `getFeatureDefinition()` → `applyNamespaceToPayload()` | ✅ 应用 |
+| Visual 实验 | `generateAutoExperimentsPayload()` → `applyNamespaceToPayload()` | ✅ 应用 |
+| Redirect 实验 | `generateAutoExperimentsPayload()` → `applyNamespaceToPayload()` | ✅ 应用 |
+
+**Holdout 虚拟 feature 的构造代码（没有 namespace）：**
+**文件：** `packages/back-end/src/services/features.ts:234-269`
+
+```typescript
+export function generateHoldoutsPayload({ holdoutsMap }): Record<string, FeatureDefinition> {
+  const holdoutDefs: Record<string, FeatureDefinition> = {};
+  holdoutsMap.forEach((holdoutWithExperiment) => {
+    const exp = holdoutWithExperiment.holdoutExperiment;
+    const holdout = holdoutWithExperiment.holdout;
+    
+    const def: FeatureDefinition = {
+      defaultValue: "genpop",
+      rules: [
+        {
+          id: getHoldoutFeatureDefId(holdout.id),
+          coverage: exp.phases[0].coverage,
+          hashAttribute: exp.hashAttribute,
+          seed: exp.phases[0].seed,
+          hashVersion: 2,
+          variations: ["holdoutcontrol", "holdouttreatment"],
+          weights: [0.5, 0.5],
+          // 注意：这里直接构造规则，没有调用 applyNamespaceToPayload！
+          // 即使 exp.phases[0].namespace 有配置，也不会被应用！
+          key: exp.trackingKey,
+          phase: `${exp.phases.length - 1}`,
+          meta: [{ key: "0" }, { key: "1" }],
+        },
+      ],
+    };
+    holdoutDefs[getHoldoutFeatureDefId(holdout.id)] = def;
+  });
+  return holdoutDefs;
+}
+```
+
+**对比：普通实验的 namespace 应用**
+**文件：** `packages/back-end/src/services/features.ts:448-455`
+
+```typescript
+// Handle namespace
+if (phase?.namespace?.enabled && phase.namespace.name) {
+  applyNamespaceToPayload(
+    exp,
+    phase.namespace,
+    namespacesToMap(organization?.settings?.namespaces),
+  );
+}
+```
+
+**结论修正：**
+- ❌ 原说法："Holdout 本身也是实验，因此也可以通过 namespace/filters 与其他实验互斥"
+- ✅ 真实情况：**Holdout 虚拟 feature 没有 namespace，分桶是全局的**。即使 holdout 实验在界面上配置了 namespace，该 namespace 也**不会**应用到 holdout 的虚拟 feature 上。
+
+### 7.4 Holdout 与 Namespace 协同的正确方式
 
 由于 Holdout 分桶是全局的，要实现 Holdout 与其他实验的互斥，需要：
 
@@ -859,7 +925,7 @@ Holdout: coverage = 0.2 (全局 20% 用户)
 业务实验 B: namespace = "other", ranges = [[0.2, 1.0]] (剩下的 80%)
 ```
 
-**方案 2：使用 prerequisites 实现间接互斥**
+**方案 2：使用 prerequisites 实现间接互斥（推荐）**
 ```
 Feature A (关联 holdout)
     └─ holdout 规则作为 prerequisite (最前面)
@@ -867,7 +933,74 @@ Feature A (关联 holdout)
         └─ 否则继续执行后续规则（可能包含 namespace）
 ```
 
-### 7.4 Holdout 互斥的实际生效路径
+### 7.5 Holdout 定义被裁剪的完整生效链路
+
+**文件：** `packages/back-end/src/services/features.ts:1035-1196`
+
+Holdout 虚拟 feature 的生效经过**四级过滤**：
+
+```
+SDK Connection 配置
+    │
+    ├─ 第一级：环境过滤
+    │   └─ getAllPayloadHoldouts(environment)
+    │       └─ 只返回 environmentSettings[env].enabled = true 的 holdout
+    │       └─ 代码：HoldoutModel.ts:169-217
+    │
+    ├─ 第二级：项目过滤
+    │   └─ buildHoldoutsMapForProjects(holdoutsMap, projectList)
+    │       └─ 只返回 holdout.projects 与 connection.projects 匹配的 holdout
+    │       └─ 代码：services/features.ts:209-232
+    │
+    ├─ 第三级：生成所有 holdout 虚拟 feature
+    │   └─ generateHoldoutsPayload(holdoutsMapForConnection)
+    │       └─ 为每个 holdout 生成 $holdout:xxx 虚拟 feature
+    │       └─ 注意：这里生成的是全部通过前两级过滤的 holdout
+    │       └─ 代码：services/features.ts:234-269
+    │
+    └─ 第四级：裁剪未被引用的 holdout（关键！）
+        └─ pruneUnreferencedHoldouts(holdoutFeatureDefinitions, featureDefinitions)
+            └─ 扫描所有 feature 的所有规则
+            └─ 检查 rule.parentConditions?.[0]?.id 是否以 "$holdout:" 开头
+            └─ 只保留被引用的 holdout 虚拟 feature
+            └─ 代码：services/features.ts:1035-1050
+```
+
+**第四级裁剪的关键代码证据：**
+**文件：** `packages/back-end/src/services/features.ts:1035-1050`
+
+```typescript
+// Keep only holdout defs that are referenced by at least one feature rule.
+function pruneUnreferencedHoldouts(
+  holdouts: Record<string, FeatureDefinition>,
+  features: Record<string, FeatureDefinition>,
+): Record<string, FeatureDefinition> {
+  const referenced = new Set<string>();
+  for (const k in features) {
+    for (const rule of features[k]?.rules ?? []) {
+      // 只检查第一条 parentCondition！
+      const pcId = rule.parentConditions?.[0]?.id;
+      if (pcId?.startsWith("$holdout:")) referenced.add(pcId);
+    }
+  }
+  return Object.fromEntries(
+    Object.entries(holdouts).filter(([key]) => referenced.has(key)),
+  );
+}
+```
+
+**裁剪逻辑的关键细节：**
+1. **只检查第一条 parentCondition**：`rule.parentConditions?.[0]?.id`，如果 holdout 不在第一条则不会被检测到
+2. **只被 feature 规则引用才保留**：auto experiments（visual/redirect）引用的 holdout 不会被保留
+3. **裁剪发生在 feature 定义生成之后**：确保只保留实际被使用的 holdout
+4. **最终合并**：`featuresWithHoldouts = { ...featureDefinitions, ...holdoutsInUse }`
+
+**生效链路的实际影响：**
+- 如果一个 holdout 没有被任何 feature 关联，它的虚拟 feature **不会**出现在 SDK payload 中
+- 即使 holdout 关联了实验（linkedExperiments），如果没有关联 feature，也**不会**被包含在 payload 中
+- 这是一种优化：减少 payload 大小，只发送实际需要的 holdout 定义
+
+### 7.6 Holdout 互斥的实际生效路径
 
 ```
 evalFeature("checkout_button")
@@ -903,9 +1036,10 @@ evalFeature("checkout_button")
 | Holdout 验证器 | `packages/shared/src/validators/holdout.ts` | `holdoutValidator` |
 | Holdout 规则生成 | `packages/back-end/src/util/features.ts:592-616` | `getFeatureDefinition()` 中的 holdoutRule |
 | Holdout 虚拟 Feature | `packages/back-end/src/services/features.ts:234-269` | `generateHoldoutsPayload()` |
+| Holdout 定义裁剪 | `packages/back-end/src/services/features.ts:1035-1050` | `pruneUnreferencedHoldouts()` |
 | Prerequisites Capability 检查 | `packages/back-end/src/util/features.ts:563-590` | `hasPrerequisites` 变量 |
-| 项目门禁 | `packages/back-end/src/services/features.ts:209-232` | `buildHoldoutsMapForProjects()` |
-| 环境门禁 | `packages/back-end/src/models/HoldoutModel.ts:169-217` | `getAllPayloadHoldouts()` |
+| 项目过滤 | `packages/back-end/src/services/features.ts:209-232` | `buildHoldoutsMapForProjects()` |
+| 环境过滤 | `packages/back-end/src/models/HoldoutModel.ts:169-217` | `getAllPayloadHoldouts()` |
 | Feature 定义生成 | `packages/back-end/src/util/features.ts:478-978` | `getFeatureDefinition()` |
 | 分桶排除检查 | `packages/sdk-js/src/core.ts:832-840` | `isFilteredOut()` |
 | 实验运行流程 | `packages/sdk-js/src/core.ts:385-785` | `runExperiment()` |
@@ -913,15 +1047,56 @@ evalFeature("checkout_button")
 | Namespace 工具 | `packages/shared/src/util/namespaces.ts` | `getNamespaceRanges()`, `rangesOverlap()` |
 | Namespace 应用 | `packages/back-end/src/util/features.ts:425-476` | `applyNamespaceToPayload()` |
 | Filter 类型 | `packages/sdk-js/src/types/growthbook.ts:547-556` | `Filter` 接口 |
+| Auto Experiments Payload | `packages/back-end/src/services/features.ts:282-498` | `generateAutoExperimentsPayload()` |
 
 ## 九、核心结论
 
-1. **Holdout 依赖 prerequisites capability**：没有该能力时，Holdout 规则完全不生成，包含 prerequisites 的 feature 被整个排除
+### 9.1 Holdout 生效机制
 
-2. **项目/环境门禁是多级联动的**：Feature、Experiment、Holdout 各自有独立的项目和环境过滤逻辑
+1. **完全依赖 prerequisites capability**：
+   - 没有该能力时，Holdout 规则完全不生成
+   - 包含 prerequisites 的 feature 会被整个排除
+   - Holdout 规则通过 `parentConditions` 作为先决条件实现
 
-3. **跨实验互斥没有全局强制保证**：完全依赖手动配置，代码中没有验证机制，配置错误会导致用户同时进入多个实验
+2. **四级过滤生效链路**：
+   - 第一级：环境过滤（`getAllPayloadHoldouts`）
+   - 第二级：项目过滤（`buildHoldoutsMapForProjects`）
+   - 第三级：生成所有虚拟 feature（`generateHoldoutsPayload`）
+   - 第四级：裁剪未被引用的（`pruneUnreferencedHoldouts`）→ 只保留被 feature 规则第一条 `parentCondition` 引用的
 
-4. **Holdout 分桶是全局的**：Holdout 虚拟 feature 没有 namespace/filter，分桶是全局的，与业务实验的分桶是两次独立计算
+3. **分桶是全局的**：
+   - Holdout 虚拟 feature **没有 namespace/filter**
+   - 即使 holdout 实验配置了 namespace，也**不会**应用到虚拟 feature
+   - 分桶是全局的，与业务实验的分桶是两次独立计算
 
-5. **Holdout 互斥是"软互斥"**：通过 prerequisite + force 规则实现，而不是 namespace 层面的"硬互斥"
+### 9.2 跨实验互斥机制
+
+1. **没有全局强制保证** ⚠️：
+   - 代码中存在 `rangesOverlap()` 工具函数，但**从未用于** SDK payload 生成时的验证
+   - 完全依赖手动配置 namespace 的范围不重叠
+   - 配置错误会导致用户同时进入多个实验
+
+2. **互斥的实现方式**：
+   - 普通实验（feature-ref、visual、redirect）都通过 `applyNamespaceToPayload` 应用 namespace
+   - 组织级 namespace 提供统一的 `hashAttribute` 和 `seed`
+   - 但不验证范围是否重叠
+
+3. **正确使用互斥**：
+   - 同一 namespace 下的实验必须手动配置不重叠的 ranges
+   - 必须使用相同的 `hashAttribute` 和 `hashVersion`
+   - 建议使用组织级 namespace 定义以保证一致性
+
+### 9.3 Holdout 与互斥的关系
+
+1. **Holdout 不参与 namespace 互斥**：
+   - Holdout 虚拟 feature 没有 namespace，分桶是全局的
+   - 无法通过 namespace 实现 Holdout 与其他实验的"硬互斥"
+
+2. **Holdout 的"软互斥"**：
+   - 通过 `prerequisite + force` 规则实现
+   - 如果用户在 `holdoutcontrol` 组，直接返回 holdout 值，跳过后续所有规则
+   - 这是在规则评估层面的互斥，而不是分桶层面的互斥
+
+3. **协同方案**：
+   - 方案 1：业务实验的 namespace 范围避开 Holdout 的 coverage
+   - 方案 2：依赖 Holdout 的 prerequisite 规则提前返回（推荐）
