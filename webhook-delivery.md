@@ -18,42 +18,69 @@ GrowthBook 代码库中存在 **5 条投递通道**，各自有不同的重试�
 
 ## 一、事件入队流程
 
-### 1.1 触发源与完整异步调用链
+### 1.1 触发源与完整执行路径
 
-Feature 变更时，完整调用链是 **5 层 fire-and-forget** 的后台任务链，**每一层都不阻塞上层**：
+Feature 变更时，从接口请求到响应返回的完整路径包含**同步阻塞操作**和**后台异步任务**两类。以下逐层展开，标注每一行是 `await` 还是 fire-and-forget。
+
+#### 同步阻塞路径（接口响应必须等待的操作）
 
 ```
-Express 路由处理器
-    ↓
-controllers/features.ts:2433  await updateFeature(...)
-    ↓
-models/FeatureModel.ts:1053  onFeatureUpdate(...).catch(logger.error)  ← 第 1 层 fire-and-forget
-    ↓
-models/FeatureModel.ts:927  queueSDKPayloadRefresh(...)  ← 同步函数，立即返回
-    ↓
-services/features.ts:618  refreshSDKPayloadCache(...).catch(logger.error)  ← 第 2 层 fire-and-forget
-    ↓
-services/features.ts:821  triggerWebhookJobs(...).catch(logger.error)  ← 第 3 层 fire-and-forget
-    ↓
-jobs/updateAllJobs.ts:17-58  triggerWebhookJobs 内部:
-    ├─ 4 个 webhook/proxy 通道（均 .catch() 不 await）
-    └─ await purgeCDNCache()  ← 仅在 triggerWebhookJobs 内部 await，不影响接口响应
+postFeatureSync (controllers/features.ts:2264)
+│
+├─ ① await getFeature(context, id)                     ← Mongo 读（:2281）
+├─ ② await createRevision({...})                       ← 条件，创建 revision（:2415）
+├─ ③ await updateFeature(context, feature, updates)    ← 核心写入（:2433）
+│    ├─ await runValidateFeatureHooks({...})             ← 企业版 hook 验证（FeatureModel.ts:991）
+│    │    └─ _runCustomHooks: 查询 hook 配置 + V8 sandbox 执行
+│    │       （Cloud 环境跳过；自部署 + premium 时阻塞）
+│    ├─ await FeatureModel.updateOne({...})              ← Mongo 写（:1028）
+│    ├─ await Promise.all(addLinkedFeatureToExperiment)  ← 条件，关联实验更新（:1036）
+│    ├─ await FeatureModel.findOne({...})                ← Mongo 读（:1045）
+│    ├─ onFeatureUpdate(...).catch(...)                  ← ★ fire-and-forget（:1053）
+│    └─ return updatedFeature
+│
+├─ ④ await req.audit({...})                            ← Mongo 写，审计日志（:2435）
+│    └─ insertAudit({...})                               ← auth/index.ts:275
+│
+└─ ⑤ res.status(200).json({feature: updatedFeature})  ← 发送响应（:2446）
 ```
 
-**关键异步证据**（每层对应代码）：
+#### 后台异步路径（接口响应不等待的操作）
+
+`onFeatureUpdate` 在 `updateFeature` 内部以 `.catch()` 调用，**不 await**，因此其全部子操作在后台异步执行：
+
+```
+onFeatureUpdate(...).catch(...)  ← FeatureModel.ts:1053, 无 await
+│
+├─ queueSDKPayloadRefresh({...})                       ← 同步函数，立即返回（:927）
+│    └─ refreshSDKPayloadCache({...}).catch(...)        ← services/features.ts:618, fire-and-forget
+│         ├─ await promiseAllChunks(promises, 4)         ← 更新 SDK connection cache（Mongo 写）
+│         └─ triggerWebhookJobs(...).catch(...)          ← services/features.ts:821, fire-and-forget
+│              ├─ 4 个 webhook/proxy 通道（均 .catch() 不 await）
+│              └─ await purgeCDNCache()                   ← 仅在 triggerWebhookJobs 内部 await
+│
+├─ await logFeatureUpdatedEvent(...)                   ← Event Webhook 入队（:950）
+│    └─ 虽然 onFeatureUpdate 内部 await，但外层不 await，所以不阻塞接口
+│
+└─ await updateVercelExperimentationItemFromFeature()  ← Vercel 集成（:954, 条件）
+     └─ 同上，外层不 await，不阻塞接口
+```
+
+#### 关键代码证据
 
 ```typescript
-// 第 1 层：FeatureModel.ts:1053 — onFeatureUpdate 不 await
+// FeatureModel.ts:1053 — onFeatureUpdate 不 await，后续立即 return
 onFeatureUpdate(context, feature, updatedFeature).catch((e) => {
   logger.error(e, "Error refreshing SDK Payload on feature update");
 });
+return updatedFeature;  // ← updateFeature 返回，不等待 onFeatureUpdate
 
-// 第 2 层：services/features.ts:618 — refreshSDKPayloadCache 不 await
+// services/features.ts:618 — refreshSDKPayloadCache 不 await
 refreshSDKPayloadCache({ ...data, stackTrace }).catch((e) => {
   logger.error(e, "Error refreshing SDK Payload Cache");
 });
 
-// 第 3 层：services/features.ts:821 — triggerWebhookJobs 不 await
+// services/features.ts:821 — triggerWebhookJobs 不 await
 triggerWebhookJobs(context, payloadKeys, connectionsUpdated, true).catch(
   (e) => {
     logger.error(e, "Error triggering webhook jobs");
@@ -61,7 +88,21 @@ triggerWebhookJobs(context, payloadKeys, connectionsUpdated, true).catch(
 );
 ```
 
-**结论**：`triggerWebhookJobs` 内部的 `await purgeCDNCache` 仅等待 CDN 清除完成，但由于 `triggerWebhookJobs` 本身是 fire-and-forget 调用，**CDN 清除和所有 webhook 投递都在后台异步执行，不阻塞 Feature 更新 API 的响应**。接口响应延迟由 Mongo 操作（`FeatureModel.updateOne`、`FeatureModel.findOne`）主导。
+#### 响应延迟主导因素判定
+
+接口响应延迟由**同步阻塞路径**中的操作决定：
+
+| 操作 | 位置 | 类型 | 说明 |
+|------|------|------|------|
+| `getFeature` | `:2281` | Mongo 读 | 查找 feature 文档 |
+| `createRevision` | `:2415` | Mongo 写 | 条件性，当有规则变更时触发 |
+| `runValidateFeatureHooks` | `:991` | Mongo 读 + sandbox | 仅自部署 + premium 生效；Cloud 跳过 |
+| `FeatureModel.updateOne` | `:1028` | Mongo 写 | 写入 feature 变更 |
+| `addLinkedFeatureToExperiment` | `:1036` | Mongo 写 | 条件性，仅当 linkedExperiments 变更时 |
+| `FeatureModel.findOne` | `:1045` | Mongo 读 | 回读持久化后的文档 |
+| `req.audit` → `insertAudit` | `:2435` | Mongo 写 | 写入审计日志 |
+
+**CDN 清除和全部 webhook 投递都不在上述路径中**，它们在 `onFeatureUpdate` 的后台异步链中执行，不阻塞接口响应。
 
 ### 1.2 统一入队分发器 — triggerWebhookJobs
 
@@ -492,43 +533,55 @@ if ((connection.proxy.consecutiveFailures || 0) >= WEBHOOK_CONSECUTIVE_FAILURES_
 
 ## 七、完整调用链路图
 
-### 7.1 triggerWebhookJobs 全局时序
+### 7.1 Feature 更新接口完整时序
 
 ```
-Feature 变更
-    ↓
-controllers/features.ts:2433  await updateFeature(...)
-    ↓
-models/FeatureModel.ts:960  async function updateFeature(...)
-    ├─ ① await FeatureModel.updateOne(...)    ← Mongo 写操作（阻塞接口）
-    ├─ ② await FeatureModel.findOne(...)      ← Mongo 读操作（阻塞接口）
-    ├─ ③ onFeatureUpdate(...).catch(...)      ← fire-and-forget，不阻塞
-    └─ ④ return updatedFeature                ← 接口响应返回
-         ↓
-         onFeatureUpdate 后台异步执行:
-         ├─ queueSDKPayloadRefresh(...)
-         ├─ refreshSDKPayloadCache(...).catch(...)
-         │   ├─ await promiseAllChunks(promises, 4)  ← 更新 SDK connection cache
-         │   └─ triggerWebhookJobs(...).catch(...)
-         │        ├── [异步] queueWebhooksByConnections()
-         │        │    └── Agenda: fireWebhooks → 串行 payload + 串行发送
-         │        │         最多重试 2 次: 30s → 5m → 放弃
-         │        │
-         │        ├── [异步] fireGlobalSdkWebhooks()
-         │        │    └── 串行 payload + 并行发送（不重试）
-         │        │
-         │        ├── [异步, 条件] queueProxyUpdate()
-         │        │    └── Agenda: proxyUpdate
-         │        │         最多重试 1 次: 5s → 放弃
-         │        │
-         │        ├── [异步] queueLegacySdkWebhooks()
-         │        │    └── Agenda: fireWebhook
-         │        │         最多重试 2 次: 30s → 5m → 放弃
-         │        │
-         │        └── [await] purgeCDNCache()  ← 仅在 triggerWebhookJobs 内等待
-         │
-         ├─ await logFeatureUpdatedEvent(...)
-         └─ await updateVercelExperimentationItemFromFeature(...)
+postFeatureSync (controllers/features.ts:2264)
+│
+├─ [await] getFeature(context, id)                         ← Mongo 读（:2281）
+│
+├─ [await, 条件] createRevision({...})                     ← Mongo 写（:2415）
+│
+├─ [await] updateFeature(context, feature, updates)        ← 核心写入（:2433）
+│    ├─ [await] runValidateFeatureHooks({...})               ← 企业版 hook（:991）
+│    │    └─ Cloud 跳过 / 自部署+premium: 查 hook + V8 sandbox 执行
+│    ├─ [await] FeatureModel.updateOne({...})                ← Mongo 写（:1028）
+│    ├─ [await, 条件] addLinkedFeatureToExperiment           ← Mongo 写（:1036）
+│    ├─ [await] FeatureModel.findOne({...})                  ← Mongo 读（:1045）
+│    ├─ [fire-and-forget] onFeatureUpdate(...).catch(...)    ← ★ 不阻塞（:1053）
+│    └─ return updatedFeature
+│
+├─ [await] req.audit({...}) → insertAudit({...})           ← Mongo 写（:2435）
+│
+└─ res.status(200).json({feature: updatedFeature})         ← 响应发送（:2446）
+     ↑
+     │  以上全部为同步阻塞操作，决定接口响应延迟
+     │  以下全部为后台异步，不阻塞接口
+     ↓
+     onFeatureUpdate 后台异步执行:
+     ├─ queueSDKPayloadRefresh(...)
+     │    └─ refreshSDKPayloadCache(...).catch(...)
+     │         ├─ [await] promiseAllChunks(promises, 4)     ← SDK connection cache 更新
+     │         └─ triggerWebhookJobs(...).catch(...)
+     │              ├── [异步] queueWebhooksByConnections()
+     │              │    └── Agenda: fireWebhooks → 串行 payload + 串行发送
+     │              │         最多重试 2 次: 30s → 5m → 放弃
+     │              │
+     │              ├── [异步] fireGlobalSdkWebhooks()
+     │              │    └── 串行 payload + 并行发送（不重试）
+     │              │
+     │              ├── [异步, 条件] queueProxyUpdate()
+     │              │    └── Agenda: proxyUpdate
+     │              │         最多重试 1 次: 5s → 放弃
+     │              │
+     │              ├── [异步] queueLegacySdkWebhooks()
+     │              │    └── Agenda: fireWebhook
+     │              │         最多重试 2 次: 30s → 5m → 放弃
+     │              │
+     │              └── [await] purgeCDNCache()              ← 仅在 triggerWebhookJobs 内等待
+     │
+     ├─ [await, 但外层不 await] logFeatureUpdatedEvent(...)  ← Event Webhook 入队
+     └─ [await, 但外层不 await] updateVercelExperimentationItemFromFeature(...)
 ```
 
 ### 7.2 Event Webhook 完整链路
@@ -649,41 +702,65 @@ await BluebirdPromise.each(payloads, ([key, payload]) =>
 
 `BluebirdPromise.reduce` 和 `BluebirdPromise.each` 都是串行迭代器，与 `Promise.all` 的并行语义不同。
 
-### 结论 5：Feature 更新接口的响应延迟由 Mongo 操作主导，purgeCDNCache 在后台异步执行
+### 结论 5：Feature 更新接口的响应延迟由同步阻塞路径中的操作决定，webhook/CDN 全部在后台异步执行
 
-**代码证据 — 完整异步调用链**：
+**完整同步阻塞路径代码证据**：
 
 ```typescript
-// 第 1 层：controllers/features.ts:2433 — 接口 await updateFeature
+// ===== 控制器层 =====
+
+// controllers/features.ts:2281 — [await] Mongo 读
+const feature = await getFeature(context, id);
+
+// controllers/features.ts:2415 — [await, 条件] Mongo 写
+const revision = await createRevision({...});
+
+// controllers/features.ts:2433 — [await] 核心写入
 const updatedFeature = await updateFeature(context, feature, updates);
 
-// 第 2 层：FeatureModel.ts:1053 — updateFeature 内部 fire-and-forget
+// controllers/features.ts:2435 — [await] Mongo 写（审计日志）
+await req.audit({event: "feature.update", ...});
+// → 内部调用 insertAudit({...})  (auth/index.ts:275)
+
+// controllers/features.ts:2446 — 响应发送
+res.status(200).json({status: 200, feature: updatedFeature});
+```
+
+```typescript
+// ===== updateFeature 内部 =====
+
+// FeatureModel.ts:991 — [await] 企业版 hook 验证
+await runValidateFeatureHooks({context, feature: projected, original: feature});
+// → Cloud 跳过 (sandbox-eval.ts:99); 自部署+premium 时: 查 hook + V8 sandbox 执行
+
+// FeatureModel.ts:1028 — [await] Mongo 写
+await FeatureModel.updateOne({organization: feature.organization, id: feature.id}, {$set: normalizedUpdates});
+
+// FeatureModel.ts:1036 — [await, 条件] Mongo 写
+if (experimentsAdded.size > 0) {
+  await Promise.all([...experimentsAdded].map(async (exp) => {
+    await addLinkedFeatureToExperiment(context, exp, feature.id);
+  }));
+}
+
+// FeatureModel.ts:1045 — [await] Mongo 读
+const persisted = await FeatureModel.findOne({organization: feature.organization, id: feature.id});
+
+// FeatureModel.ts:1053 — ★ fire-and-forget，不 await
 onFeatureUpdate(context, feature, updatedFeature).catch((e) => {
   logger.error(e, "Error refreshing SDK Payload on feature update");
 });
-// 紧接着 return updatedFeature —— 接口响应已发送
 
-// 第 3 层：services/features.ts:618 — queueSDKPayloadRefresh 内部 fire-and-forget
-refreshSDKPayloadCache({ ...data, stackTrace }).catch((e) => {
-  logger.error(e, "Error refreshing SDK Payload Cache");
-});
-
-// 第 4 层：services/features.ts:821 — refreshSDKPayloadCache 内部 fire-and-forget
-triggerWebhookJobs(context, payloadKeys, connectionsUpdated, true).catch(
-  (e) => {
-    logger.error(e, "Error triggering webhook jobs");
-  }
-);
-
-// 第 5 层：updateAllJobs.ts:57 — triggerWebhookJobs 内部 await purgeCDNCache
-await purgeCDNCache(context.org.id, surrogateKeys);
+// FeatureModel.ts:1057 — 返回
+return updatedFeature;
 ```
 
 **关键判定**：
-- 第 2 层的 `onFeatureUpdate(...).catch(...)` 没有 `await`，因此 `updateFeature` 函数会在 `onFeatureUpdate` 执行完之前就返回
-- 第 1 层的 `await updateFeature` 因此不等待 `onFeatureUpdate` 及其内部任何操作完成
-- 接口响应由 `return updatedFeature` 发送，此时 `purgeCDNCache` 和所有 webhook 投递都还在后台执行
-- Feature 更新接口的响应延迟由 `FeatureModel.updateOne()` 和 `FeatureModel.findOne()` 两个 Mongo 操作主导
+
+1. `updateFeature` 内部的 `onFeatureUpdate(...).catch(...)` 没有 `await`，因此 `updateFeature` 不等待它完成就 `return updatedFeature`
+2. 控制器在 `await updateFeature` 返回后，还执行了 `await req.audit(...)` 才发送响应——**审计日志写入也是阻塞操作**
+3. 接口响应延迟由同步阻塞路径中**所有**操作的耗时累加决定，包括：`getFeature` 读 → `createRevision` 写（条件）→ `runValidateFeatureHooks` → `FeatureModel.updateOne` 写 → `addLinkedFeatureToExperiment` 写（条件）→ `FeatureModel.findOne` 读 → `insertAudit` 写
+4. **CDN 清除、SDK connection cache 更新、全部 webhook 投递**都在 `onFeatureUpdate` 的后台异步链中执行，不阻塞接口响应
 
 ### 结论 6：熔断机制仅覆盖 3 条通道
 
