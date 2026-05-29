@@ -2,13 +2,15 @@
 
 ## 概述
 
-GrowthBook 代码库中存在 **三套独立的 Webhook 体系**，各自有不同的使用场景和实现方式：
+GrowthBook 代码库中存在 **四类投递通道**，各自有不同的重试策略、payload 获取方式和执行时序：
 
-| 体系 | 任务名 | 适用场景 | 核心文件 |
-|------|--------|----------|----------|
-| Legacy SDK Webhook | `fireWebhook` | 旧版 SDK 连接 webhook | `packages/back-end/src/jobs/webhooks.ts` |
-| SDK Webhook | `fireWebhooks` | 新版 SDK 连接 webhook | `packages/back-end/src/jobs/sdkWebhooks.ts` |
-| Event Webhook | `eventWebHook` | 系统事件通知 | `packages/back-end/src/events/handlers/webhooks/` |
+| 体系 | Agenda 任务名 | 适用场景 | 核心文件 | 重试上限 |
+|------|--------------|----------|----------|----------|
+| Legacy SDK Webhook | `fireWebhook` | 旧版 SDK 连接 | `jobs/webhooks.ts` | 3 次 |
+| SDK Webhook (新版) | `fireWebhooks` | 新版 SDK 连接 | `jobs/sdkWebhooks.ts` | 3 次 |
+| Event Webhook | `eventWebHook` | 系统事件通知 | `events/handlers/webhooks/EventWebHookNotifier.ts` | 3 次 |
+| Global SDK Webhook | *(无 Agenda)* | 环境变量全局配置 | `jobs/sdkWebhooks.ts:fireGlobalSdkWebhooks` | **0 次** |
+| Proxy Update | `proxyUpdate` | SDK 代理推送 | `jobs/proxyUpdate.ts` | 1 次 |
 
 ---
 
@@ -27,96 +29,335 @@ triggerWebhookJobs(context, payloadKeys, connectionsUpdated, true).catch(
 );
 ```
 
-### 1.2 统一入队分发器
+### 1.2 统一入队分发器 — triggerWebhookJobs
 
-`jobs/updateAllJobs.ts:17-58` 中的 `triggerWebhookJobs` 并行触发三个入队通道：
+`jobs/updateAllJobs.ts:17-58` 中 `triggerWebhookJobs` 的完整执行逻辑：
 
+```typescript
+export const triggerWebhookJobs = async (
+  context, payloadKeys, connections, isProxyEnabled, isFeature = true,
+) => {
+  // ① 异步入队，不等待完成
+  queueWebhooksByConnections(context, connections).catch(...);
+
+  // ② 同步发起（内部异步），不等待完成
+  fireGlobalSdkWebhooks(context, connections).catch(...);
+
+  // ③ 条件入队，不等待完成
+  if (isProxyEnabled) {
+    queueProxyUpdate(context, connections).catch(...);
+  }
+
+  // ④ 异步入队，不等待完成
+  queueLegacySdkWebhooks(context, payloadKeys, isFeature).catch(...);
+
+  // ⑤ 同步等待 CDN 缓存清除完成
+  await purgeCDNCache(context.org.id, surrogateKeys);
+};
 ```
-triggerWebhookJobs
-├─→ queueWebhooksByConnections()  # 新版 SDK webhooks
-├─→ fireGlobalSdkWebhooks()       # 全局配置 webhooks
-└─→ queueLegacySdkWebhooks()      # 旧版 SDK webhooks
-```
+
+**时序关键点**：步骤 ①-④ 全部是 fire-and-forget（`.catch()` 吞掉错误），不阻塞后续步骤；只有步骤 ⑤ `purgeCDNCache` 使用 `await` 同步等待。因此 **webhook 入队/投递与 CDN 清除之间是并行关系**，CDN 清除不会等 webhook 完成，webhook 也不会等 CDN。
 
 ### 1.3 新版 SDK Webhook 入队 (`sdkWebhooks.ts:114-125`)
 
 ```typescript
-export async function queueWebhooksByConnections(
-  context: ReqContext | ApiReqContext,
-  connections: SDKConnectionInterface[],
-) {
+export async function queueWebhooksByConnections(context, connections) {
   const sdkKeys = connections.map((c) => c.id);
   const webhooks =
-    await context.models.sdkWebhooks.findAllSdkWebhooksByConnectionIds(sdkKeys);
+    await context.models.sdkWebhooks.findAllSdkWebhookByConnectionIds(sdkKeys);
   for (const webhook of webhooks) {
     if (webhook && !webhook.disabled) await queueSingleSdkWebhookJob(webhook);
   }
 }
 ```
 
-入队时的关键约束：
-```typescript
-// sdkWebhooks.ts:104-112
-const job = agenda.create(SDK_WEBHOOKS_JOB_NAME, {
-  webhookId: webhook.id,
-  retryCount: 0,
-});
-job.unique({ "data.webhookId": webhook.id });  // 防重复
-job.schedule(new Date());                      // 立即执行
-await job.save();
-```
+入队时使用 `job.unique({ "data.webhookId": webhook.id })` 防止同一 webhook 重复入队。
 
 ### 1.4 旧版 SDK Webhook 入队 (`webhooks.ts:139-180`)
 
-过滤逻辑：根据 `payloadKeys` 匹配 webhook 的 `project` 和 `environment`
+过滤逻辑：根据 `payloadKeys` 匹配 webhook 的 `project` 和 `environment`，额外跳过 `featuresOnly` 但非 feature 事件、以及 `disabled` 状态的 webhook。
+
+### 1.5 Global SDK Webhook — 无 Agenda 入队
+
+`fireGlobalSdkWebhooks` (`sdkWebhooks.ts:356-421`) **不走 Agenda 队列**，而是直接在当前事件循环中发起 HTTP 请求：
 
 ```typescript
-if (!payloadKeys.some(
-  (key) =>
-    key.project === (webhook.project || "") &&
-    key.environment === (webhook.environment || "production"),
-)) {
-  continue;  // 跳过不相关的 webhook
+for (const connection of connections) {
+  const payload = await getFeatureDefinitionsWithCache({context, params: connection});
+  WEBHOOKS.forEach((webhook) => {
+    runWebhookFetch({...}).catch((e) => {
+      logger.error(e, "Failed to fire global webhook");
+    });
+  });
 }
-
-// 额外过滤：featuresOnly 标记、disabled 状态
-if (!isFeature && webhook.featuresOnly) continue;
-if (webhook.disabled) continue;
 ```
 
-### 1.5 Event Webhook 入队链
+每个 connection 的 payload 获取是串行的（`for...of` + `await`），但对每个 WEBHOOK 的 `runWebhookFetch` 调用是并行的（`forEach` + 不 `await`）。
+
+### 1.6 Event Webhook 入队链
 
 Event Webhook 走独立的事件系统：
 
 ```
-EventModel.create(...) 
+EventModel.create(...)
   → EventNotifier(eventId).perform()
     → Agenda job: "eventCreated"
       → webHooksEventHandler(event)
-        → getAllEventWebHooksForEvent(...)  # 按事件名查找 webhook
+        → getAllEventWebHooksForEvent(...)
         → EventWebHookNotifier.enqueue()
           → Agenda job: "eventWebHook"
 ```
 
-`EventNotifier` 实现 (`events/notifiers/EventNotifier.ts:59-66`):
+### 1.7 Proxy Update 入队 (`proxyUpdate.ts:167-183`)
+
 ```typescript
-async perform() {
-  const job = this.agenda.create<EventNotificationData>("eventCreated", {
-    eventId: this.eventId,
-  });
-  job.unique({ "data.eventId": this.eventId });
-  job.schedule(new Date());
+export async function queueProxyUpdate(context, connections) {
+  for (const connection of connections) {
+    if (IS_CLOUD) {
+      await queueSingleProxyUpdate(context.org.id, connection, true);
+    }
+    await queueSingleProxyUpdate(context.org.id, connection, false);
+  }
+}
+```
+
+每个 connection 可能入队两个 job（cloud proxy + self-hosted proxy），入队间串行。
+
+---
+
+## 二、重试机制差异详解（核心纠正点）
+
+### 2.1 重试策略对比总表
+
+| 体系 | 最大重试次数 | 第 1 次重试延迟 | 第 2 次重试延迟 | 第 3 次重试延迟 | 重试触发方式 |
+|------|-------------|----------------|----------------|----------------|-------------|
+| Legacy SDK Webhook | **2 次** | 30s | 5m | — | Agenda `fail` 事件 |
+| SDK Webhook (新版) | **2 次** | 30s | 5m | — | Agenda `fail` 事件 |
+| Event Webhook | **3 次** | 30s | 5m | 5m | 显式 `retryJob()` 调用 |
+| Global SDK Webhook | **0 次** | — | — | — | 无重试 |
+| Proxy Update | **1 次** | 5s | — | — | Agenda `fail` 事件 |
+
+### 2.2 逐行比对：Legacy SDK / 新版 SDK Webhook — 实际只有 2 次重试
+
+两套代码的重试逻辑完全一致（`webhooks.ts:110-136` / `sdkWebhooks.ts:75-101`）：
+
+```typescript
+agenda.on("fail:" + JOB_NAME, async (error, job) => {
+  const retryCount = job.attrs.data.retryCount;
+  let nextRunAt = Date.now();
+
+  if (retryCount === 0) {          // 首次失败 → 等待 30s
+    nextRunAt += 30000;
+  } else if (retryCount === 1) {   // 第 2 次失败 → 等待 5m
+    nextRunAt += 300000;
+  } else {                          // retryCount >= 2 → 放弃
+    return;
+  }
+
+  job.attrs.data.retryCount++;
+  job.attrs.nextRunAt = new Date(nextRunAt);
+  await job.save();
+});
+```
+
+**执行追踪**：
+- 首次执行（`retryCount=0`）失败 → `retryCount` 变为 1，安排 30s 后重试 → **第 1 次重试**
+- 第 1 次重试（`retryCount=1`）失败 → `retryCount` 变为 2，安排 5m 后重试 → **第 2 次重试**
+- 第 2 次重试（`retryCount=2`）失败 → 进入 `else` 分支，直接 `return` → **不再重试**
+
+因此 **Legacy 和新版 SDK Webhook 最多重试 2 次**，总执行次数 = 1（首次）+ 2（重试）= 3 次。
+
+### 2.3 逐行比对：Event Webhook — 实际有 3 次重试
+
+`EventWebHookNotifier.ts:371-389`：
+
+```typescript
+private static async retryJob(job) {
+  if (job.attrs.data.retryCount >= 3) {
+    return;                         // retryCount >= 3 → 放弃
+  }
+
+  let nextRunAt = Date.now();
+  if (job.attrs.data.retryCount === 0) {
+    nextRunAt += 30000;             // 首次失败 → 30s
+  } else {
+    nextRunAt += 300000;            // 其他 → 5m
+  }
+
+  job.attrs.data.retryCount++;
+  job.attrs.nextRunAt = new Date(nextRunAt);
   await job.save();
 }
 ```
 
+**执行追踪**：
+- 首次执行（`retryCount=0`）失败 → `retryCount` 变为 1，安排 30s → **第 1 次重试**
+- 第 1 次重试（`retryCount=1`）失败 → `retryCount` 变为 2，安排 5m → **第 2 次重试**
+- 第 2 次重试（`retryCount=2`）失败 → `retryCount` 变为 3，安排 5m → **第 3 次重试**
+- 第 3 次重试（`retryCount=3`）失败 → `>= 3`，不再重试
+
+因此 **Event Webhook 最多重试 3 次**，总执行次数 = 1（首次）+ 3（重试）= 4 次。
+
+**注意**：Event Webhook 的重试不是通过 Agenda `fail` 事件触发的。`handleWebHookError` 在记录日志后显式调用 `retryJob()`，且 `sendDataToWebHook` 在失败时返回 `{ result: "error" }` 而非 `throw`，所以 Agenda 不会自动触发 `fail` 事件——重试完全由业务代码控制。
+
+### 2.4 Global SDK Webhook — 无重试
+
+`fireGlobalSdkWebhooks` 中对 `runWebhookFetch` 的调用：
+
+```typescript
+runWebhookFetch({...}).catch((e) => {
+  logger.error(e, "Failed to fire global webhook");
+});
+```
+
+没有 Agenda job 包裹，没有 retryCount，没有 fail 事件监听。失败仅记日志，**不重试**。
+
+### 2.5 Proxy Update — 仅 1 次重试
+
+`proxyUpdate.ts:122-143`：
+
+```typescript
+agenda.on("fail:" + PROXY_UPDATE_JOB_NAME, async (error, job) => {
+  const retryCount = job.attrs.data.retryCount;
+  let nextRunAt = Date.now();
+
+  if (retryCount === 0) {
+    nextRunAt += 5000;    // 首次失败 → 5s
+  } else {
+    return;               // 放弃
+  }
+
+  job.attrs.data.retryCount++;
+  job.attrs.nextRunAt = new Date(nextRunAt);
+  await job.save();
+});
+```
+
+**最多重试 1 次**，延迟仅 5 秒（远短于 webhook 的 30s），超时也只有 5 秒。
+
 ---
 
-## 二、签名生成机制
+## 三、SDK Payload 获取与发送的串并行关系
 
-### 2.1 新版 SDK Webhook 双重签名 (`sdkWebhooks.ts:156-230`)
+### 3.1 新版 SDK Webhook (`sdkWebhooks.ts:308-354`)
 
-**签名 1 - `webhook-secret`** (兼容旧版):
+```
+fireSdkWebhook(context, webhook)
+│
+├─① findSDKConnectionsByIds(webhook.sdks)       ← 查询关联的 SDK 连接
+│
+├─② BluebirdPromise.reduce(connections, ...)     ← 串行获取每个 connection 的 payload
+│     connection[0] → getFeatureDefinitionsWithCache() → [key0, payload0]
+│     connection[1] → getFeatureDefinitionsWithCache() → [key1, payload1]
+│     ...
+│
+└─③ BluebirdPromise.each(payloads, ...)          ← 串行发送每个 payload
+      runWebhookFetch({key0, payload0}) → HTTP POST
+      runWebhookFetch({key1, payload1}) → HTTP POST
+      ...
+```
+
+**关键**：payload 获取（步骤②）使用 `BluebirdPromise.reduce`，**串行**逐个获取；payload 发送（步骤③）使用 `BluebirdPromise.each`，也是**串行**逐个发送。两者均为串行的原因：避免同时大量调用 `getFeatureDefinitionsWithCache` 和 `cancellableFetch` 导致后端/Mongo 过载。
+
+**一个 webhook 对应多个 SDK 连接时**，会为每个连接独立获取 payload 并独立发送 HTTP 请求，但彼此串行。
+
+### 3.2 旧版 SDK Webhook (`webhooks.ts:25-108`)
+
+```
+fireWebhook(job)
+│
+├─① getFeatureDefinitionsWithCache()    ← 单次获取，使用合成的 cache key
+├─② getExperimentOverrides()            ← 条件获取（仅非 featuresOnly）
+│
+└─③ cancellableFetch()                  ← 单次发送
+```
+
+旧版只获取一个 payload、发送一次请求，无串并行问题。
+
+### 3.3 Global SDK Webhook (`sdkWebhooks.ts:356-421`)
+
+```
+fireGlobalSdkWebhooks(context, connections)
+│
+└─ for (connection of connections) {          ← 外层：串行遍历 connection
+     │
+     ├─① await getFeatureDefinitionsWithCache()   ← 串行获取 payload
+     │
+     └─② WEBHOOKS.forEach(webhook => {            ← 内层：并行触发所有全局 webhook
+          runWebhookFetch({...}).catch(...)             ← 不 await，并行执行
+        })
+   }
+```
+
+**混合模式**：connection 之间串行获取 payload；但对同一个 connection 的多个全局 webhook，发送请求是并行的（`forEach` 不 `await`）。
+
+### 3.4 Event Webhook (`EventWebHookNotifier.ts`)
+
+每个 EventWebHook 只发送一次请求，payload 在 job handler 内按 `payloadType` 就地构建，无串并行问题。
+
+### 3.5 Proxy Update (`proxyUpdate.ts`)
+
+单个 connection 只获取一个 payload 并发送一次，无串并行问题。
+
+### 3.6 串并行关系总结
+
+| 体系 | Payload 获取 | HTTP 发送 | 说明 |
+|------|-------------|----------|------|
+| 新版 SDK Webhook | **串行** (reduce) | **串行** (each) | 每个连接独立 payload+请求 |
+| 旧版 SDK Webhook | 单次 | 单次 | 一个 webhook 一个 payload |
+| Global SDK Webhook | **串行** (for…of) | **并行** (forEach) | 同一 payload 发 N 个全局 webhook |
+| Event Webhook | 就地构建 | 单次 | — |
+| Proxy Update | 单次 | 单次 | — |
+
+---
+
+## 四、triggerWebhookJobs 的完整执行时序
+
+### 4.1 时序图
+
+```
+triggerWebhookJobs() 被调用
+│
+├─ [fire-and-forget] queueWebhooksByConnections()
+│    └─→ 串行遍历 webhooks，逐个 agenda.create("fireWebhooks").save()
+│         （仅入队，实际执行由 Agenda 调度）
+│
+├─ [fire-and-forget] fireGlobalSdkWebhooks()
+│    └─→ 串行获取 payload，并行 runWebhookFetch()（立即发起 HTTP 请求）
+│         （不经过 Agenda，在当前事件循环中直接执行）
+│
+├─ [fire-and-forget] queueProxyUpdate()          ← 仅当 isProxyEnabled
+│    └─→ 串行遍历 connections，逐个 agenda.create("proxyUpdate").save()
+│         （仅入队，实际执行由 Agenda 调度）
+│
+├─ [fire-and-forget] queueLegacySdkWebhooks()
+│    └─→ 串行遍历 webhooks，逐个 agenda.create("fireWebhook").save()
+│         （仅入队，实际执行由 Agenda 调度）
+│
+└─ [await] purgeCDNCache()                       ← 唯一同步等待
+     └─→ 向 Fastly API 发 POST 清除 surrogate keys
+          （批量处理，每批最多 256 个 key）
+```
+
+### 4.2 时序关键结论
+
+1. **webhook 入队与 CDN 清除并行**：步骤 ①-④ 全部 fire-and-forget，`purgeCDNCache` 不等它们完成就开始执行，反之亦然。
+
+2. **Global Webhook 是唯一同步投递**：`fireGlobalSdkWebhooks` 不走 Agenda，在 `triggerWebhookJobs` 的调用栈内直接发起 HTTP 请求。但由于外层 `triggerWebhookJobs` 本身被 `.catch()` 调用（fire-and-forget），所以它也不会阻塞 Feature 更新的主流程。
+
+3. **Proxy Update 的条件性**：只有 `isProxyEnabled=true` 时才入队 proxy 更新。Cloud 用户还会额外入队一个 cloud proxy 更新 job。
+
+4. **CDN 清除的幂等性**：`purgeCDNCache` 内部按 256 个 key 一批调用 Fastly API，失败仅记日志不抛出异常，不会影响整个 `triggerWebhookJobs` 的完成。
+
+5. **入队顺序无保证**：四个入队/投递操作虽然代码上是顺序执行，但各自是异步的。Agenda job 的实际执行顺序取决于 Agenda 调度器的并发度和队列状态。
+
+---
+
+## 五、签名生成机制
+
+### 5.1 新版 SDK Webhook 双重签名 (`sdkWebhooks.ts:156-230`)
+
+**签名 1 - `webhook-secret`**：
 ```typescript
 const signature = createHmac("sha256", signingKey)
   .update(sendPayload ? jsonPayload : "")
@@ -124,7 +365,7 @@ const signature = createHmac("sha256", signingKey)
 const secret = `whsec_${signature}`;
 ```
 
-**签名 2 - `webhook-signature`** (新版标准):
+**签名 2 - `webhook-signature`**（Svix 兼容格式）：
 ```typescript
 const standardSignatureBody = `${webhookID}.${timestamp}.${body || ""}`;
 const standardSignature =
@@ -134,7 +375,7 @@ const standardSignature =
     .digest("base64");
 ```
 
-**请求头**:
+请求头：
 ```
 webhook-id: msg_xxx
 webhook-timestamp: 1620000000
@@ -143,241 +384,132 @@ webhook-secret: whsec_xyz789...
 webhook-sdk-key: sdk-abc123
 ```
 
-### 2.2 旧版 SDK Webhook 单一签名 (`webhooks.ts:78-80`)
+### 5.2 旧版 SDK Webhook 单一签名 (`webhooks.ts:78-80`)
 
 ```typescript
 const signature = createHmac("sha256", webhook.signingKey)
-  .update(payload)
-  .digest("hex");
+  .update(payload).digest("hex");
 ```
 
-**请求头**:
-```
-X-GrowthBook-Signature: abc123...
-Content-Type: application/json
-```
+请求头：`X-GrowthBook-Signature`
 
-### 2.3 Event Webhook 签名 (`event-webhooks-utils.ts:39-49`)
+### 5.3 Event Webhook 签名 (`event-webhooks-utils.ts:39-49`)
 
 ```typescript
-export const getEventWebHookSignatureForPayload = <T>({
-  signingKey,
-  payload,
-}: {
-  signingKey: string;
-  payload: T;
-}): string => {
-  const requestPayload = JSON.stringify(payload);
-  return createHmac("sha256", signingKey).update(requestPayload).digest("hex");
-};
+const requestPayload = JSON.stringify(payload);
+return createHmac("sha256", signingKey).update(requestPayload).digest("hex");
 ```
+
+请求头：`X-GrowthBook-Signature`
+
+### 5.4 Proxy Update 签名 (`proxyUpdate.ts:92-94`)
+
+```typescript
+const signature = createHmac("sha256", connection.proxy.signingKey)
+  .update(payload).digest("hex");
+```
+
+请求头：`X-GrowthBook-Signature` + `X-GrowthBook-Api-Key`
 
 ---
 
-## 三、核心投递逻辑
+## 六、失败回退与熔断机制
 
-### 3.1 新版 SDK Webhook 投递 (`sdkWebhooks.ts:308-354`)
+### 6.1 连续失败熔断 (`WebhookModel.ts:109-131`)
 
-```
-fireSdkWebhook(context, webhook)
-  ├─→ findSDKConnectionsByIds(webhook.sdks)
-  ├─→ 并行获取所有 SDK connections 的 payload
-  │    └─→ getFeatureDefinitionsWithCache(connection)
-  └─→ 逐个调用 runWebhookFetch()
-       ├─→ 生成双重签名
-       ├─→ 按 payloadFormat 构建 body
-       ├─→ cancellableFetch() 发送请求
-       ├─→ 成功: createSdkWebhookLog(成功) + 重置错误状态
-       └─→ 失败: createSdkWebhookLog(失败) + 记录错误 + throw
-```
-
-**Payload Format 支持**:
-- `standard`: 标准格式 `{ type, timestamp, data: { payload } }`
-- `sdkPayload`: 原始 SDK payload
-- `edgeConfig`: Vercel Edge Config 格式
-- `edgeConfigUnescaped`: 非转义的 Edge Config 格式
-- `vercelNativeIntegration`: Vercel 原生集成格式
-- `standard-no-payload`: 不含 payload 的标准格式
-- `none`: 不发送 body
-
-### 3.2 旧版 SDK Webhook 投递 (`webhooks.ts:25-108`)
-
-```
-fireWebhook(job)
-  ├─→ 构建 legacy cache key
-  ├─→ getFeatureDefinitionsWithCache()
-  ├─→ 构建 payload: { timestamp, features, dateUpdated, overrides?, experiments? }
-  ├─→ 生成签名
-  ├─→ cancellableFetch()
-  ├─→ 成功: setLastSdkWebhookError(webhook, "")
-  └─→ 失败: setLastSdkWebhookError(webhook, error) + throw
-```
-
-### 3.3 Event Webhook 投递 (`EventWebHookNotifier.ts:211-277`)
-
-```
-sendDataToWebHook()
-  ├─→ getEventWebHookSignatureForPayload()
-  ├─→ 应用 SecretsReplacer (替换 URL 和 headers 中的密钥占位符)
-  ├─→ cancellableFetch()
-  ├─→ 成功: 返回 { result: "success", ... }
-  └─→ 失败: 返回 { result: "error", ... }
-```
-
----
-
-## 四、失败重试机制
-
-### 4.1 重试策略（三类 Webhook 共用相同策略）
-
-| 重试次数 | 等待时间 |
-|----------|----------|
-| 第 1 次失败 | 30 秒 |
-| 第 2 次失败 | 5 分钟 |
-| 第 3 次失败 | 放弃 |
-
-### 4.2 新版/旧版 SDK Webhook 重试实现
-
-通过 Agenda 的 `fail` 事件监听实现 (`sdkWebhooks.ts:75-101` / `webhooks.ts:110-136`):
-
-```typescript
-agenda.on(
-  "fail:" + JOB_NAME,
-  async (error: Error, job: WebhookJob) => {
-    const retryCount = job.attrs.data.retryCount;
-    let nextRunAt = Date.now();
-    
-    if (retryCount === 0) {
-      nextRunAt += 30000;      // 30秒
-    } else if (retryCount === 1) {
-      nextRunAt += 300000;     // 5分钟
-    } else {
-      return;  // 第3次失败，放弃
-    }
-
-    job.attrs.data.retryCount++;
-    job.attrs.nextRunAt = new Date(nextRunAt);
-    await job.save();
-  }
-);
-```
-
-### 4.3 Event Webhook 重试实现 (`EventWebHookNotifier.ts:371-389`)
-
-显式调用 `retryJob()` 方法：
-
-```typescript
-private static async retryJob(job: Job<EventWebHookJobData>) {
-  if (job.attrs.data.retryCount >= 3) return;  // 最多3次
-
-  let nextRunAt = Date.now();
-  if (job.attrs.data.retryCount === 0) {
-    nextRunAt += 30000;      // 30秒
-  } else {
-    nextRunAt += 300000;     // 第2、3次都是5分钟
-  }
-
-  job.attrs.data.retryCount++;
-  job.attrs.nextRunAt = new Date(nextRunAt);
-  await job.save();
-}
-```
-
----
-
-## 五、失败回退与熔断机制
-
-### 5.1 连续失败熔断 (`WebhookModel.ts:109-131`)
-
-阈值常量 (`shared/constants.ts:261`):
+阈值常量 (`shared/constants.ts:261`)：
 ```typescript
 export const WEBHOOK_CONSECUTIVE_FAILURES_THRESHOLD = 10;
 ```
 
-熔断逻辑 (`WebhookModel.ts:113-122`):
+熔断逻辑：
+- 每次投递失败：`consecutiveFailures++`，当达到 10 时设置 `disabled = true`
+- 一旦成功：**全部重置**（`error=""`, `lastSuccess=now`, `consecutiveFailures=0`, `disabled=false`）
+
+**注意**：熔断仅影响 SDK Webhook（新版和旧版），Global Webhook 和 Event Webhook 不受此机制约束。
+
+### 6.2 Proxy Update 的熔断 (`proxyUpdate.ts:66-71`)
+
+Proxy Update 也使用相同的 `WEBHOOK_CONSECUTIVE_FAILURES_THRESHOLD = 10` 阈值，但检查位置在 job handler 开头：
+
 ```typescript
-public async setLastSdkWebhookError(
-  webhook: WebhookInterface,
-  error: string,
-) {
-  if (error) {
-    const consecutiveFailures = (webhook.consecutiveFailures || 0) + 1;
-    const updates: UpdateProps<WebhookInterface> = {
-      error,
-      consecutiveFailures,
-    };
-    // 连续失败 10 次自动禁用
-    if (consecutiveFailures >= WEBHOOK_CONSECUTIVE_FAILURES_THRESHOLD) {
-      updates.disabled = true;
-    }
-    await this.update(webhook, updates);
-  } else {
-    // 成功时重置所有状态
-    await this.update(webhook, {
-      error: "",
-      lastSuccess: new Date(),
-      consecutiveFailures: 0,
-      disabled: false,
-    });
-  }
+if ((connection.proxy.consecutiveFailures || 0) >= WEBHOOK_CONSECUTIVE_FAILURES_THRESHOLD) {
+  return;  // 连续失败 10 次，跳过执行
 }
 ```
 
-### 5.2 投递日志记录
+### 6.3 投递日志记录
 
-**SDK Webhook 日志** (`SdkWebhookLogModel`):
-```typescript
-interface SdkWebHookLogInterface {
-  id: string;
-  webhookId: string;
-  webhookRequestId?: string;
-  organizationId: string;
-  dateCreated: Date;
-  responseCode: number | null;
-  responseBody: string | null;
-  result: "error" | "success";
-  payload: Record<string, unknown>;
-}
-```
+**SDK Webhook 日志** (`SdkWebHookLogInterface`)：每次投递成功/失败都写入 `webhook-logs` 集合。
 
-**Event Webhook 日志** (`EventWebHookLogModel`):
-每次投递（无论成功失败）都会创建日志记录，包含 payload、响应状态码、响应体等完整信息。
+**Event Webhook 日志** (`EventWebHookLogModel`)：`handleWebHookSuccess` 和 `handleWebHookError` 各自调用 `createEventWebHookLog`，保证每次投递均有记录。
+
+**Global Webhook 日志**：`runWebhookFetch` 内部也调用 `createSdkWebhookLog`，但因 `global=true` 不会调用 `setLastSdkWebhookError`，所以不影响熔断计数。
 
 ---
 
-## 六、完整调用链路图
+## 七、完整调用链路图
 
-### 6.1 SDK Webhook 完整链路
+### 7.1 triggerWebhookJobs 全局时序
 
 ```
 Feature 变更
     ↓
 services/features.ts: updateFeatures()
     ↓
-triggerWebhookJobs(context, payloadKeys, connections)
-    ├─→ queueWebhooksByConnections()
-    │    └─→ Agenda: fireWebhooks { webhookId, retryCount: 0 }
-    │          ↓
-    │        fireWebhooks(job)
-    │          ├─→ getFeatureDefinitionsWithCache()
-    │          ├─→ 生成双重签名
-    │          ├─→ runWebhookFetch() → HTTP POST
-    │          ├─→ 成功: 重置错误状态 + 记录日志
-    │          └─→ 失败: 记录错误 + throw → 触发 fail 事件 → 重试
+triggerWebhookJobs(context, payloadKeys, connections, isProxyEnabled, isFeature)
     │
-    ├─→ fireGlobalSdkWebhooks()  # 直接执行，无重试
+    ├── [异步] queueWebhooksByConnections()
+    │    └── for each webhook:
+    │         agenda.create("fireWebhooks", {webhookId, retryCount:0}).save()
+    │              ↓ (Agenda 调度，异步执行)
+    │            fireWebhooks(job)
+    │              ├── findSDKConnectionsByIds()
+    │              ├── BluebirdPromise.reduce → 串行获取 payload
+    │              ├── BluebirdPromise.each → 串行 runWebhookFetch()
+    │              │    ├── 成功 → setLastSdkWebhookError("") + createSdkWebhookLog
+    │              │    └── 失败 → setLastSdkWebhookError(msg) + createSdkWebhookLog + throw
+    │              │              ↓ (Agenda fail 事件)
+    │              │            最多重试 2 次: 30s → 5m → 放弃
     │
-    └─→ queueLegacySdkWebhooks()
-         └─→ Agenda: fireWebhook { webhookId, retryCount: 0 }
-               ↓
-             fireWebhook(job)
-               ├─→ 生成单一签名
-               ├─→ cancellableFetch()
-               ├─→ 成功: 重置错误状态
-               └─→ 失败: 记录错误 + throw → 触发 fail 事件 → 重试
+    ├── [异步] fireGlobalSdkWebhooks()
+    │    └── for each connection (串行):
+    │         ├── await getFeatureDefinitionsWithCache()
+    │         └── WEBHOOKS.forEach → 并行 runWebhookFetch()
+    │              ├── 成功 → createSdkWebhookLog (global=true, 不影响熔断)
+    │              └── 失败 → createSdkWebhookLog + logger.error (不重试)
+    │
+    ├── [异步, 条件] queueProxyUpdate()
+    │    └── for each connection:
+    │         agenda.create("proxyUpdate", {orgId, connectionId, retryCount:0}).save()
+    │              ↓ (Agenda 调度，异步执行)
+    │            proxyUpdate(job)
+    │              ├── 检查 consecutiveFailures >= 10 → 跳过
+    │              ├── getFeatureDefinitionsWithCache()
+    │              ├── fireProxyWebhook() → HTTP POST (5s 超时)
+    │              ├── 成功 → clearProxyError()
+    │              └── 失败 → setProxyError() + throw
+    │                        ↓ (Agenda fail 事件)
+    │                      最多重试 1 次: 5s → 放弃
+    │
+    ├── [异步] queueLegacySdkWebhooks()
+    │    └── for each webhook (过滤 project/env/featuresOnly/disabled):
+    │         agenda.create("fireWebhook", {webhookId, retryCount:0}).save()
+    │              ↓ (Agenda 调度，异步执行)
+    │            fireWebhook(job)
+    │              ├── getFeatureDefinitionsWithCache()
+    │              ├── 条件: getExperimentOverrides()
+    │              ├── cancellableFetch() → HTTP POST
+    │              ├── 成功 → setLastSdkWebhookError("")
+    │              └── 失败 → setLastSdkWebhookError(error) + throw
+    │                        ↓ (Agenda fail 事件)
+    │                      最多重试 2 次: 30s → 5m → 放弃
+    │
+    └── [同步等待] purgeCDNCache()
+         └── 向 Fastly POST /purge (按 surrogate key 批量, 每批 ≤256)
 ```
 
-### 6.2 Event Webhook 完整链路
+### 7.2 Event Webhook 完整链路
 
 ```
 领域事件发生 (如 feature.created)
@@ -389,36 +521,47 @@ new EventNotifier(eventId).perform()
 Agenda: eventCreated { eventId }
     ↓
 EventNotifier.jobHandler()
-    ├─→ webHooksEventHandler(event)
-    │    ├─→ getAllEventWebHooksForEvent(eventName)
-    │    └─→ 为每个 webhook 创建 EventWebHookNotifier.enqueue()
-    │          ↓
-    │        Agenda: eventWebHook { eventId, eventWebHookId, retryCount: 0 }
-    │          ↓
-    │        EventWebHookNotifier.handleAgendaJob()
-    │          ├─→ 按 payloadType 构建 payload (json/raw/slack/discord)
-    │          ├─→ 生成签名
-    │          ├─→ sendDataToWebHook() → HTTP POST
-    │          ├─→ 成功: 更新状态 + 记录日志
-    │          └─→ 失败: 更新状态 + 记录日志 + retryJob()
+    ├── webHooksEventHandler(event)
+    │    ├── getAllEventWebHooksForEvent({eventName, enabled:true, tags, projects})
+    │    │    └── filterEventForEnvironments() 环境过滤
+    │    └── for each eventWebHook:
+    │         new EventWebHookNotifier({eventId, eventWebHookId}).enqueue()
+    │              ↓
+    │         Agenda: eventWebHook { eventId, eventWebHookId, retryCount: 0 }
+    │              ↓
+    │         EventWebHookNotifier.handleAgendaJob()
+    │              ├── getEvent() + getEventWebHookById() + findOrganizationById()
+    │              ├── 按 payloadType 构建 payload (json/raw/slack/discord)
+    │              ├── getBackEndSecretsReplacer() → 替换 URL/headers 密钥
+    │              ├── sendDataToWebHook()
+    │              │    ├── getEventWebHookSignatureForPayload()
+    │              │    ├── cancellableFetch() → HTTP POST (30s 超时)
+    │              │    ├── 成功 → { result: "success" }
+    │              │    └── 失败 → { result: "error" } (不 throw)
+    │              ├── 成功 → handleWebHookSuccess()
+    │              │    ├── updateEventWebHookStatus({state:"success"})
+    │              │    └── createEventWebHookLog()
+    │              └── 失败 → handleWebHookError()
+    │                   ├── updateEventWebHookStatus({state:"error"})
+    │                   ├── createEventWebHookLog()
+    │                   └── retryJob()
+    │                        最多重试 3 次: 30s → 5m → 5m → 放弃
     │
-    └─→ slackEventHandler(event)  # 并行的 Slack 通知
+    └── slackEventHandler(event)  ← 并行 Slack 通知
 ```
 
 ---
 
-## 七、关键设计要点
+## 八、关键设计要点
 
-1. **防重复入队**: 所有 Agenda job 都使用 `job.unique()` 确保同一 webhook 同一事件不会重复入队
+1. **重试次数存在实质性差异**：Legacy/新版 SDK 最多重试 **2 次**（总执行 3 次），Event Webhook 最多重试 **3 次**（总执行 4 次），Proxy 最多重试 **1 次**（总执行 2 次），Global 无重试。上一版分析将它们统一表述为"3 次"是不准确的。
 
-2. **超时控制**: 使用 `cancellableFetch()` 设置 30 秒超时和 1000 字节最大响应大小
+2. **重试触发机制不同**：SDK/Legacy/Proxy 通过 Agenda `fail` 事件隐式触发；Event Webhook 通过业务代码显式调用 `retryJob()` 触发（因为 `sendDataToWebHook` 失败时返回 result 而非 throw，不会自动触发 `fail` 事件）。
 
-3. **并行但隔离**: 不同 webhook 体系完全独立，互不影响
+3. **Payload 获取与发送均为串行**：新版 SDK Webhook 使用 `BluebirdPromise.reduce` + `BluebirdPromise.each`，确保同一个 webhook 的多个 connection 串行获取、串行发送，避免后端过载。Global Webhook 则在 connection 间串行获取、跨 webhook 并行发送。
 
-4. **幂等性设计**: 
-   - `webhook-id` 用于接收方去重
-   - `webhook-timestamp` 用于防止重放攻击
+4. **triggerWebhookJobs 中 CDN 清除是唯一同步等待点**：四类 webhook/proxy 入队都是 fire-and-forget，只有 `purgeCDNCache` 使用 `await`。这意味着 Feature 更新 API 的响应延迟主要由 CDN 清除决定，而非 webhook 投递。
 
-5. **渐进式重试**: 指数退避策略（30秒 → 5分钟 → 放弃）避免轰炸接收方
+5. **Global Webhook 既不入队也不重试**：它在 `triggerWebhookJobs` 调用栈内直接发起 HTTP 请求，失败仅记日志，不触发熔断计数，也不影响其他 webhook 通道。
 
-6. **熔断保护**: 连续 10 次失败自动禁用，避免无效资源消耗
+6. **熔断仅覆盖部分通道**：`consecutiveFailures` / `disabled` 机制仅作用于新版和旧版 SDK Webhook（通过 `setLastSdkWebhookError`）以及 Proxy Update（通过 `setProxyError`）。Event Webhook 使用独立的 `updateEventWebHookStatus`，Global Webhook 完全无状态追踪。
