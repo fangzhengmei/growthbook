@@ -18,18 +18,50 @@ GrowthBook 代码库中存在 **5 条投递通道**，各自有不同的重试�
 
 ## 一、事件入队流程
 
-### 1.1 触发源
+### 1.1 触发源与完整异步调用链
 
-Feature 变更时，`services/features.ts:821` 作为统一触发点：
+Feature 变更时，完整调用链是 **5 层 fire-and-forget** 的后台任务链，**每一层都不阻塞上层**：
+
+```
+Express 路由处理器
+    ↓
+controllers/features.ts:2433  await updateFeature(...)
+    ↓
+models/FeatureModel.ts:1053  onFeatureUpdate(...).catch(logger.error)  ← 第 1 层 fire-and-forget
+    ↓
+models/FeatureModel.ts:927  queueSDKPayloadRefresh(...)  ← 同步函数，立即返回
+    ↓
+services/features.ts:618  refreshSDKPayloadCache(...).catch(logger.error)  ← 第 2 层 fire-and-forget
+    ↓
+services/features.ts:821  triggerWebhookJobs(...).catch(logger.error)  ← 第 3 层 fire-and-forget
+    ↓
+jobs/updateAllJobs.ts:17-58  triggerWebhookJobs 内部:
+    ├─ 4 个 webhook/proxy 通道（均 .catch() 不 await）
+    └─ await purgeCDNCache()  ← 仅在 triggerWebhookJobs 内部 await，不影响接口响应
+```
+
+**关键异步证据**（每层对应代码）：
 
 ```typescript
-// services/features.ts:821
+// 第 1 层：FeatureModel.ts:1053 — onFeatureUpdate 不 await
+onFeatureUpdate(context, feature, updatedFeature).catch((e) => {
+  logger.error(e, "Error refreshing SDK Payload on feature update");
+});
+
+// 第 2 层：services/features.ts:618 — refreshSDKPayloadCache 不 await
+refreshSDKPayloadCache({ ...data, stackTrace }).catch((e) => {
+  logger.error(e, "Error refreshing SDK Payload Cache");
+});
+
+// 第 3 层：services/features.ts:821 — triggerWebhookJobs 不 await
 triggerWebhookJobs(context, payloadKeys, connectionsUpdated, true).catch(
   (e) => {
     logger.error(e, "Error triggering webhook jobs");
   }
 );
 ```
+
+**结论**：`triggerWebhookJobs` 内部的 `await purgeCDNCache` 仅等待 CDN 清除完成，但由于 `triggerWebhookJobs` 本身是 fire-and-forget 调用，**CDN 清除和所有 webhook 投递都在后台异步执行，不阻塞 Feature 更新 API 的响应**。接口响应延迟由 Mongo 操作（`FeatureModel.updateOne`、`FeatureModel.findOne`）主导。
 
 ### 1.2 统一入队分发器 — triggerWebhookJobs
 
@@ -53,7 +85,7 @@ export const triggerWebhookJobs = async (
   // ④ 异步入队，不等待完成
   queueLegacySdkWebhooks(context, payloadKeys, isFeature).catch(...);
 
-  // ⑤ 同步等待 CDN 缓存清除完成
+  // ⑤ 同步等待 CDN 缓存清除完成（仅在函数内部等待）
   await purgeCDNCache(context.org.id, surrogateKeys);
 };
 ```
@@ -324,7 +356,7 @@ fireGlobalSdkWebhooks(context, connections)
 ### 4.1 时序图
 
 ```
-triggerWebhookJobs() 被调用
+triggerWebhookJobs() 被调用（自身是 fire-and-forget，不阻塞上层）
 │
 ├─ [fire-and-forget] queueWebhooksByConnections()
 │    └─→ 串行遍历 webhooks，逐个 agenda.create("fireWebhooks").save()
@@ -342,7 +374,7 @@ triggerWebhookJobs() 被调用
 │    └─→ 串行遍历 webhooks，逐个 agenda.create("fireWebhook").save()
 │         （仅入队，实际执行由 Agenda 调度）
 │
-└─ [await] purgeCDNCache()                       ← 唯一同步等待
+└─ [await] purgeCDNCache()                       ← 仅在 triggerWebhookJobs 内部等待
      └─→ 向 Fastly API 发 POST 清除 surrogate keys
           （批量处理，每批最多 256 个 key）
 ```
@@ -351,13 +383,15 @@ triggerWebhookJobs() 被调用
 
 1. **webhook 入队与 CDN 清除并行**：步骤 ①-④ 全部 fire-and-forget，`purgeCDNCache` 不等它们完成就开始执行，反之亦然。
 
-2. **Global Webhook 是唯一同步投递**：`fireGlobalSdkWebhooks` 不走 Agenda，在 `triggerWebhookJobs` 的调用栈内直接发起 HTTP 请求。但由于外层 `triggerWebhookJobs` 本身被 `.catch()` 调用（fire-and-forget），所以它也不会阻塞 Feature 更新的主流程。
+2. **Global Webhook 是唯一同步投递（但仍不阻塞接口）**：`fireGlobalSdkWebhooks` 不走 Agenda，在 `triggerWebhookJobs` 的调用栈内直接发起 HTTP 请求。但由于 `triggerWebhookJobs` 本身被 `.catch()` 调用（fire-and-forget），所以它也不会阻塞 Feature 更新的主流程。
 
 3. **Proxy Update 的条件性**：只有 `isProxyEnabled=true` 时才入队 proxy 更新。Cloud 用户还会额外入队一个 cloud proxy 更新 job。
 
 4. **CDN 清除的容错性**：`purgeCDNCache` 内部按 256 个 key 一批调用 Fastly API，`catch` 块仅记日志不抛出异常，不会影响整个 `triggerWebhookJobs` 的完成。
 
 5. **入队顺序无保证**：四个入队/投递操作虽然代码上是顺序执行，但各自是异步的。Agenda job 的实际执行顺序取决于 Agenda 调度器的并发度和队列状态。
+
+6. **整个后台链路不阻塞接口**：从 `onFeatureUpdate` 开始的所有后台操作（cache 更新、CDN 清除、webhook 投递）都是异步执行的，不影响 Feature 更新 API 的响应时间。
 
 ---
 
@@ -463,58 +497,38 @@ if ((connection.proxy.consecutiveFailures || 0) >= WEBHOOK_CONSECUTIVE_FAILURES_
 ```
 Feature 变更
     ↓
-services/features.ts: updateFeatures()
+controllers/features.ts:2433  await updateFeature(...)
     ↓
-triggerWebhookJobs(context, payloadKeys, connections, isProxyEnabled, isFeature)
-    │
-    ├── [异步] queueWebhooksByConnections()
-    │    └── for each webhook:
-    │         agenda.create("fireWebhooks", {webhookId, retryCount:0}).save()
-    │              ↓ (Agenda 调度，异步执行)
-    │            fireWebhooks(job)
-    │              ├── findSDKConnectionsByIds()
-    │              ├── BluebirdPromise.reduce → 串行获取 payload
-    │              ├── BluebirdPromise.each → 串行 runWebhookFetch()
-    │              │    ├── 成功 → setLastSdkWebhookError("") + createSdkWebhookLog
-    │              │    └── 失败 → setLastSdkWebhookError(msg) + createSdkWebhookLog + throw
-    │              │              ↓ (Agenda fail 事件)
-    │              │            最多重试 2 次: 30s → 5m → 放弃
-    │
-    ├── [异步] fireGlobalSdkWebhooks()
-    │    └── for each connection (串行):
-    │         ├── await getFeatureDefinitionsWithCache()
-    │         └── WEBHOOKS.forEach → 并行 runWebhookFetch()
-    │              ├── 成功 → createSdkWebhookLog (global=true, 不影响熔断)
-    │              └── 失败 → createSdkWebhookLog + logger.error (不重试)
-    │
-    ├── [异步, 条件] queueProxyUpdate()
-    │    └── for each connection:
-    │         agenda.create("proxyUpdate", {orgId, connectionId, retryCount:0}).save()
-    │              ↓ (Agenda 调度，异步执行)
-    │            proxyUpdate(job)
-    │              ├── 检查 consecutiveFailures >= 10 → 跳过
-    │              ├── getFeatureDefinitionsWithCache()
-    │              ├── fireProxyWebhook() → HTTP POST (5s 超时)
-    │              ├── 成功 → clearProxyError()
-    │              └── 失败 → setProxyError() + throw
-    │                        ↓ (Agenda fail 事件)
-    │                      最多重试 1 次: 5s → 放弃
-    │
-    ├── [异步] queueLegacySdkWebhooks()
-    │    └── for each webhook (过滤 project/env/featuresOnly/disabled):
-    │         agenda.create("fireWebhook", {webhookId, retryCount:0}).save()
-    │              ↓ (Agenda 调度，异步执行)
-    │            fireWebhook(job)
-    │              ├── getFeatureDefinitionsWithCache()
-    │              ├── 条件: getExperimentOverrides()
-    │              ├── cancellableFetch() → HTTP POST
-    │              ├── 成功 → setLastSdkWebhookError("")
-    │              └── 失败 → setLastSdkWebhookError(error) + throw
-    │                        ↓ (Agenda fail 事件)
-    │                      最多重试 2 次: 30s → 5m → 放弃
-    │
-    └── [同步等待] purgeCDNCache()
-         └── 向 Fastly POST /purge (按 surrogate key 批量, 每批 ≤256)
+models/FeatureModel.ts:960  async function updateFeature(...)
+    ├─ ① await FeatureModel.updateOne(...)    ← Mongo 写操作（阻塞接口）
+    ├─ ② await FeatureModel.findOne(...)      ← Mongo 读操作（阻塞接口）
+    ├─ ③ onFeatureUpdate(...).catch(...)      ← fire-and-forget，不阻塞
+    └─ ④ return updatedFeature                ← 接口响应返回
+         ↓
+         onFeatureUpdate 后台异步执行:
+         ├─ queueSDKPayloadRefresh(...)
+         ├─ refreshSDKPayloadCache(...).catch(...)
+         │   ├─ await promiseAllChunks(promises, 4)  ← 更新 SDK connection cache
+         │   └─ triggerWebhookJobs(...).catch(...)
+         │        ├── [异步] queueWebhooksByConnections()
+         │        │    └── Agenda: fireWebhooks → 串行 payload + 串行发送
+         │        │         最多重试 2 次: 30s → 5m → 放弃
+         │        │
+         │        ├── [异步] fireGlobalSdkWebhooks()
+         │        │    └── 串行 payload + 并行发送（不重试）
+         │        │
+         │        ├── [异步, 条件] queueProxyUpdate()
+         │        │    └── Agenda: proxyUpdate
+         │        │         最多重试 1 次: 5s → 放弃
+         │        │
+         │        ├── [异步] queueLegacySdkWebhooks()
+         │        │    └── Agenda: fireWebhook
+         │        │         最多重试 2 次: 30s → 5m → 放弃
+         │        │
+         │        └── [await] purgeCDNCache()  ← 仅在 triggerWebhookJobs 内等待
+         │
+         ├─ await logFeatureUpdatedEvent(...)
+         └─ await updateVercelExperimentationItemFromFeature(...)
 ```
 
 ### 7.2 Event Webhook 完整链路
@@ -635,30 +649,41 @@ await BluebirdPromise.each(payloads, ([key, payload]) =>
 
 `BluebirdPromise.reduce` 和 `BluebirdPromise.each` 都是串行迭代器，与 `Promise.all` 的并行语义不同。
 
-### 结论 5：triggerWebhookJobs 中 purgeCDNCache 是唯一 await
+### 结论 5：Feature 更新接口的响应延迟由 Mongo 操作主导，purgeCDNCache 在后台异步执行
 
-代码位置：`updateAllJobs.ts:24-57`
+**代码证据 — 完整异步调用链**：
 
 ```typescript
-// 第 24 行：无 await
-queueWebhooksByConnections(context, connections).catch(...);
+// 第 1 层：controllers/features.ts:2433 — 接口 await updateFeature
+const updatedFeature = await updateFeature(context, feature, updates);
 
-// 第 28 行：无 await
-fireGlobalSdkWebhooks(context, connections).catch(...);
+// 第 2 层：FeatureModel.ts:1053 — updateFeature 内部 fire-and-forget
+onFeatureUpdate(context, feature, updatedFeature).catch((e) => {
+  logger.error(e, "Error refreshing SDK Payload on feature update");
+});
+// 紧接着 return updatedFeature —— 接口响应已发送
 
-// 第 33 行：无 await
-if (isProxyEnabled) {
-  queueProxyUpdate(context, connections).catch(...);
-}
+// 第 3 层：services/features.ts:618 — queueSDKPayloadRefresh 内部 fire-and-forget
+refreshSDKPayloadCache({ ...data, stackTrace }).catch((e) => {
+  logger.error(e, "Error refreshing SDK Payload Cache");
+});
 
-// 第 38 行：无 await
-queueLegacySdkWebhooks(context, payloadKeys, isFeature).catch(...);
+// 第 4 层：services/features.ts:821 — refreshSDKPayloadCache 内部 fire-and-forget
+triggerWebhookJobs(context, payloadKeys, connectionsUpdated, true).catch(
+  (e) => {
+    logger.error(e, "Error triggering webhook jobs");
+  }
+);
 
-// 第 57 行：唯一 await
+// 第 5 层：updateAllJobs.ts:57 — triggerWebhookJobs 内部 await purgeCDNCache
 await purgeCDNCache(context.org.id, surrogateKeys);
 ```
 
-四个 webhook/proxy 调用均使用 `.catch()` 而非 `await`，属于 fire-and-forget 模式。Feature 更新 API 的响应延迟因此由 `purgeCDNCache`（Fastly API 调用）主导，而非 webhook 投递。
+**关键判定**：
+- 第 2 层的 `onFeatureUpdate(...).catch(...)` 没有 `await`，因此 `updateFeature` 函数会在 `onFeatureUpdate` 执行完之前就返回
+- 第 1 层的 `await updateFeature` 因此不等待 `onFeatureUpdate` 及其内部任何操作完成
+- 接口响应由 `return updatedFeature` 发送，此时 `purgeCDNCache` 和所有 webhook 投递都还在后台执行
+- Feature 更新接口的响应延迟由 `FeatureModel.updateOne()` 和 `FeatureModel.findOne()` 两个 Mongo 操作主导
 
 ### 结论 6：熔断机制仅覆盖 3 条通道
 
