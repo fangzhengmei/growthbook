@@ -34,9 +34,22 @@ sql: z
 - **漏斗度量 (Funnel Metrics)**：计算转化率
 - **标准化指标**：将分子数据按分母标准化，消除样本量偏差
 
-### 1.3 Safe Rollout 中的分母处理
+---
 
-在 `packages/back-end/src/services/safeRolloutSnapshots.ts:210-215` 中，分母度量被特殊处理：
+## 2. 分母处理链路分析 (Denominator Processing Chain)
+
+### 2.1 两种处理模式对比
+
+系统中存在两种不同的分母处理模式，分别用于不同的业务场景：
+
+| 处理模式 | 应用场景 | 展开方式 | 环路防护 |
+|---------|---------|---------|---------|
+| **单层展开** | Safe Rollout 快照设置 | 仅展开一层 | 无显式防护 |
+| **递归展开** | 通用实验报表、人口数据分析 | 递归展开所有层 | 有显式 `visited` Set 防护 |
+
+### 2.2 Safe Rollout 中的分母处理 (单层展开)
+
+**位置**：`packages/back-end/src/services/safeRolloutSnapshots.ts:210-215`
 
 ```typescript
 const denominatorMetrics = allExperimentMetrics
@@ -47,17 +60,7 @@ const denominatorMetrics = allExperimentMetrics
   .filter(Boolean) as MetricInterface[];
 ```
 
-**关键点**：
-- 仅对 Legacy Metric (非 Fact Metric) 提取分母
-- 通过 `metricMap.get()` 递归获取分母度量对象
-- 使用 `.filter(Boolean)` 过滤掉不存在的分母度量
-
-### 1.4 分母的递归展开与环路防护
-
-#### 1.4.1 当前实现机制
-
-在 `getSettingsForSnapshotMetrics` 函数 (`safeRolloutSnapshots.ts:188-234`) 中：
-
+**代码证据** (`safeRolloutSnapshots.ts:188-234`)：
 ```typescript
 export async function getSettingsForSnapshotMetrics(
   context: ReqContext | ApiReqContext,
@@ -67,6 +70,11 @@ export async function getSettingsForSnapshotMetrics(
   settingsForSnapshotMetrics: MetricSnapshotSettings[];
 }> {
   // ...
+  const allExperimentMetrics = allExperimentMetricIds
+    .map((id) => metricMap.get(id))
+    .filter(isDefined);
+
+  // ⚠️ 单层展开：只展开直接分母，不递归展开分母的分母
   const denominatorMetrics = allExperimentMetrics
     .filter((m) => m && !isFactMetric(m) && m.denominator)
     .map((m: ExperimentMetricInterface) =>
@@ -78,9 +86,8 @@ export async function getSettingsForSnapshotMetrics(
     if (!metric) continue;
     const { metricSnapshotSettings } = getMetricSnapshotSettings({
       metric: metric,
-      denominatorMetrics: denominatorMetrics,  // 传入分母度量列表
-      experimentRegressionAdjustmentEnabled: ...,
-      organizationSettings: context.org.settings,
+      denominatorMetrics: denominatorMetrics,  // 传入单层展开的分母列表
+      // ...
     });
     // ...
   }
@@ -88,29 +95,186 @@ export async function getSettingsForSnapshotMetrics(
 }
 ```
 
-#### 1.4.2 环路防护机制
+**关键点**：
+- 仅对 Legacy Metric (非 Fact Metric) 提取分母
+- **单层展开**：只展开直接分母，不递归处理分母的分母
+  - 例如：A→B→C，只获取 B，不获取 C
+- 通过 `metricMap.get()` 获取分母度量对象
+- 使用 `.filter(Boolean)` 过滤掉不存在的分母度量
+- **无显式环路防护**
 
-**当前实现的防护方式**：
-1. **单层展开**：只做一层展开，不递归处理分母的分母
-   - 例如：A 的分母是 B，B 的分母是 C → 只展开到 B，不展开 C
-   
-2. **存在性过滤**：使用 `.filter(Boolean)` 确保分母度量存在
-   ```typescript
-   .filter(Boolean) as MetricInterface[];
-   ```
+### 2.3 递归展开函数 (expandDenominatorMetrics)
 
-3. **隐式去重**：通过 `Set` 去重（在 `getAllMetricIdsFromExperiment` 中）
-   ```typescript
-   return Array.from(new Set(expandMetricGroups([...], metricGroups)));
-   ```
+**定义位置**：`packages/back-end/src/util/sql.ts:183-199`
 
-**潜在风险**：
-- 若 A.denominator = B 且 B.denominator = A，会形成自引用环路
-- 当前代码未显式检测环路，依赖调用链中的隐式保护
+```typescript
+// Recursively create list of metric denominators in order
+// For example, a "step3" metric has denominator "step2", which itself has denominator "step1"
+// If you pass "step3" into this, it will return ["step1","step2","step3"]
+export function expandDenominatorMetrics(
+  metric: string,
+  map: Map<string, { denominator?: string }>,
+  visited?: Set<string>,
+): string[] {
+  visited = visited || new Set();       // 环路防护：visited 集合
+  const m = map.get(metric);
+  if (!m) return [];
+  if (visited.has(metric)) return [];   // 环路防护：检测到已访问过的度量，返回空数组
 
-## 2. 护栏阈值设置 (Guardrail Threshold Settings)
+  visited.add(metric);
+  if (!m.denominator) return [metric];
+  // 递归展开：先展开分母，再追加当前度量
+  return [...expandDenominatorMetrics(m.denominator, map, visited), metric];
+}
+```
 
-### 2.1 核心阈值常量
+**环路防护机制详解**：
+1. **`visited` Set 参数**：记录已访问的度量 ID
+2. **第191行**：`visited = visited || new Set()` - 初始化访问集合
+3. **第194行**：`if (visited.has(metric)) return []` - 检测环路，返回空数组终止递归
+4. **第196行**：`visited.add(metric)` - 标记当前度量为已访问
+
+**测试用例验证** (`back-end/test/util/sql.test.ts:353-375`)：
+```typescript
+const metricMap = new Map<string, { denominator?: string }>(
+  Object.entries({
+    a: { denominator: "b" },
+    b: {},
+    c: { denominator: "d" },
+    d: { denominator: "c" },  // 环路：c→d→c
+    e: { denominator: "c" },
+    f: { denominator: "f" },  // 自引用
+    g: { denominator: "h" },  // h 不存在
+  }),
+);
+
+expect(expandDenominatorMetrics("a", metricMap)).toEqual(["b", "a"]);
+expect(expandDenominatorMetrics("c", metricMap)).toEqual(["d", "c"]);
+expect(expandDenominatorMetrics("d", metricMap)).toEqual(["c", "d"]);
+expect(expandDenominatorMetrics("e", metricMap)).toEqual(["d", "c", "e"]);  // 递归展开两层
+expect(expandDenominatorMetrics("f", metricMap)).toEqual(["f"]);  // 自引用被防护
+expect(expandDenominatorMetrics("g", metricMap)).toEqual(["g"]);  // h 不存在，只返回 g
+expect(expandDenominatorMetrics("h", metricMap)).toEqual([]);     // h 不存在
+```
+
+### 2.4 递归展开的调用路径
+
+#### 调用路径 1: 实验结果查询
+
+**位置**：`packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts:215-226`
+
+```typescript
+for (const m of legacyMetricSingles) {
+  const denominatorMetrics: MetricInterface[] = [];
+  if (m.denominator) {
+    // 使用递归展开函数
+    denominatorMetrics.push(
+      ...expandDenominatorMetrics(
+        m.denominator,
+        metricMap as Map<string, MetricInterface>,
+      )
+        .map((m) => metricMap.get(m) as MetricInterface)
+        .filter(Boolean),
+    );
+  }
+  // ...
+}
+```
+
+**完整调用链**：
+```
+ExperimentResultsQueryRunner.startQuery()
+        ↓
+legacyMetricSingles 循环处理每个度量
+        ↓
+if (m.denominator) → expandDenominatorMetrics(m.denominator, metricMap)
+        ↓
+返回 [最底层分母, 中间分母, 目标分母] 数组
+        ↓
+转换为 MetricInterface 对象并传入查询参数
+```
+
+#### 调用路径 2: 人口数据查询
+
+**位置**：`packages/back-end/src/queryRunners/PopulationDataQueryRunner.ts:110-119`
+
+```typescript
+const denominatorMetrics: MetricInterface[] = [];
+if (m.denominator) {
+  denominatorMetrics.push(
+    ...expandDenominatorMetrics(
+      m.denominator,
+      metricMap as Map<string, MetricInterface>,
+    )
+      .map((m) => metricMap.get(m) as MetricInterface)
+      .filter(Boolean),
+  );
+}
+```
+
+#### 调用路径 3: 通用报表链路
+
+**位置**：`packages/back-end/src/services/reports.ts:514-521`
+
+```typescript
+const denominatorMetricIds = uniq<string>(
+  allReportMetrics
+    .map((m) => m?.denominator)
+    .filter((d) => d && typeof d === "string") as string[],
+);
+const denominatorMetrics = denominatorMetricIds
+  .map((m) => metricMap.get(m) || null)
+  .filter(isDefined) as MetricInterface[];
+```
+
+**注意**：报表设置阶段是单层展开，但在实际查询执行阶段（ExperimentResultsQueryRunner）会再次递归展开。
+
+---
+
+## 3. 环路防护生效范围 (Loop Guardrail Scope)
+
+### 3.1 生效范围对比
+
+| 链路 | 是否使用 `expandDenominatorMetrics` | 环路防护是否生效 | 说明 |
+|------|------------------------------------|-----------------|------|
+| **Safe Rollout 快照设置** (`safeRolloutSnapshots.ts`) | ❌ 否 | ❌ 不生效 | 单层展开，依赖 `metricMap.get()` 隐式保护 |
+| **实验结果查询** (`ExperimentResultsQueryRunner.ts`) | ✅ 是 | ✅ 生效 | 递归展开，`visited` Set 防护 |
+| **人口数据查询** (`PopulationDataQueryRunner.ts`) | ✅ 是 | ✅ 生效 | 递归展开，`visited` Set 防护 |
+| **报表设置** (`reports.ts`) | ❌ 否 | ❌ 不生效 | 单层展开，但后续查询阶段会递归 |
+
+### 3.2 环路风险分析
+
+**Safe Rollout 链路的潜在风险**：
+- 若 `A.denominator = B` 且 `B.denominator = A`，形成自引用环路
+- Safe Rollout 中只展开一层，因此只会收集 `[B]`，不会无限递归
+- 但 B 本身的分母 A 不会被展开，导致数据不完整
+
+**代码风险点** (`safeRolloutSnapshots.ts:210-215`)：
+```typescript
+// 假设 A.denominator = B, B.denominator = A
+const denominatorMetrics = allExperimentMetrics  // allExperimentMetrics = [A]
+  .filter((m) => m && !isFactMetric(m) && m.denominator)  // A 有分母 B
+  .map((m) => metricMap.get(m.denominator as string))      // 获取 B
+  .filter(Boolean);
+// 结果: denominatorMetrics = [B]
+// B 的分母 A 不会被展开，因为只做了一层 map
+```
+
+### 3.3 环路防护的测试验证
+
+测试用例 (`sql.test.ts:353-375`) 验证了以下场景：
+1. ✅ 正常链式引用：`a→b` → `["b", "a"]`
+2. ✅ 双向环路：`c→d→c` → 输入 c 返回 `["d", "c"]`，输入 d 返回 `["c", "d"]`
+3. ✅ 长链式引用：`e→c→d→c` → `["d", "c", "e"]`（c 已被访问，不再递归）
+4. ✅ 自引用环路：`f→f` → `["f"]`（检测到已访问，终止递归）
+5. ✅ 不存在的分母：`g→h` (h 不存在) → `["g"]`
+6. ✅ 不存在的度量：输入 `h` → `[]`
+
+---
+
+## 4. 护栏阈值设置 (Guardrail Threshold Settings)
+
+### 4.1 核心阈值常量
 
 在 `packages/shared/src/constants.ts` 中定义了默认阈值：
 
@@ -123,7 +287,7 @@ export async function getSettingsForSnapshotMetrics(
 | `DEFAULT_P_VALUE_THRESHOLD` | 0.05 | 统计显著性 p-value 阈值 |
 | `DEFAULT_GUARDRAIL_ALPHA` | 0.05 | 护栏度量显著性水平 |
 
-### 2.2 组织级别设置
+### 4.2 组织级别设置
 
 在 `packages/shared/src/enterprise/decision-criteria/decisionCriteria.ts:245-261` 中，`getHealthSettings` 函数合并组织设置与默认值：
 
@@ -145,7 +309,7 @@ export function getHealthSettings(
 }
 ```
 
-### 2.3 度量级别阈值
+### 4.3 度量级别阈值
 
 在 `packages/shared/types/metric.d.ts:74-79` 中，每个度量可以配置独立的阈值：
 
@@ -162,9 +326,11 @@ export interface MetricInterface {
 }
 ```
 
-## 3. 异常拦截机制 (Anomaly Interception Mechanism)
+---
 
-### 3.1 SRM (Sample Ratio Mismatch) 样本比率不匹配检测
+## 5. 异常拦截机制 (Anomaly Interception Mechanism)
+
+### 5.1 SRM (Sample Ratio Mismatch) 样本比率不匹配检测
 
 **核心逻辑** 在 `packages/shared/src/health/health.ts:74-96`：
 
@@ -198,7 +364,7 @@ export function getSRMHealthData({
 - 从健康查询结果中获取 `snapshot.health?.traffic?.overall?.srm`
 - 如无健康查询结果，回退到主分析结果 `snapshot.analyses?.[0]?.results?.[0]?.srm`
 
-### 3.2 多重暴露检测
+### 5.2 多重暴露检测
 
 **核心逻辑** 在 `packages/shared/src/health/health.ts:25-62`：
 
@@ -222,7 +388,7 @@ export function getMultipleExposureHealthData({
 }
 ```
 
-### 3.3 护栏度量异常拦截
+### 5.3 护栏度量异常拦截
 
 在 `packages/shared/src/enterprise/decision-criteria/decisionCriteria.ts:648-665` 中，Safe Rollout 使用专门的决策标准：
 
@@ -251,9 +417,11 @@ const ROLLBACK_SAFE_ROLLOUT_DECISION_CRITERIA: DecisionCriteriaData = {
 - 检查度量状态是否为 "lost" (显著下降)
 - 如果任意护栏度量状态为 "lost"，触发回滚
 
-## 4. 自动回滚执行机制 (Auto Rollback Execution)
+---
 
-### 4.1 自动回滚实际执行位置
+## 6. 自动回滚执行机制 (Auto Rollback Execution)
+
+### 6.1 自动回滚实际执行位置
 
 **入口点**：`packages/back-end/src/models/SafeRolloutSnapshotModel.ts:158`
 
@@ -341,7 +509,7 @@ export async function checkAndRollbackSafeRollout({
 }
 ```
 
-### 4.2 执行流程详解
+### 6.2 执行流程详解
 
 ```
 快照更新完成 (afterUpdateOne hook)
@@ -375,9 +543,11 @@ export async function checkAndRollbackSafeRollout({
 返回 "rolled-back"
 ```
 
-## 5. 健康异常与回滚决策的判定优先级
+---
 
-### 5.1 判定优先级顺序
+## 7. 健康异常与回滚决策的判定优先级
+
+### 7.1 判定优先级顺序
 
 在 `getSafeRolloutResultStatus` 函数 (`decisionCriteria.ts:597-717`) 中，判定顺序如下：
 
@@ -443,7 +613,7 @@ export function getSafeRolloutResultStatus({ ... }): ... {
 }
 ```
 
-### 5.2 优先级总结
+### 7.2 优先级总结
 
 | 优先级 | 状态 | 触发条件 | 说明 |
 |-------|------|---------|------|
@@ -459,9 +629,11 @@ export function getSafeRolloutResultStatus({ ... }): ... {
 - `unhealthy` 状态仅标记问题，需要人工介入，不会触发自动回滚
 - 只有明确的 `rollback-now` 状态才会执行自动回滚
 
-## 6. 无数据与剩余天数分支条件
+---
 
-### 6.1 无数据分支 (no-data)
+## 8. 无数据与剩余天数分支条件
+
+### 8.1 无数据分支 (no-data)
 
 **触发条件** (`decisionCriteria.ts:616-619`)：
 ```typescript
@@ -481,7 +653,7 @@ if (!healthSummary?.totalUsers && hoursRunning > 24) {
 - 曝光事件未正确上报
 - 流量完全没有进入实验
 
-### 6.2 剩余天数分支 (days-left)
+### 8.2 剩余天数分支 (days-left)
 
 **触发条件** (`decisionCriteria.ts:696-700`)：
 ```typescript
@@ -521,7 +693,7 @@ export function getSafeRolloutDaysLeft({
 - 已运行时长：基于最新快照时间计算
 - 剩余天数：`(endDate - latestSnapshotDate) / 1440`（分钟转天数）
 
-### 6.3 发布分支 (ship-now)
+### 8.3 发布分支 (ship-now)
 
 **触发条件** (`decisionCriteria.ts:703-716`)：
 ```typescript
@@ -544,9 +716,73 @@ if (daysLeft <= 0 && resultsStatus) {
 1. `daysLeft <= 0` - 监测期已结束
 2. `resultsStatus` 存在 - 有分析结果数据
 
-## 7. 整体配合流程 (Overall Coordination Flow)
+---
 
-### 7.1 Safe Rollout 健康评估流程
+## 9. 分母处理链路总览
+
+### 9.1 完整数据流转图
+
+```
++-------------------+
+|  度量定义         |
+|  metric.denominator |
++---------+---------+
+          |
+          v
+┌─────────────────────────────────────────────────┐
+│  分母校验链路分支                                │
+│                                                 │
+│  ┌─────────────────────┐   ┌─────────────────────┐
+│  │  Safe Rollout 链路  │   │  通用报表/查询链路  │
+│  │  (safeRollout-      │   │  (ExperimentResults │
+│  │   Snapshots.ts)     │   │   QueryRunner.ts)   │
+│  └──────────┬──────────┘   └──────────┬──────────┘
+│             │                         │
+│             ▼                         ▼
+│  ┌─────────────────────┐   ┌─────────────────────┐
+│  │  单层展开           │   │  递归展开           │
+│  │  allExperiment-     │   │  expandDenominator- │
+│  │  Metrics.filter()   │   │  Metrics()          │
+│  │  .map()             │   │  (递归函数)         │
+│  └──────────┬──────────┘   └──────────┬──────────┘
+│             │                         │
+│             ▼                         ▼
+│  ┌─────────────────────┐   ┌─────────────────────┐
+│  │  环路防护: 无        │   │  环路防护: 有       │
+│  │  仅 filter(Boolean) │   │  visited Set 检测   │
+│  └──────────┬──────────┘   └──────────┬──────────┘
+│             │                         │
+│             ▼                         ▼
+│  ┌─────────────────────┐   ┌─────────────────────┐
+│  │  分母列表           │   │  完整分母链         │
+│  │  [B] (A→B→C)        │   │  [B, C, ...]        │
+│  └──────────┬──────────┘   └──────────┬──────────┘
+│             │                         │
+│             ▼                         ▼
+│  ┌─────────────────────┐   ┌─────────────────────┐
+│  │  回归调整设置       │   │  SQL 查询构建       │
+│  │  getMetricSnapshot- │   │  getExperiment-     │
+│  │  Settings()         │   │  MetricQuery()      │
+│  └─────────────────────┘   └─────────────────────┘
+└─────────────────────────────────────────────────┘
+```
+
+### 9.2 分母处理对比表
+
+| 维度 | Safe Rollout 链路 | 通用查询链路 |
+|------|------------------|-------------|
+| **文件** | `safeRolloutSnapshots.ts` | `ExperimentResultsQueryRunner.ts` |
+| **展开方式** | 单层 `.map()` | 递归 `expandDenominatorMetrics()` |
+| **环路防护** | ❌ 无显式防护 | ✅ `visited` Set 检测 |
+| **处理深度** | 仅直接分母 | 完整分母链 |
+| **应用场景** | 快照设置、回归调整 | SQL 查询构建、数据获取 |
+| **调用时机** | 快照创建前 | 查询执行时 |
+
+---
+
+## 10. 整体配合流程
+
+### 10.1 Safe Rollout 健康评估流程
 
 **入口函数** `getSafeRolloutResultStatus` (`decisionCriteria.ts:597-717`)
 
@@ -581,7 +817,7 @@ if (daysLeft <= 0 && resultsStatus) {
    └─ 优先级4: 监测期结束且无异常 → status: ship-now
 ```
 
-### 7.2 自动回滚触发链
+### 10.2 自动回滚触发链
 
 ```
 快照分析完成
@@ -609,55 +845,9 @@ status === "rollback-now"?
 Safe Rollout 状态变为 "rolled-back"
 ```
 
-## 8. 数据流转图示
+---
 
-```
-+---------------------+     +---------------------+     +---------------------+
-|  分母度量定义       |     |  护栏度量选择       |     |  阈值配置           |
-|  (Metric.denominator)|     |  (guardrailMetricIds)|     |  (组织/度量级别)    |
-+----------+----------+     +----------+----------+     +----------+----------+
-           |                           |                           |
-           v                           v                           v
-+-----------------------------------------------------------------------------+
-|                                                                             |
-|                    Safe Rollout Snapshot 分析流程                           |
-|                                                                             |
-|  +----------------+   +----------------+   +----------------+               |
-|  |  数据查询      |   |  SRM 计算      |   |  多重暴露计算   |               |
-|  |  (SQL Query)   |-->|  (Chi-square)  |-->|  (用户去重)     |               |
-|  +----------------+   +----------------+   +----------------+               |
-|                                    |                                         |
-|                                    v                                         |
-|  +----------------+   +----------------+   +----------------+               |
-|  |  护栏度量分析  |<--+  分母标准化    |   |  健康状态评估   |               |
-|  |  (统计检验)    |   |  (比率计算)    |   |  (阈值比较)     |               |
-|  +--------+-------+   +----------------+   +--------+-------+               |
-|           |                                    |                           |
-|           v                                    v                           |
-|  +----------------+                  +----------------+                    |
-|  |  度量状态判断  |                  |  最终决策      |                    |
-|  |  (won/lost/...)|----------------->|  (rollback/ship)|                    |
-|  +----------------+                  +----------------+                    |
-+-----------------------------------------------------------------------------+
-                                    |
-                                    v
-                          +-------------------+
-                          |  状态判定优先级    |
-                          |  1. no-data        |
-                          |  2. unhealthy      |
-                          |  3. rollback-now   |
-                          |  4. days-left      |
-                          |  5. ship-now       |
-                          +---------+---------+
-                                    |
-                                    v
-                          +-------------------+
-                          |  自动回滚执行      |
-                          |  (autoRollback)    |
-                          +-------------------+
-```
-
-## 9. 关键文件索引
+## 11. 关键文件索引
 
 | 文件路径 | 核心功能 |
 |---------|---------|
@@ -665,8 +855,13 @@ Safe Rollout 状态变为 "rolled-back"
 | `packages/shared/src/constants.ts` | 阈值常量定义 |
 | `packages/shared/src/health/health.ts` | SRM 和多重暴露健康检测 |
 | `packages/shared/src/enterprise/decision-criteria/decisionCriteria.ts` | 决策框架与护栏评估逻辑 |
-| `packages/back-end/src/services/safeRolloutSnapshots.ts` | Safe Rollout 快照服务，分母度量处理 |
+| `packages/back-end/src/services/safeRolloutSnapshots.ts` | Safe Rollout 快照服务，**单层**分母处理 |
+| `packages/back-end/src/util/sql.ts:186-199` | `expandDenominatorMetrics` **递归**展开函数，含环路防护 |
+| `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 实验结果查询，**递归**分母展开 |
+| `packages/back-end/src/queryRunners/PopulationDataQueryRunner.ts` | 人口数据查询，**递归**分母展开 |
 | `packages/back-end/src/enterprise/saferollouts/safeRolloutUtils.ts` | 自动回滚实际执行逻辑 |
 | `packages/back-end/src/models/SafeRolloutSnapshotModel.ts` | 快照模型，包含自动回滚触发 hook |
+| `packages/back-end/src/services/reports.ts` | 报表服务，分母处理链路 |
+| `packages/back-end/test/util/sql.test.ts:353-375` | `expandDenominatorMetrics` 测试用例 |
 | `packages/front-end/components/Features/RuleModal/SafeRolloutFields.tsx` | Safe Rollout 配置表单 |
 | `packages/shared/src/experiments/experiments.ts` | 度量组展开、分母快照设置 |
