@@ -6,8 +6,7 @@
 
 #### Legacy Metric 的分母配置
 
-在 `packages/shared/types/metric.d.ts:63` 中，`MetricInterface` 定义了分
-段 ID：
+在 `packages/shared/types/metric.d.ts:63` 中，`MetricInterface` 定义了分母度量 ID：
 
 ```typescript
 export interface MetricInterface {
@@ -37,28 +36,54 @@ sql: z
 
 #### Fact Metric 的分母配置
 
-Fact Metric 的分母存储在度量对象内部（不是 ID 引用）：
+Fact Metric 的分母是一个 `ColumnRef` 类型引用，与分子共享相同的结构定义。
+
+**类型定义来源** (`packages/shared/src/validators/fact-table.ts:233-251`)：
 
 ```typescript
-// Fact Metric 的分子分母结构
-export interface FactMetricInterface {
+export const factMetricValidator = z.object({
   // ...
-  numerator: {
-    factTableId: string;
-    // ...
-  };
-  denominator?: {
-    factTableId: string;
-    // ...
-  };
+  metricType: metricTypeValidator,       // "ratio" | "mean" | "proportion" | "retention" | "quantile" | "dailyParticipation"
+  numerator: columnRefValidator,          // ColumnRef
+  denominator: columnRefValidator.nullable(),  // ColumnRef | null
   // ...
-}
+});
+```
+
+**`ColumnRef` 的定义** (`packages/shared/src/validators/fact-table.ts:160-169`)：
+
+```typescript
+export const columnRefValidator = z
+  .object({
+    factTableId: z.string(),                          // 所属 Fact Table 的 ID
+    column: z.string(),                               // 列名
+    aggregation: columnAggregationValidator.optional(), // 聚合方式
+    rowFilters: z.array(rowFilterValidator).optional(), // 行级过滤
+    aggregateFilter: z.string().optional(),            // 聚合后过滤
+    aggregateFilterColumn: z.string().optional(),      // 聚合过滤列
+  })
+  .strict();
+```
+
+**推断出的 `FactMetricInterface` 分母签名**：
+
+```typescript
+type FactMetricInterface = {
+  // ...
+  metricType: "ratio" | "mean" | "proportion" | "retention" | "quantile" | "dailyParticipation";
+  numerator: ColumnRef;        // ColumnRef = { factTableId, column, aggregation?, rowFilters?, ... }
+  denominator: ColumnRef | null;  // 与 numerator 完全相同的结构，可为 null
+  // ...
+};
 ```
 
 **特点**：
-- 分母是完整的对象，不是 ID 引用
-- 分母与分子共享相同的结构
-- 不支持链式递归引用（分母本身没有自己的分母）
+- 分母是 `ColumnRef | null` 类型，与分子共享相同的结构
+- 分母通过 `factTableId` 引用所属的 Fact Table，通过 `column` 指定列
+- 分母可以是 `null`（如 `mean`、`proportion` 类型的度量不需要分母）
+- 分母可以引用与分子不同的 Fact Table（跨表比率度量）
+- **不支持链式递归引用**：`ColumnRef` 没有 `denominator` 字段，无法形成 A→B→C 的链
+- 分母的语义由 `metricType` 决定：`metricType === "ratio"` 时分母参与除法运算
 
 ### 1.2 分母度量的用途
 
@@ -470,18 +495,233 @@ function getFactMetricGroup(metric: FactMetricInterface): string {
 
 | 维度 | Legacy Metric | Fact Metric |
 |------|--------------|-------------|
-| **分母存储方式** | 字符串 ID 引用 | 内嵌完整对象 |
-| **链式引用支持** | ✅ 支持（A→B→C） | ❌ 不支持 |
+| **分母存储方式** | 字符串 ID 引用 (`denominator?: string`) | `ColumnRef \| null` (`denominator: columnRefValidator.nullable()`) |
+| **分母指向** | 另一个度量的 ID | 同一或不同 Fact Table 的列 |
+| **链式引用支持** | ✅ 支持（A→B→C） | ❌ 不支持（`ColumnRef` 无 `denominator` 字段） |
 | **递归展开需要** | ✅ 需要 | ❌ 不需要 |
 | **环路防护需要** | ✅ 需要 | ❌ 不需要 |
+| **比率判定方式** | `!!denominatorMetric && !isBinomialMetric(denominator)` | `m.metricType === "ratio"` |
+| **漏斗判定方式** | `!!denominatorMetric && isBinomialMetric(denominator)` | `false`（Fact Metric 永远不是漏斗度量） |
 | **查询构建方式** | 多 CTE JOIN | 单查询（可能跨表 JOIN） |
 | **度量分组策略** | 每个度量单独查询 | 同 factTable 可合并查询 |
 
 ---
 
-## 4. 环路防护生效范围 (Loop Guardrail Scope)
+## 4. Safe Rollout 中 Fact Metric 分母的完整代码流程
 
-### 4.1 生效范围对比
+### 4.1 快照设置阶段：Fact Metric 分母被显式忽略
+
+**位置**：`packages/back-end/src/services/safeRolloutSnapshots.ts:70-117`
+
+```typescript
+export function getMetricForSafeRolloutSnapshot(
+  id: string,
+  metricMap: Map<string, ExperimentMetricInterface>,
+  settingsForSnapshotMetrics?: MetricSnapshotSettings[],
+): MetricForSafeRolloutSnapshot | null {
+  const metric = metricMap.get(id);
+  if (!metric) return null;
+  const { baseMetricId } = parseSliceMetricId(id);
+  const metricSnapshotSettings = settingsForSnapshotMetrics?.find(
+    (s) => s.metric === baseMetricId,
+  );
+  return {
+    id,
+    settings: {
+      datasource: metric.datasource,
+      type: isBinomialMetric(metric) ? "binomial" : "count",
+      aggregation: ("aggregation" in metric && metric.aggregation) || undefined,
+      cappingSettings: metric.cappingSettings,
+      // ⚠️ 关键行：Fact Metric 的分母在快照设置中被显式设为 undefined
+      denominator: (!isFactMetric(metric) && metric.denominator) || undefined,
+      sql: (!isFactMetric(metric) && metric.sql) || undefined,
+      userIdTypes: (!isFactMetric(metric) && metric.userIdTypes) || undefined,
+    },
+    computedSettings: {
+      windowSettings: { ... },
+      regressionAdjustmentDays: metricSnapshotSettings?.regressionAdjustmentDays ?? ...,
+      regressionAdjustmentEnabled: metricSnapshotSettings?.regressionAdjustmentEnabled ?? false,
+      regressionAdjustmentAvailable: metricSnapshotSettings?.regressionAdjustmentAvailable ?? true,
+      regressionAdjustmentReason: metricSnapshotSettings?.regressionAdjustmentReason ?? "",
+    },
+  };
+}
+```
+
+**分析**：
+
+| 字段 | Legacy Metric | Fact Metric |
+|------|--------------|-------------|
+| `denominator` | `metric.denominator` (字符串 ID) | `undefined`（被 `!isFactMetric(metric)` 条件过滤） |
+| `sql` | `metric.sql` (SQL 字符串) | `undefined` |
+| `userIdTypes` | `metric.userIdTypes` | `undefined` |
+
+**原因**：Fact Metric 的分母信息（`ColumnRef`）不需要在快照设置中传递给 Legacy Metric 的查询构建器。Fact Metric 的分母在 SQL 生成阶段直接从 `metric.denominator` 对象中读取。
+
+### 4.2 快照度量设置阶段：Fact Metric 分母不参与回归调整收集
+
+**位置**：`packages/back-end/src/services/safeRolloutSnapshots.ts:210-215`
+
+```typescript
+// 仅对 Legacy Metric 提取分母度量，用于回归调整
+const denominatorMetrics = allExperimentMetrics
+  .filter((m) => m && !isFactMetric(m) && m.denominator)  // 排除 Fact Metric
+  .map((m: ExperimentMetricInterface) =>
+    metricMap.get(m.denominator as string),
+  )
+  .filter(Boolean) as MetricInterface[];
+```
+
+**效果**：
+- `denominatorMetrics` 列表只包含 Legacy Metric 的分母
+- Fact Metric 的 `denominator` (`ColumnRef`) 不会被加入此列表
+- 这些分母度量仅用于 `getMetricSnapshotSettings()` 的回归调整计算
+
+### 4.3 查询执行阶段：Fact Metric 分母通过分组查询处理
+
+**入口**：`ExperimentResultsQueryRunner.startQuery()`
+
+**步骤 1 - 度量分组** (`experimentQueries.ts:256-350`)：
+
+```typescript
+export function getFactMetricGroups(
+  metrics: ExperimentMetricInterface[],
+  settings: ExperimentSnapshotSettings,
+  integration: SourceIntegrationInterface,
+  organization: OrganizationInterface,
+): GroupedMetrics {
+  const legacyMetrics: MetricInterface[] = metrics.filter((m) =>
+    isLegacyMetric(m),
+  );
+  const factMetrics: FactMetricInterface[] = metrics.filter(isFactMetric);
+
+  // ... 分组逻辑 ...
+  return {
+    factMetricGroups: groupArrays,  // Fact Metric 按表分组
+    legacyMetricSingles: legacyMetrics,  // Legacy Metric 作为单例
+  };
+}
+```
+
+**步骤 2 - Legacy Metric 处理** (`ExperimentResultsQueryRunner.ts:215-257`)：
+
+```typescript
+// Legacy Metric: 使用递归展开分母
+for (const m of legacyMetricSingles) {
+  const denominatorMetrics: MetricInterface[] = [];
+  if (m.denominator) {
+    denominatorMetrics.push(
+      ...expandDenominatorMetrics(m.denominator, metricMap)
+        .map((m) => metricMap.get(m) as MetricInterface)
+        .filter(Boolean),
+    );
+  }
+  const queryParams: ExperimentMetricQueryParams = {
+    metric: m,
+    denominatorMetrics,  // 递归展开的分母列表
+    // ...
+  };
+  // → 调用 getExperimentMetricQuery() 构建 SQL
+}
+```
+
+**步骤 3 - Fact Metric 处理** (`ExperimentResultsQueryRunner.ts:259-297`)：
+
+```typescript
+// Fact Metric: 直接传入度量数组，分母在 SQL 生成阶段处理
+for (const [i, m] of factMetricGroups.entries()) {
+  const queryParams: ExperimentFactMetricsQueryParams = {
+    activationMetric,
+    dimensions: ...,
+    metrics: m,  // 包含完整 FactMetricInterface（含 denominator: ColumnRef | null）
+    segment: segmentObj,
+    settings: snapshotSettings,
+    // ...
+  };
+  // → 调用 getExperimentFactMetricsQuery() 构建 SQL
+  // Fact Metric 的分母在 SQL 生成阶段直接从 metric.denominator 读取
+}
+```
+
+### 4.4 SQL 生成阶段：Fact Metric 分母的使用
+
+**位置**：`packages/back-end/src/integrations/sql/queries/experiment-fact-metrics-query.ts`
+
+Fact Metric 的分母在 SQL 生成时通过 `metric.denominator` 直接读取：
+
+```typescript
+// 在 Fact Metric 的 SQL 生成中
+// metric.denominator 是 ColumnRef | null
+// 如果 metric.metricType === "ratio" 且 metric.denominator 不为 null
+// SQL 构建器会：
+// 1. 从 metric.denominator.factTableId 获取分母的 Fact Table
+// 2. 从 metric.denominator.column 获取分母的列名
+// 3. 在同一查询中构建分母的聚合表达式
+// 4. 最终 SQL 计算 numerator_value / denominator_value
+```
+
+### 4.5 完整流程对比
+
+```
+Safe Rollout 分母处理完整流程：
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  1. 快照设置阶段 (safeRolloutSnapshots.ts)                          │
+│                                                                      │
+│  Legacy Metric:                                                      │
+│    getMetricForSafeRolloutSnapshot()                                 │
+│    → settings.denominator = metric.denominator (string)              │
+│    → settings.sql = metric.sql                                       │
+│    → settings.userIdTypes = metric.userIdTypes                        │
+│                                                                      │
+│  Fact Metric:                                                        │
+│    getMetricForSafeRolloutSnapshot()                                 │
+│    → settings.denominator = undefined  ← !isFactMetric 过滤         │
+│    → settings.sql = undefined                                        │
+│    → settings.userIdTypes = undefined                                │
+│                                                                      │
+│  回归调整分母收集:                                                    │
+│    denominatorMetrics = allExperimentMetrics                          │
+│      .filter(m => !isFactMetric(m) && m.denominator)  ← 排除 Fact   │
+│      .map(m => metricMap.get(m.denominator))                         │
+│    // denominatorMetrics 仅含 Legacy Metric 的分母度量对象           │
+├──────────────────────────────────────────────────────────────────────┤
+│  2. 查询执行阶段 (ExperimentResultsQueryRunner.ts)                   │
+│                                                                      │
+│  Legacy Metric:                                                      │
+│    expandDenominatorMetrics(m.denominator, metricMap)                │
+│    → denominatorMetrics = [B, C, ...] (递归展开)                     │
+│    → getExperimentMetricQuery({ metric, denominatorMetrics })       │
+│    → SQL 中生成 __denominator0, __denominator1 等 CTE               │
+│                                                                      │
+│  Fact Metric:                                                        │
+│    getFactMetricGroups(metrics) → factMetricGroups                   │
+│    → getExperimentFactMetricsQuery({ metrics: [m1, m2, ...] })      │
+│    → SQL 中直接读取 metric.denominator.factTableId 和 .column       │
+│    → 分母在同一查询中聚合，不需要额外 CTE                             │
+├──────────────────────────────────────────────────────────────────────┤
+│  3. SQL 生成阶段                                                      │
+│                                                                      │
+│  Legacy Metric SQL:                                                  │
+│    WITH __metric AS (...),                                           │
+│         __denominator0 AS (...),                                     │
+│         __denominator1 AS (...),                                     │
+│         __userDenominatorAgg AS (JOIN __denominatorN)                │
+│                                                                      │
+│  Fact Metric SQL:                                                    │
+│    WITH __metricData AS (                                            │
+│      SELECT numerator_agg / denominator_agg AS value                 │
+│      FROM fact_table                                                 │
+│      -- 分母直接在同一条 SQL 中聚合                                   │
+│    )                                                                 │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. 环路防护生效范围 (Loop Guardrail Scope)
+
+### 5.1 生效范围对比
 
 | 链路 | 是否使用 `expandDenominatorMetrics` | 环路防护是否生效 | 说明 |
 |------|------------------------------------|-----------------|------|
@@ -489,9 +729,9 @@ function getFactMetricGroup(metric: FactMetricInterface): string {
 | **实验结果查询** (`ExperimentResultsQueryRunner.ts`) | ✅ 是 | ✅ 生效 | 递归展开，`visited` Set 防护 |
 | **人口数据查询** (`PopulationDataQueryRunner.ts`) | ✅ 是 | ✅ 生效 | 递归展开，`visited` Set 防护 |
 | **报表设置** (`reports.ts`) | ❌ 否 | ❌ 不生效 | 单层展开，但后续查询阶段会递归 |
-| **Fact Metric 查询** | ❌ 否 | ❌ 不适用 | 分母是内嵌对象，不支持链式引用 |
+| **Fact Metric 查询** | ❌ 否 | ❌ 不适用 | 分母是 `ColumnRef`，不支持链式引用 |
 
-### 4.2 环路风险分析
+### 5.2 环路风险分析
 
 **Safe Rollout 链路的潜在风险**：
 - 若 `A.denominator = B` 且 `B.denominator = A`，形成自引用环路
@@ -509,7 +749,7 @@ const denominatorMetrics = allExperimentMetrics  // allExperimentMetrics = [A]
 // B 的分母 A 不会被展开，因为只做了一层 map
 ```
 
-### 4.3 环路防护的测试验证
+### 5.3 环路防护的测试验证
 
 测试用例 (`sql.test.ts:353-375`) 验证了以下场景：
 1. ✅ 正常链式引用：`a→b` → `["b", "a"]`
@@ -521,9 +761,9 @@ const denominatorMetrics = allExperimentMetrics  // allExperimentMetrics = [A]
 
 ---
 
-## 5. 递归结果使用的边界条件
+## 6. 递归结果使用的边界条件
 
-### 5.1 边界条件 1: 分母数组为空
+### 6.1 边界条件 1: 分母数组为空
 
 **代码位置**：`experiment-metric-query.ts:78-81`
 ```typescript
@@ -539,7 +779,7 @@ const denominator =
 - `funnelMetric = false`
 - 不生成分母相关的 CTE 和聚合逻辑
 
-### 5.2 边界条件 2: Funnel vs Ratio 度量区分
+### 6.2 边界条件 2: Funnel vs Ratio 度量区分
 
 **代码位置**：`experiment-metric-query.ts:82-87`
 ```typescript
@@ -573,7 +813,7 @@ export function isFunnelMetric(
   - 主查询直接 JOIN 最后一个分母的 CTE
   - 只使用最后一个分母
 
-### 5.3 边界条件 3: Fact Metric 的特殊处理
+### 6.3 边界条件 3: Fact Metric 的特殊处理
 
 Fact Metric 在查询中被分组处理，不经过 `expandDenominatorMetrics`：
 
@@ -601,7 +841,7 @@ for (const [i, m] of factMetricGroups.entries()) {
 
 **注意**：Fact Metric 的分母在 SQL 生成阶段直接从 `metric.denominator` 对象读取，不需要预先展开。
 
-### 5.4 边界条件 4: 百分位截断的特殊处理
+### 6.4 边界条件 4: 百分位截断的特殊处理
 
 **代码位置**：`experiment-metric-query.ts:451-471`
 ```typescript
@@ -633,9 +873,9 @@ ${
 
 ---
 
-## 6. 分母处理链路总览
+## 7. 分母处理链路总览
 
-### 6.1 Legacy Metric 完整数据流转图
+### 7.1 Legacy Metric 完整数据流转图
 
 ```
 +-------------------+
@@ -685,7 +925,7 @@ ${
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 分母处理对比表
+### 7.2 分母处理对比表
 
 | 维度 | Safe Rollout 链路 (Legacy) | 通用查询链路 (Legacy) | Fact Metric 链路 |
 |------|---------------------------|----------------------|-----------------|
@@ -697,7 +937,7 @@ ${
 | **调用时机** | 快照创建前 | 查询执行时 | 查询执行时 |
 | **查询中的使用** | 不直接用于查询 | 全部分母生成 CTE | 直接读取对象 |
 
-### 6.3 递归结果使用总结
+### 7.3 递归结果使用总结
 
 | 使用场景 | 使用的分母 | 代码位置 |
 |---------|-----------|---------|
@@ -710,9 +950,9 @@ ${
 
 ---
 
-## 7. 护栏阈值设置 (Guardrail Threshold Settings)
+## 8. 护栏阈值设置 (Guardrail Threshold Settings)
 
-### 7.1 核心阈值常量
+### 8.1 核心阈值常量
 
 在 `packages/shared/src/constants.ts` 中定义了默认阈值：
 
@@ -725,7 +965,7 @@ ${
 | `DEFAULT_P_VALUE_THRESHOLD` | 0.05 | 统计显著性 p-value 阈值 |
 | `DEFAULT_GUARDRAIL_ALPHA` | 0.05 | 护栏度量显著性水平 |
 
-### 7.2 组织级别设置
+### 8.2 组织级别设置
 
 在 `packages/shared/src/enterprise/decision-criteria/decisionCriteria.ts:245-261` 中，`getHealthSettings` 函数合并组织设置与默认值：
 
@@ -747,7 +987,7 @@ export function getHealthSettings(
 }
 ```
 
-### 7.3 度量级别阈值
+### 8.3 度量级别阈值
 
 在 `packages/shared/types/metric.d.ts:74-79` 中，每个度量可以配置独立的阈值：
 
@@ -766,9 +1006,9 @@ export interface MetricInterface {
 
 ---
 
-## 8. 异常拦截机制 (Anomaly Interception Mechanism)
+## 9. 异常拦截机制 (Anomaly Interception Mechanism)
 
-### 8.1 SRM (Sample Ratio Mismatch) 样本比率不匹配检测
+### 9.1 SRM (Sample Ratio Mismatch) 样本比率不匹配检测
 
 **核心逻辑** 在 `packages/shared/src/health/health.ts:74-96`：
 
@@ -802,7 +1042,7 @@ export function getSRMHealthData({
 - 从健康查询结果中获取 `snapshot.health?.traffic?.overall?.srm`
 - 如无健康查询结果，回退到主分析结果 `snapshot.analyses?.[0]?.results?.[0]?.srm`
 
-### 8.2 多重暴露检测
+### 9.2 多重暴露检测
 
 **核心逻辑** 在 `packages/shared/src/health/health.ts:25-62`：
 
@@ -826,7 +1066,7 @@ export function getMultipleExposureHealthData({
 }
 ```
 
-### 8.3 护栏度量异常拦截
+### 9.3 护栏度量异常拦截
 
 在 `packages/shared/src/enterprise/decision-criteria/decisionCriteria.ts:648-665` 中，Safe Rollout 使用专门的决策标准：
 
@@ -857,9 +1097,9 @@ const ROLLBACK_SAFE_ROLLOUT_DECISION_CRITERIA: DecisionCriteriaData = {
 
 ---
 
-## 9. 自动回滚执行机制 (Auto Rollback Execution)
+## 10. 自动回滚执行机制 (Auto Rollback Execution)
 
-### 9.1 自动回滚实际执行位置
+### 10.1 自动回滚实际执行位置
 
 **入口点**：`packages/back-end/src/models/SafeRolloutSnapshotModel.ts:158`
 
@@ -947,7 +1187,7 @@ export async function checkAndRollbackSafeRollout({
 }
 ```
 
-### 9.2 执行流程详解
+### 10.2 执行流程详解
 
 ```
 快照更新完成 (afterUpdateOne hook)
@@ -983,9 +1223,9 @@ export async function checkAndRollbackSafeRollout({
 
 ---
 
-## 10. 健康异常与回滚决策的判定优先级
+## 11. 健康异常与回滚决策的判定优先级
 
-### 10.1 判定优先级顺序
+### 11.1 判定优先级顺序
 
 在 `getSafeRolloutResultStatus` 函数 (`decisionCriteria.ts:597-717`) 中，判定顺序如下：
 
@@ -1051,7 +1291,7 @@ export function getSafeRolloutResultStatus({ ... }): ... {
 }
 ```
 
-### 10.2 优先级总结
+### 11.2 优先级总结
 
 | 优先级 | 状态 | 触发条件 | 说明 |
 |-------|------|---------|------|
@@ -1069,9 +1309,9 @@ export function getSafeRolloutResultStatus({ ... }): ... {
 
 ---
 
-## 11. 无数据与剩余天数分支条件
+## 12. 无数据与剩余天数分支条件
 
-### 11.1 无数据分支 (no-data)
+### 12.1 无数据分支 (no-data)
 
 **触发条件** (`decisionCriteria.ts:616-619`)：
 ```typescript
@@ -1091,7 +1331,7 @@ if (!healthSummary?.totalUsers && hoursRunning > 24) {
 - 曝光事件未正确上报
 - 流量完全没有进入实验
 
-### 11.2 剩余天数分支 (days-left)
+### 12.2 剩余天数分支 (days-left)
 
 **触发条件** (`decisionCriteria.ts:696-700`)：
 ```typescript
@@ -1131,7 +1371,7 @@ export function getSafeRolloutDaysLeft({
 - 已运行时长：基于最新快照时间计算
 - 剩余天数：`(endDate - latestSnapshotDate) / 1440`（分钟转天数）
 
-### 11.3 发布分支 (ship-now)
+### 12.3 发布分支 (ship-now)
 
 **触发条件** (`decisionCriteria.ts:703-716`)：
 ```typescript
@@ -1156,9 +1396,9 @@ if (daysLeft <= 0 && resultsStatus) {
 
 ---
 
-## 12. 整体配合流程
+## 13. 整体配合流程
 
-### 12.1 Safe Rollout 健康评估流程
+### 13.1 Safe Rollout 健康评估流程
 
 **入口函数** `getSafeRolloutResultStatus` (`decisionCriteria.ts:597-717`)
 
@@ -1193,7 +1433,7 @@ if (daysLeft <= 0 && resultsStatus) {
    └─ 优先级4: 监测期结束且无异常 → status: ship-now
 ```
 
-### 12.2 自动回滚触发链
+### 13.2 自动回滚触发链
 
 ```
 快照分析完成
@@ -1223,23 +1463,27 @@ Safe Rollout 状态变为 "rolled-back"
 
 ---
 
-## 13. 关键文件索引
+## 14. 关键文件索引
 
 | 文件路径 | 核心功能 |
 |---------|---------|
 | `packages/shared/types/metric.d.ts` | Metric 类型定义，Legacy/Fact Metric 分母配置差异 |
+| `packages/shared/types/fact-table.d.ts` | `FactMetricInterface` 类型（Zod 推断），`ColumnRef` 定义 |
+| `packages/shared/src/validators/fact-table.ts:160-169` | `columnRefValidator` - Fact Metric 分母的 Zod 验证器 |
+| `packages/shared/src/validators/fact-table.ts:233-251` | `factMetricValidator` - Fact Metric 完整验证器定义 |
 | `packages/shared/src/constants.ts` | 阈值常量定义 |
 | `packages/shared/src/health/health.ts` | SRM 和多重暴露健康检测 |
 | `packages/shared/src/enterprise/decision-criteria/decisionCriteria.ts` | 决策框架与护栏评估逻辑 |
-| `packages/shared/src/experiments/experiments.ts` | 度量类型判断 (isRatioMetric, isFunnelMetric) |
-| `packages/back-end/src/services/safeRolloutSnapshots.ts` | Safe Rollout 快照服务，**单层**分母处理 |
+| `packages/shared/src/experiments/experiments.ts` | 度量类型判断 (isRatioMetric, isFunnelMetric, isBinomialMetric) |
+| `packages/back-end/src/services/safeRolloutSnapshots.ts:70-117` | `getMetricForSafeRolloutSnapshot` - Fact Metric 分母在快照设置中被忽略 |
+| `packages/back-end/src/services/safeRolloutSnapshots.ts:188-234` | `getSettingsForSnapshotMetrics` - 分母收集（仅 Legacy Metric） |
 | `packages/back-end/src/util/sql.ts:186-199` | `expandDenominatorMetrics` **递归**展开函数，含环路防护 |
-| `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 实验结果查询，**递归**分母展开 |
+| `packages/back-end/src/queryRunners/ExperimentResultsQueryRunner.ts` | 实验结果查询，Legacy 递归分母展开 + Fact 分组查询 |
 | `packages/back-end/src/queryRunners/PopulationDataQueryRunner.ts` | 人口数据查询，**递归**分母展开 |
-| `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | Legacy Metric SQL 查询构建，分母使用逻辑 |
-| `packages/back-end/src/services/experimentQueries/experimentQueries.ts` | Fact Metric 分组逻辑 |
+| `packages/back-end/src/integrations/sql/queries/experiment-metric-query.ts` | Legacy Metric SQL 查询构建，分母 CTE 和使用逻辑 |
+| `packages/back-end/src/integrations/sql/queries/experiment-fact-metrics-query.ts` | Fact Metric SQL 查询构建，分母直接从 ColumnRef 读取 |
+| `packages/back-end/src/services/experimentQueries/experimentQueries.ts` | Fact Metric 分组逻辑（同表/跨表比率） |
 | `packages/back-end/src/enterprise/saferollouts/safeRolloutUtils.ts` | 自动回滚实际执行逻辑 |
 | `packages/back-end/src/models/SafeRolloutSnapshotModel.ts` | 快照模型，包含自动回滚触发 hook |
 | `packages/back-end/src/services/reports.ts` | 报表服务，分母处理链路 |
 | `packages/back-end/test/util/sql.test.ts:353-375` | `expandDenominatorMetrics` 测试用例 |
-| `packages/front-end/components/Features/RuleModal/SafeRolloutFields.tsx` | Safe Rollout 配置表单 |
