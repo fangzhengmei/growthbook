@@ -2,15 +2,17 @@
 
 ## 概述
 
-GrowthBook 代码库中存在 **四类投递通道**，各自有不同的重试策略、payload 获取方式和执行时序：
+GrowthBook 代码库中存在 **5 条投递通道**，各自有不同的重试策略、payload 获取方式和执行时序：
 
-| 体系 | Agenda 任务名 | 适用场景 | 核心文件 | 重试上限 |
-|------|--------------|----------|----------|----------|
-| Legacy SDK Webhook | `fireWebhook` | 旧版 SDK 连接 | `jobs/webhooks.ts` | 3 次 |
-| SDK Webhook (新版) | `fireWebhooks` | 新版 SDK 连接 | `jobs/sdkWebhooks.ts` | 3 次 |
-| Event Webhook | `eventWebHook` | 系统事件通知 | `events/handlers/webhooks/EventWebHookNotifier.ts` | 3 次 |
-| Global SDK Webhook | *(无 Agenda)* | 环境变量全局配置 | `jobs/sdkWebhooks.ts:fireGlobalSdkWebhooks` | **0 次** |
-| Proxy Update | `proxyUpdate` | SDK 代理推送 | `jobs/proxyUpdate.ts` | 1 次 |
+| 体系 | Agenda 任务名 | 适用场景 | 核心文件 | 最大重试次数 | 总执行次数 |
+|------|--------------|----------|----------|-------------|-----------|
+| Legacy SDK Webhook | `fireWebhook` | 旧版 SDK 连接 | `jobs/webhooks.ts` | 2 | 3 |
+| SDK Webhook (新版) | `fireWebhooks` | 新版 SDK 连接 | `jobs/sdkWebhooks.ts` | 2 | 3 |
+| Event Webhook | `eventWebHook` | 系统事件通知 | `events/handlers/webhooks/EventWebHookNotifier.ts` | 3 | 4 |
+| Global SDK Webhook | *(无 Agenda)* | 环境变量全局配置 | `jobs/sdkWebhooks.ts:fireGlobalSdkWebhooks` | 0 | 1 |
+| Proxy Update | `proxyUpdate` | SDK 代理推送 | `jobs/proxyUpdate.ts` | 1 | 2 |
+
+> **术语约定**：本文严格区分"最大重试次数"（首次执行失败后的额外执行次数）与"总执行次数"（首次 + 重试）。源码注释中的 "If it failed 3 times, give up" 指的是总执行 3 次（即重试 2 次后放弃），而非重试 3 次。
 
 ---
 
@@ -64,7 +66,7 @@ export const triggerWebhookJobs = async (
 export async function queueWebhooksByConnections(context, connections) {
   const sdkKeys = connections.map((c) => c.id);
   const webhooks =
-    await context.models.sdkWebhooks.findAllSdkWebhookByConnectionIds(sdkKeys);
+    await context.models.sdkWebhooks.findAllSdkWebhooksByConnectionIds(sdkKeys);
   for (const webhook of webhooks) {
     if (webhook && !webhook.disabled) await queueSingleSdkWebhookJob(webhook);
   }
@@ -125,19 +127,19 @@ export async function queueProxyUpdate(context, connections) {
 
 ---
 
-## 二、重试机制差异详解（核心纠正点）
+## 二、重试机制差异详解
 
 ### 2.1 重试策略对比总表
 
 | 体系 | 最大重试次数 | 第 1 次重试延迟 | 第 2 次重试延迟 | 第 3 次重试延迟 | 重试触发方式 |
 |------|-------------|----------------|----------------|----------------|-------------|
-| Legacy SDK Webhook | **2 次** | 30s | 5m | — | Agenda `fail` 事件 |
-| SDK Webhook (新版) | **2 次** | 30s | 5m | — | Agenda `fail` 事件 |
-| Event Webhook | **3 次** | 30s | 5m | 5m | 显式 `retryJob()` 调用 |
-| Global SDK Webhook | **0 次** | — | — | — | 无重试 |
-| Proxy Update | **1 次** | 5s | — | — | Agenda `fail` 事件 |
+| Legacy SDK Webhook | 2 | 30s | 5m | — | Agenda `fail` 事件 |
+| SDK Webhook (新版) | 2 | 30s | 5m | — | Agenda `fail` 事件 |
+| Event Webhook | 3 | 30s | 5m | 5m | 显式 `retryJob()` 调用 |
+| Global SDK Webhook | 0 | — | — | — | 无重试 |
+| Proxy Update | 1 | 5s | — | — | Agenda `fail` 事件 |
 
-### 2.2 逐行比对：Legacy SDK / 新版 SDK Webhook — 实际只有 2 次重试
+### 2.2 逐行比对：Legacy SDK / 新版 SDK Webhook — 最多重试 2 次
 
 两套代码的重试逻辑完全一致（`webhooks.ts:110-136` / `sdkWebhooks.ts:75-101`）：
 
@@ -167,7 +169,9 @@ agenda.on("fail:" + JOB_NAME, async (error, job) => {
 
 因此 **Legacy 和新版 SDK Webhook 最多重试 2 次**，总执行次数 = 1（首次）+ 2（重试）= 3 次。
 
-### 2.3 逐行比对：Event Webhook — 实际有 3 次重试
+> 源码注释 `// If it failed 3 times, give up` 中的 "3 times" 指总执行 3 次（含首次），而非重试 3 次。
+
+### 2.3 逐行比对：Event Webhook — 最多重试 3 次
 
 `EventWebHookNotifier.ts:371-389`：
 
@@ -198,6 +202,8 @@ private static async retryJob(job) {
 
 因此 **Event Webhook 最多重试 3 次**，总执行次数 = 1（首次）+ 3（重试）= 4 次。
 
+> 源码注释 `// If it failed 3 times, give up` 中的 "3 times" 指重试 3 次（不含首次），与 Legacy/SDK 的注释含义不同。
+
 **注意**：Event Webhook 的重试不是通过 Agenda `fail` 事件触发的。`handleWebHookError` 在记录日志后显式调用 `retryJob()`，且 `sendDataToWebHook` 在失败时返回 `{ result: "error" }` 而非 `throw`，所以 Agenda 不会自动触发 `fail` 事件——重试完全由业务代码控制。
 
 ### 2.4 Global SDK Webhook — 无重试
@@ -212,7 +218,7 @@ runWebhookFetch({...}).catch((e) => {
 
 没有 Agenda job 包裹，没有 retryCount，没有 fail 事件监听。失败仅记日志，**不重试**。
 
-### 2.5 Proxy Update — 仅 1 次重试
+### 2.5 Proxy Update — 最多重试 1 次
 
 `proxyUpdate.ts:122-143`：
 
@@ -234,6 +240,8 @@ agenda.on("fail:" + PROXY_UPDATE_JOB_NAME, async (error, job) => {
 ```
 
 **最多重试 1 次**，延迟仅 5 秒（远短于 webhook 的 30s），超时也只有 5 秒。
+
+> 源码注释 `// If it failed twice, give up` 中的 "twice" 指总执行 2 次（含首次），即重试 1 次后放弃。
 
 ---
 
@@ -347,7 +355,7 @@ triggerWebhookJobs() 被调用
 
 3. **Proxy Update 的条件性**：只有 `isProxyEnabled=true` 时才入队 proxy 更新。Cloud 用户还会额外入队一个 cloud proxy 更新 job。
 
-4. **CDN 清除的幂等性**：`purgeCDNCache` 内部按 256 个 key 一批调用 Fastly API，失败仅记日志不抛出异常，不会影响整个 `triggerWebhookJobs` 的完成。
+4. **CDN 清除的容错性**：`purgeCDNCache` 内部按 256 个 key 一批调用 Fastly API，`catch` 块仅记日志不抛出异常，不会影响整个 `triggerWebhookJobs` 的完成。
 
 5. **入队顺序无保证**：四个入队/投递操作虽然代码上是顺序执行，但各自是异步的。Agenda job 的实际执行顺序取决于 Agenda 调度器的并发度和队列状态。
 
@@ -552,16 +560,112 @@ EventNotifier.jobHandler()
 
 ---
 
-## 八、关键设计要点
+## 八、关键结论的逐项代码对照
 
-1. **重试次数存在实质性差异**：Legacy/新版 SDK 最多重试 **2 次**（总执行 3 次），Event Webhook 最多重试 **3 次**（总执行 4 次），Proxy 最多重试 **1 次**（总执行 2 次），Global 无重试。上一版分析将它们统一表述为"3 次"是不准确的。
+以下每条结论均附源码位置和判定依据，可直接跳转验证。
 
-2. **重试触发机制不同**：SDK/Legacy/Proxy 通过 Agenda `fail` 事件隐式触发；Event Webhook 通过业务代码显式调用 `retryJob()` 触发（因为 `sendDataToWebHook` 失败时返回 result 而非 throw，不会自动触发 `fail` 事件）。
+### 结论 1：5 条通道的重试上限各不相同
 
-3. **Payload 获取与发送均为串行**：新版 SDK Webhook 使用 `BluebirdPromise.reduce` + `BluebirdPromise.each`，确保同一个 webhook 的多个 connection 串行获取、串行发送，避免后端过载。Global Webhook 则在 connection 间串行获取、跨 webhook 并行发送。
+| 通道 | 最大重试 | 判定依据 |
+|------|---------|---------|
+| Legacy SDK | 2 | `webhooks.ts:119-129`：`retryCount===0` 进入、`retryCount===1` 进入、`else` 放弃，故 retryCount 可从 0 递增到 2（即重试 2 次） |
+| SDK Webhook (新版) | 2 | `sdkWebhooks.ts:84-94`：与 Legacy 完全一致的 if/else if/else 结构 |
+| Event Webhook | 3 | `EventWebHookNotifier.ts:372`：`retryCount >= 3` 时 return，故 retryCount 可从 0 递增到 3（即重试 3 次） |
+| Global SDK | 0 | `sdkWebhooks.ts:410-418`：`runWebhookFetch().catch()` 无 retryCount 字段、无 Agenda job 包裹 |
+| Proxy Update | 1 | `proxyUpdate.ts:131-136`：`retryCount===0` 进入、`else` 放弃，故 retryCount 只能从 0 递增到 1（即重试 1 次） |
 
-4. **triggerWebhookJobs 中 CDN 清除是唯一同步等待点**：四类 webhook/proxy 入队都是 fire-and-forget，只有 `purgeCDNCache` 使用 `await`。这意味着 Feature 更新 API 的响应延迟主要由 CDN 清除决定，而非 webhook 投递。
+### 结论 2：源码注释中的 "failed N times" 含义不一致
 
-5. **Global Webhook 既不入队也不重试**：它在 `triggerWebhookJobs` 调用栈内直接发起 HTTP 请求，失败仅记日志，不触发熔断计数，也不影响其他 webhook 通道。
+| 文件 | 注释原文 | 实际含义 |
+|------|---------|---------|
+| `webhooks.ts:126` | `// If it failed 3 times, give up` | 总执行 3 次（首次 + 2 次重试）后放弃 |
+| `sdkWebhooks.ts:91` | `// If it failed 3 times, give up` | 同上，总执行 3 次后放弃 |
+| `EventWebHookNotifier.ts:373` | `// If it failed 3 times, give up` | 重试 3 次（总执行 4 次）后放弃 |
+| `proxyUpdate.ts:134` | `// If it failed twice, give up` | 总执行 2 次（首次 + 1 次重试）后放弃 |
 
-6. **熔断仅覆盖部分通道**：`consecutiveFailures` / `disabled` 机制仅作用于新版和旧版 SDK Webhook（通过 `setLastSdkWebhookError`）以及 Proxy Update（通过 `setProxyError`）。Event Webhook 使用独立的 `updateEventWebHookStatus`，Global Webhook 完全无状态追踪。
+同样的注释措辞 "failed 3 times"，在 Legacy/SDK 中指总执行次数，在 Event Webhook 中指重试次数。这是代码层面的语义不一致，分析时应以代码逻辑（`retryCount` 的递增与判断条件）为准。
+
+### 结论 3：重试触发机制分为两类
+
+**Agenda `fail` 事件驱动**（Legacy / SDK / Proxy）：
+
+```
+投递失败 → throw Error → Agenda 标记 job 为 failed
+  → agenda.on("fail:" + JOB_NAME, ...) 被触发
+  → 在回调中修改 retryCount 和 nextRunAt
+  → job.save() 后由 Agenda 重新调度
+```
+
+代码位置：`webhooks.ts:110-136`、`sdkWebhooks.ts:75-101`、`proxyUpdate.ts:122-143`
+
+**业务代码显式调用**（Event Webhook）：
+
+```
+sendDataToWebHook() 返回 { result: "error" }（不 throw）
+  → handleWebHookError() 被调用
+  → 在 handleWebHookError 内直接调用 retryJob()
+  → retryJob() 修改 retryCount 和 nextRunAt
+  → job.save() 后由 Agenda 重新调度
+```
+
+代码位置：`EventWebHookNotifier.ts:320-358`（`handleWebHookError` 在第 358 行调用 `retryJob()`）
+
+关键区别：Event Webhook 的 `sendDataToWebHook` 在 HTTP 响应非 ok 或异常时返回 `{ result: "error" }` 而非 throw（见第 253-259 行和第 267-276 行），因此 Agenda 不会触发 `fail` 事件，重试必须由业务代码主动发起。
+
+### 结论 4：新版 SDK Webhook 的 payload 获取和发送均为串行
+
+代码位置：`sdkWebhooks.ts:330-353`
+
+```typescript
+// 串行获取：BluebirdPromise.reduce 逐个 await
+const payloads = await BluebirdPromise.reduce(
+  connections,
+  async (payloads, connection) => {
+    const defs = await getFeatureDefinitionsWithCache(...);  // 每次都 await
+    return [[connection.key, defs], ...payloads];
+  },
+  [],
+);
+
+// 串行发送：BluebirdPromise.each 逐个 await
+await BluebirdPromise.each(payloads, ([key, payload]) =>
+  runWebhookFetch({...}),  // 每次都 await
+);
+```
+
+`BluebirdPromise.reduce` 和 `BluebirdPromise.each` 都是串行迭代器，与 `Promise.all` 的并行语义不同。
+
+### 结论 5：triggerWebhookJobs 中 purgeCDNCache 是唯一 await
+
+代码位置：`updateAllJobs.ts:24-57`
+
+```typescript
+// 第 24 行：无 await
+queueWebhooksByConnections(context, connections).catch(...);
+
+// 第 28 行：无 await
+fireGlobalSdkWebhooks(context, connections).catch(...);
+
+// 第 33 行：无 await
+if (isProxyEnabled) {
+  queueProxyUpdate(context, connections).catch(...);
+}
+
+// 第 38 行：无 await
+queueLegacySdkWebhooks(context, payloadKeys, isFeature).catch(...);
+
+// 第 57 行：唯一 await
+await purgeCDNCache(context.org.id, surrogateKeys);
+```
+
+四个 webhook/proxy 调用均使用 `.catch()` 而非 `await`，属于 fire-and-forget 模式。Feature 更新 API 的响应延迟因此由 `purgeCDNCache`（Fastly API 调用）主导，而非 webhook 投递。
+
+### 结论 6：熔断机制仅覆盖 3 条通道
+
+| 通道 | 是否熔断 | 判定依据 |
+|------|---------|---------|
+| Legacy SDK | ✅ | `webhooks.ts:103` 调用 `setLastSdkWebhookError(webhook, e)`，该方法在 `WebhookModel.ts:119` 检查 `consecutiveFailures >= 10` 时设 `disabled=true` |
+| SDK Webhook (新版) | ✅ | `sdkWebhooks.ts:304` 调用 `setLastSdkWebhookError(webhook, message)`，同上 |
+| Event Webhook | ❌ | `EventWebHookNotifier.ts:339` 调用 `updateEventWebHookStatus(eventWebHookId, {state:"error"})`，该方法无 `consecutiveFailures` / `disabled` 逻辑 |
+| Global SDK | ❌ | `sdkWebhooks.ts:410-418` 的 `runWebhookFetch` 调用时 `global=true`，此时 `sdkWebhooks.ts:287-288` 和 `303-304` 跳过 `setLastSdkWebhookError` 调用 |
+| Proxy Update | ✅ | `proxyUpdate.ts:68-71` 在 job handler 开头检查 `consecutiveFailures >= 10` 直接 return |
